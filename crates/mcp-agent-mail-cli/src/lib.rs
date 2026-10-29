@@ -660,7 +660,10 @@ pub enum Commands {
         /// Allow a direct SQLite read only when no daemon is reachable.
         #[arg(long)]
         direct: bool,
+        #[command(flatten)]
+        listen: InboxEventsListenArgs,
         /// Output format: table, json, or toon (default: table, piped or not).
+        /// While listening, json prints one event object per line.
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
         /// Output JSON (shorthand for --format json).
@@ -4181,6 +4184,7 @@ fn dispatch_command(command: Commands) -> CliResult<()> {
             limit,
             position_now,
             direct,
+            listen,
             format,
             json,
             host,
@@ -4192,6 +4196,7 @@ fn dispatch_command(command: Commands) -> CliResult<()> {
             limit,
             position_now,
             direct,
+            &listen,
             format,
             json,
             host,
@@ -10354,6 +10359,7 @@ fn handle_inbox_events(
     limit: usize,
     position_now: bool,
     direct: bool,
+    listen: &InboxEventsListenArgs,
     format: Option<output::CliOutputFormat>,
     json: bool,
     host: Option<String>,
@@ -10367,6 +10373,9 @@ fn handle_inbox_events(
             "--position-now cannot be combined with --after",
             serde_json::json!({ "field": "after" }),
         );
+    }
+    if let Err(message) = listen.validate(position_now) {
+        return emit_inbox_events_error(fmt, "invalid_argument", message, serde_json::json!({}));
     }
     if limit > 1000 {
         return emit_inbox_events_error(
@@ -10405,87 +10414,70 @@ fn handle_inbox_events(
         );
     }
 
-    let direct_config = InboxEventsDirectConfig {
-        project_key: project_key.clone(),
-        agent_name: agent_name.clone(),
-        after,
-        limit,
-        position_now,
-    };
     let config = Config::from_env();
     let (host, port) = hook_server_host_port(&config, host, port);
     let daemon_reachable = direct && process_owner_port_reachable(&host, port);
     let use_daemon = check_inbox_should_use_daemon(direct, daemon_reachable);
-    let result = if use_daemon {
-        let rpc_config = resolve_check_inbox_rpc_config_reader(
-            |key| std::env::var(key).ok(),
-            &project_key,
-            &agent_name,
-            &host,
-            port,
-            &config.http_path,
-            local_server_bearer_token(&config),
-        );
-        let server_urls = rpc_config.server_urls.clone();
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .map_err(|error| CliError::Other(format!("runtime error: {error}")));
-        match runtime {
-            Ok(runtime) => {
-                let daemon_result = runtime.block_on(async {
-                    fetch_inbox_events_via_jsonrpc_with_fallback(
-                        &rpc_config,
-                        &server_urls,
-                        after,
-                        limit,
-                        position_now,
-                    )
-                    .await
-                });
-                if direct && daemon_result.is_err() {
-                    inbox_events_direct(&direct_config)
-                } else {
-                    daemon_result
-                }
-            }
-            Err(error) => Err(InboxEventsReadError::Other(error)),
-        }
-    } else {
-        inbox_events_direct(&direct_config)
+    let source = InboxEventsSource {
+        rpc_config: use_daemon.then(|| {
+            resolve_check_inbox_rpc_config_reader(
+                |key| std::env::var(key).ok(),
+                &project_key,
+                &agent_name,
+                &host,
+                port,
+                &config.http_path,
+                local_server_bearer_token(&config),
+            )
+        }),
+        direct_config: InboxEventsDirectConfig {
+            project_key,
+            agent_name,
+            after,
+            limit,
+            position_now,
+        },
+        direct,
     };
 
-    let page = match result {
-        Ok(page) => page,
-        Err(InboxEventsReadError::CursorExpired {
+    if let Some(mode) = listen.mode() {
+        use std::io::Write as _;
+        let mut poller = LiveInboxEventsPoller {
+            source,
+            started: std::time::Instant::now(),
+        };
+        let mut stdout = std::io::stdout();
+        let end = listen_inbox_events(
+            &mut poller,
             after,
-            oldest_available_cursor,
-        }) => {
-            return emit_inbox_events_error(
-                fmt,
-                "cursor_expired",
-                "cursor is older than retained delivery history",
-                serde_json::json!({
-                    "after": after,
-                    "oldest_available_cursor": oldest_available_cursor,
-                }),
-            );
-        }
-        Err(InboxEventsReadError::CursorAhead { after, tail_cursor }) => {
-            return emit_inbox_events_error(
-                fmt,
-                "cursor_ahead",
-                "cursor is beyond the durable delivery tail",
-                serde_json::json!({ "after": after, "tail_cursor": tail_cursor }),
-            );
-        }
-        Err(InboxEventsReadError::Other(error)) => {
-            return emit_inbox_events_error(
-                fmt,
-                "inbox_events_unavailable",
-                &error.to_string(),
-                serde_json::json!({}),
-            );
-        }
+            &listen.filter(),
+            mode,
+            std::time::Duration::from_secs(listen.interval),
+            &mut |event| {
+                writeln!(stdout, "{}", inbox_event_line(event, fmt))?;
+                stdout.flush()?;
+                Ok(())
+            },
+            &mut |error| {
+                ftui_runtime::ftui_eprintln!("inbox-events: {error}; retrying");
+            },
+        );
+        return match end {
+            Ok(InboxListenEnd::Delivered) => Ok(()),
+            Ok(InboxListenEnd::TimedOut) => {
+                ftui_runtime::ftui_eprintln!(
+                    "inbox-events timeout: no matching delivery within {}s",
+                    listen.timeout.unwrap_or_default()
+                );
+                Err(CliError::ExitCode(INBOX_EVENTS_TIMEOUT_EXIT_CODE))
+            }
+            Err(error) => emit_inbox_events_read_error(fmt, error),
+        };
+    }
+
+    let page = match source.fetch(after, position_now) {
+        Ok(page) => page,
+        Err(error) => return emit_inbox_events_read_error(fmt, error),
     };
     let data = serde_json::json!({
         "events": page.events,
@@ -10551,6 +10543,323 @@ fn emit_inbox_events_error(
         ftui_runtime::ftui_eprintln!("inbox-events {code}: {message}");
     });
     Err(CliError::ExitCode(1))
+}
+
+fn emit_inbox_events_read_error(
+    fmt: output::CliOutputFormat,
+    error: InboxEventsReadError,
+) -> CliResult<()> {
+    match error {
+        InboxEventsReadError::CursorExpired {
+            after,
+            oldest_available_cursor,
+        } => emit_inbox_events_error(
+            fmt,
+            "cursor_expired",
+            "cursor is older than retained delivery history",
+            serde_json::json!({
+                "after": after,
+                "oldest_available_cursor": oldest_available_cursor,
+            }),
+        ),
+        InboxEventsReadError::CursorAhead { after, tail_cursor } => emit_inbox_events_error(
+            fmt,
+            "cursor_ahead",
+            "cursor is beyond the durable delivery tail",
+            serde_json::json!({ "after": after, "tail_cursor": tail_cursor }),
+        ),
+        InboxEventsReadError::Other(error) => emit_inbox_events_error(
+            fmt,
+            "inbox_events_unavailable",
+            &error.to_string(),
+            serde_json::json!({}),
+        ),
+    }
+}
+
+/// Exit status of `inbox-events --once --timeout` when nothing matched in
+/// time, the same status `timeout(1)` uses, so callers can tell it from an error.
+const INBOX_EVENTS_TIMEOUT_EXIT_CODE: i32 = 124;
+
+/// Listen-mode flags of `am inbox-events`.
+///
+/// A listener polls the durable delivery cursor: the cursor already makes
+/// delivery restart-safe, so a client-side poll needs no server support.
+#[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
+pub struct InboxEventsListenArgs {
+    /// Block and print one line per new delivery until interrupted.
+    #[arg(long)]
+    follow: bool,
+    /// Block until the next delivery, print it, and exit 0.
+    #[arg(long)]
+    once: bool,
+    /// With --once: give up after this many seconds and exit 124.
+    #[arg(long, value_parser = parse_positive_u64_arg)]
+    timeout: Option<u64>,
+    /// Seconds between polls while listening.
+    #[arg(long, default_value_t = 2, value_parser = parse_positive_u64_arg)]
+    interval: u64,
+    /// While listening, only report deliveries in this thread.
+    #[arg(long)]
+    thread: Option<String>,
+    /// While listening, only report deliveries from this sender.
+    #[arg(long)]
+    from: Option<String>,
+}
+
+impl InboxEventsListenArgs {
+    fn validate(&self, position_now: bool) -> Result<(), &'static str> {
+        let listening = self.follow || self.once;
+        if self.follow && self.once {
+            return Err("--follow cannot be combined with --once");
+        }
+        if listening && position_now {
+            return Err("--position-now cannot be combined with --follow or --once");
+        }
+        if self.timeout.is_some() && !self.once {
+            return Err("--timeout requires --once");
+        }
+        if !listening && (self.thread.is_some() || self.from.is_some()) {
+            return Err("--thread and --from require --follow or --once");
+        }
+        Ok(())
+    }
+
+    fn mode(&self) -> Option<InboxListenMode> {
+        if self.follow {
+            Some(InboxListenMode::Follow)
+        } else if self.once {
+            Some(InboxListenMode::Once {
+                timeout: self.timeout.map(std::time::Duration::from_secs),
+            })
+        } else {
+            None
+        }
+    }
+
+    fn filter(&self) -> InboxEventFilter {
+        InboxEventFilter {
+            thread: self.thread.clone(),
+            from: self.from.clone(),
+        }
+    }
+}
+
+/// Which deliveries an inbox listener reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct InboxEventFilter {
+    thread: Option<String>,
+    from: Option<String>,
+}
+
+impl InboxEventFilter {
+    fn matches(&self, event: &serde_json::Value) -> Result<bool, InboxEventsReadError> {
+        if let Some(thread) = &self.thread {
+            // A server older than thread-bearing events omits the key; a
+            // filter that can never match would hang the listener silently.
+            let Some(event_thread) = event.get("thread_id") else {
+                return Err(InboxEventsReadError::Other(CliError::Other(
+                    "the server's fetch_inbox_events reports no thread_id; \
+                     upgrade the server to listen with --thread"
+                        .to_string(),
+                )));
+            };
+            if event_thread.as_str() != Some(thread.as_str()) {
+                return Ok(false);
+            }
+        }
+        if let Some(from) = &self.from {
+            let sender = event
+                .get("from")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if !sender.eq_ignore_ascii_case(from) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboxListenMode {
+    /// Report every matching delivery until interrupted.
+    Follow,
+    /// Report the first matching delivery, or give up after `timeout`.
+    Once {
+        timeout: Option<std::time::Duration>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboxListenEnd {
+    Delivered,
+    TimedOut,
+}
+
+/// The mailbox and clock an inbox listener polls.
+trait InboxEventsPoller {
+    fn fetch(
+        &mut self,
+        after: Option<i64>,
+        position_now: bool,
+    ) -> Result<InboxEventsPage, InboxEventsReadError>;
+    fn wait(&mut self, duration: std::time::Duration);
+    fn elapsed(&self) -> std::time::Duration;
+}
+
+/// Poll the delivery cursor and hand each matching event to `on_event`.
+///
+/// Starts after `after`, the caller's last processed cursor, or else at the
+/// tail as of now, so a fresh listener reports new mail and not the backlog.
+/// Once the mailbox has answered, a failed poll (a restarting server, a
+/// dropped connection) keeps the cursor and retries; `on_retry` hears the
+/// first failure of each outage. Cursor errors always end the listener.
+fn listen_inbox_events(
+    poller: &mut impl InboxEventsPoller,
+    after: Option<i64>,
+    filter: &InboxEventFilter,
+    mode: InboxListenMode,
+    interval: std::time::Duration,
+    on_event: &mut dyn FnMut(&serde_json::Value) -> CliResult<()>,
+    on_retry: &mut dyn FnMut(&CliError),
+) -> Result<InboxListenEnd, InboxEventsReadError> {
+    let timeout = match mode {
+        InboxListenMode::Follow => None,
+        InboxListenMode::Once { timeout } => timeout,
+    };
+    let mut cursor = match after {
+        Some(after) => after,
+        None => poller.fetch(None, true)?.tail_cursor,
+    };
+    let mut answered = after.is_none();
+    let mut failing = false;
+    loop {
+        match poller.fetch(Some(cursor), false) {
+            Ok(page) => {
+                answered = true;
+                failing = false;
+                for event in &page.events {
+                    if filter.matches(event)? {
+                        on_event(event).map_err(InboxEventsReadError::Other)?;
+                        if matches!(mode, InboxListenMode::Once { .. }) {
+                            return Ok(InboxListenEnd::Delivered);
+                        }
+                    }
+                }
+                cursor = page.next_cursor;
+                if page.has_more {
+                    continue;
+                }
+            }
+            Err(InboxEventsReadError::Other(error)) if answered => {
+                if !failing {
+                    on_retry(&error);
+                }
+                failing = true;
+            }
+            Err(error) => return Err(error),
+        }
+        let pause = match timeout {
+            None => interval,
+            Some(timeout) => match timeout.checked_sub(poller.elapsed()) {
+                Some(remaining) if !remaining.is_zero() => remaining.min(interval),
+                _ => return Ok(InboxListenEnd::TimedOut),
+            },
+        };
+        poller.wait(pause);
+    }
+}
+
+/// One listener output line: an event JSON object for `--format json`,
+/// otherwise `key=value` fields with the free-text subject last.
+fn inbox_event_line(event: &serde_json::Value, fmt: output::CliOutputFormat) -> String {
+    if fmt == output::CliOutputFormat::Json {
+        return event.to_string();
+    }
+    let text = |key: &str| event.get(key).and_then(serde_json::Value::as_str);
+    let number = |key: &str| {
+        event
+            .get(key)
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_default()
+    };
+    format!(
+        "cursor={} message_id={} from={} thread={} subject={}",
+        number("cursor"),
+        number("message_id"),
+        text("from").unwrap_or_default(),
+        text("thread_id").unwrap_or("-"),
+        text("subject").unwrap_or_default(),
+    )
+}
+
+/// Where `inbox-events` reads: the daemon over HTTP when `rpc_config` is set,
+/// falling back to a direct SQLite read on failure only under `--direct`.
+struct InboxEventsSource {
+    rpc_config: Option<CheckInboxRpcConfig>,
+    direct_config: InboxEventsDirectConfig,
+    direct: bool,
+}
+
+impl InboxEventsSource {
+    fn fetch(
+        &self,
+        after: Option<i64>,
+        position_now: bool,
+    ) -> Result<InboxEventsPage, InboxEventsReadError> {
+        let direct_config = InboxEventsDirectConfig {
+            after,
+            position_now,
+            ..self.direct_config.clone()
+        };
+        let Some(rpc_config) = &self.rpc_config else {
+            return inbox_events_direct(&direct_config);
+        };
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .map_err(|error| {
+                InboxEventsReadError::Other(CliError::Other(format!("runtime error: {error}")))
+            })?;
+        let daemon_result = runtime.block_on(async {
+            fetch_inbox_events_via_jsonrpc_with_fallback(
+                rpc_config,
+                &rpc_config.server_urls,
+                after,
+                direct_config.limit,
+                position_now,
+            )
+            .await
+        });
+        if self.direct && daemon_result.is_err() {
+            inbox_events_direct(&direct_config)
+        } else {
+            daemon_result
+        }
+    }
+}
+
+struct LiveInboxEventsPoller {
+    source: InboxEventsSource,
+    started: std::time::Instant,
+}
+
+impl InboxEventsPoller for LiveInboxEventsPoller {
+    fn fetch(
+        &mut self,
+        after: Option<i64>,
+        position_now: bool,
+    ) -> Result<InboxEventsPage, InboxEventsReadError> {
+        self.source.fetch(after, position_now)
+    }
+
+    fn wait(&mut self, duration: std::time::Duration) {
+        std::thread::sleep(duration);
+    }
+
+    fn elapsed(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
 }
 
 fn normalize_http_path(raw: &str) -> String {
@@ -49106,6 +49415,374 @@ http_headers = { Authorization = "Bearer secret" }
                 tail_cursor: 12
             })
         ));
+    }
+
+    /// A mailbox that answers each poll from a script and keeps virtual time.
+    /// When the script runs out it reports a cursor error, which ends a
+    /// `--follow` listener so its observations can be checked.
+    struct ScriptedInboxEventsPoller {
+        responses: std::collections::VecDeque<Result<InboxEventsPage, InboxEventsReadError>>,
+        fetches: Vec<(Option<i64>, bool)>,
+        waits: Vec<std::time::Duration>,
+        elapsed: std::time::Duration,
+    }
+
+    impl ScriptedInboxEventsPoller {
+        fn new(responses: Vec<Result<InboxEventsPage, InboxEventsReadError>>) -> Self {
+            Self {
+                responses: responses.into(),
+                fetches: Vec::new(),
+                waits: Vec::new(),
+                elapsed: std::time::Duration::ZERO,
+            }
+        }
+
+        /// Answers every poll with an empty page and never runs out.
+        fn idle() -> Self {
+            Self::new(Vec::new())
+        }
+    }
+
+    impl InboxEventsPoller for ScriptedInboxEventsPoller {
+        fn fetch(
+            &mut self,
+            after: Option<i64>,
+            position_now: bool,
+        ) -> Result<InboxEventsPage, InboxEventsReadError> {
+            self.fetches.push((after, position_now));
+            self.responses.pop_front().unwrap_or_else(|| {
+                if self.fetches.len() > 100 {
+                    return Err(InboxEventsReadError::CursorAhead {
+                        after: after.unwrap_or_default(),
+                        tail_cursor: -1,
+                    });
+                }
+                Ok(scripted_events_page(after.unwrap_or_default(), Vec::new()))
+            })
+        }
+
+        fn wait(&mut self, duration: std::time::Duration) {
+            self.waits.push(duration);
+            self.elapsed += duration;
+        }
+
+        fn elapsed(&self) -> std::time::Duration {
+            self.elapsed
+        }
+    }
+
+    fn scripted_event(cursor: i64, from: &str, thread_id: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "cursor": cursor,
+            "message_id": cursor + 100,
+            "kind": "to",
+            "subject": format!("subject {cursor}"),
+            "from": from,
+            "thread_id": thread_id,
+            "importance": "normal",
+            "ack_required": false,
+        })
+    }
+
+    fn scripted_events_page(after: i64, events: Vec<serde_json::Value>) -> InboxEventsPage {
+        let next_cursor = events
+            .last()
+            .and_then(|event| event["cursor"].as_i64())
+            .unwrap_or(after);
+        InboxEventsPage {
+            events,
+            next_cursor,
+            has_more: false,
+            oldest_available_cursor: None,
+            tail_cursor: next_cursor,
+        }
+    }
+
+    fn listen_collecting(
+        poller: &mut ScriptedInboxEventsPoller,
+        after: Option<i64>,
+        filter: &InboxEventFilter,
+        mode: InboxListenMode,
+    ) -> (
+        Result<InboxListenEnd, InboxEventsReadError>,
+        Vec<i64>,
+        Vec<String>,
+    ) {
+        let mut delivered = Vec::new();
+        let mut retries = Vec::new();
+        let end = listen_inbox_events(
+            poller,
+            after,
+            filter,
+            mode,
+            std::time::Duration::from_secs(2),
+            &mut |event| {
+                delivered.push(event["cursor"].as_i64().unwrap_or_default());
+                Ok(())
+            },
+            &mut |error| retries.push(error.to_string()),
+        );
+        (end, delivered, retries)
+    }
+
+    #[test]
+    fn inbox_follow_starts_at_the_tail_and_reports_each_new_delivery_in_order() {
+        let mut poller = ScriptedInboxEventsPoller::new(vec![
+            Ok(InboxEventsPage {
+                events: Vec::new(),
+                next_cursor: 7,
+                has_more: false,
+                oldest_available_cursor: Some(1),
+                tail_cursor: 7,
+            }),
+            Ok(scripted_events_page(7, Vec::new())),
+            Ok(scripted_events_page(
+                7,
+                vec![
+                    scripted_event(8, "BlueLake", Some("br-1")),
+                    scripted_event(9, "RedFox", None),
+                ],
+            )),
+            Ok(scripted_events_page(
+                9,
+                vec![scripted_event(12, "BlueLake", Some("br-2"))],
+            )),
+        ]);
+
+        let (end, delivered, _) = listen_collecting(
+            &mut poller,
+            None,
+            &InboxEventFilter::default(),
+            InboxListenMode::Follow,
+        );
+
+        assert!(matches!(
+            end,
+            Err(InboxEventsReadError::CursorAhead {
+                tail_cursor: -1,
+                ..
+            })
+        ));
+        assert_eq!(delivered, vec![8, 9, 12]);
+        assert_eq!(
+            &poller.fetches[..5],
+            &[
+                (None, true),
+                (Some(7), false),
+                (Some(7), false),
+                (Some(9), false),
+                (Some(12), false),
+            ]
+        );
+        assert!(
+            poller
+                .waits
+                .iter()
+                .all(|wait| *wait == std::time::Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn inbox_follow_drains_a_backlog_page_by_page_without_waiting() {
+        let mut first = scripted_events_page(3, vec![scripted_event(4, "BlueLake", None)]);
+        first.has_more = true;
+        let mut poller = ScriptedInboxEventsPoller::new(vec![
+            Ok(first),
+            Ok(scripted_events_page(
+                4,
+                vec![scripted_event(5, "BlueLake", None)],
+            )),
+        ]);
+
+        let (_, delivered, _) = listen_collecting(
+            &mut poller,
+            Some(3),
+            &InboxEventFilter::default(),
+            InboxListenMode::Follow,
+        );
+
+        assert_eq!(delivered, vec![4, 5]);
+        assert_eq!(&poller.fetches[..2], &[(Some(3), false), (Some(4), false)]);
+        assert_eq!(poller.waits.len(), poller.fetches.len() - 2);
+    }
+
+    #[test]
+    fn inbox_once_resumes_after_the_given_cursor_and_returns_the_first_match() {
+        let filter = InboxEventFilter {
+            thread: Some("br-7".to_string()),
+            from: Some("bluelake".to_string()),
+        };
+        let mut poller = ScriptedInboxEventsPoller::new(vec![Ok(scripted_events_page(
+            20,
+            vec![
+                scripted_event(21, "BlueLake", Some("br-other")),
+                scripted_event(22, "RedFox", Some("br-7")),
+                scripted_event(23, "BlueLake", Some("br-7")),
+                scripted_event(24, "BlueLake", Some("br-7")),
+            ],
+        ))]);
+
+        let (end, delivered, _) = listen_collecting(
+            &mut poller,
+            Some(20),
+            &filter,
+            InboxListenMode::Once { timeout: None },
+        );
+
+        assert!(matches!(end, Ok(InboxListenEnd::Delivered)));
+        assert_eq!(delivered, vec![23]);
+        assert_eq!(poller.fetches, vec![(Some(20), false)]);
+    }
+
+    #[test]
+    fn inbox_once_times_out_when_no_matching_delivery_arrives() {
+        let mut poller = ScriptedInboxEventsPoller::idle();
+        let filter = InboxEventFilter {
+            thread: None,
+            from: Some("Nobody".to_string()),
+        };
+        poller
+            .responses
+            .push_back(Ok(scripted_events_page(0, Vec::new())));
+        poller.responses.push_back(Ok(scripted_events_page(
+            0,
+            vec![scripted_event(1, "RedFox", None)],
+        )));
+
+        let (end, delivered, _) = listen_collecting(
+            &mut poller,
+            None,
+            &filter,
+            InboxListenMode::Once {
+                timeout: Some(std::time::Duration::from_secs(5)),
+            },
+        );
+
+        assert!(matches!(end, Ok(InboxListenEnd::TimedOut)));
+        assert!(delivered.is_empty());
+        assert_eq!(poller.elapsed, std::time::Duration::from_secs(5));
+        assert_eq!(
+            poller.waits,
+            vec![
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn inbox_listener_retries_outages_after_start_but_fails_fast_before_it() {
+        let outage = || {
+            Err(InboxEventsReadError::Other(CliError::Other(
+                "connection refused".to_string(),
+            )))
+        };
+        let mut poller = ScriptedInboxEventsPoller::new(vec![
+            Ok(scripted_events_page(5, Vec::new())),
+            outage(),
+            outage(),
+            Ok(scripted_events_page(
+                5,
+                vec![scripted_event(6, "BlueLake", None)],
+            )),
+            outage(),
+        ]);
+
+        let (end, delivered, retries) = listen_collecting(
+            &mut poller,
+            None,
+            &InboxEventFilter::default(),
+            InboxListenMode::Follow,
+        );
+
+        assert!(matches!(end, Err(InboxEventsReadError::CursorAhead { .. })));
+        assert_eq!(delivered, vec![6]);
+        assert_eq!(retries, vec!["connection refused", "connection refused"]);
+        assert_eq!(poller.fetches[4], (Some(6), false));
+
+        let mut unreachable = ScriptedInboxEventsPoller::new(vec![outage()]);
+        let (end, _, retries) = listen_collecting(
+            &mut unreachable,
+            Some(5),
+            &InboxEventFilter::default(),
+            InboxListenMode::Follow,
+        );
+        assert!(matches!(end, Err(InboxEventsReadError::Other(_))));
+        assert!(retries.is_empty());
+    }
+
+    #[test]
+    fn inbox_thread_filter_refuses_a_server_that_omits_thread_ids() {
+        let mut legacy_event = scripted_event(2, "BlueLake", None);
+        legacy_event
+            .as_object_mut()
+            .expect("event object")
+            .remove("thread_id");
+        let mut poller =
+            ScriptedInboxEventsPoller::new(vec![Ok(scripted_events_page(1, vec![legacy_event]))]);
+        let filter = InboxEventFilter {
+            thread: Some("br-1".to_string()),
+            from: None,
+        };
+
+        let (end, delivered, _) = listen_collecting(
+            &mut poller,
+            Some(1),
+            &filter,
+            InboxListenMode::Once { timeout: None },
+        );
+
+        let Err(InboxEventsReadError::Other(error)) = end else {
+            panic!("expected a thread_id capability error, got {end:?}");
+        };
+        assert!(error.to_string().contains("thread_id"), "{error}");
+        assert!(delivered.is_empty());
+    }
+
+    #[test]
+    fn inbox_listener_lines_name_cursor_message_sender_thread_and_subject() {
+        let event = scripted_event(8, "BlueLake", Some("br-1"));
+        assert_eq!(
+            inbox_event_line(&event, output::CliOutputFormat::Table),
+            "cursor=8 message_id=108 from=BlueLake thread=br-1 subject=subject 8"
+        );
+        let unthreaded = scripted_event(9, "RedFox", None);
+        assert_eq!(
+            inbox_event_line(&unthreaded, output::CliOutputFormat::Table),
+            "cursor=9 message_id=109 from=RedFox thread=- subject=subject 9"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&inbox_event_line(&event, output::CliOutputFormat::Json))
+                .expect("json line");
+        assert_eq!(json, event);
+    }
+
+    #[test]
+    fn inbox_listen_flags_are_rejected_outside_a_listen_mode() {
+        let listen = |follow, once, timeout, thread: Option<&str>| InboxEventsListenArgs {
+            follow,
+            once,
+            timeout,
+            interval: 2,
+            thread: thread.map(str::to_string),
+            from: None,
+        };
+        assert!(listen(true, true, None, None).validate(false).is_err());
+        assert!(listen(false, false, Some(5), None).validate(false).is_err());
+        assert!(listen(true, false, Some(5), None).validate(false).is_err());
+        assert!(
+            listen(false, false, None, Some("br-1"))
+                .validate(false)
+                .is_err()
+        );
+        assert!(listen(true, false, None, None).validate(true).is_err());
+        assert!(
+            listen(false, true, Some(5), Some("br-1"))
+                .validate(false)
+                .is_ok()
+        );
+        assert!(listen(false, false, None, None).validate(true).is_ok());
     }
 
     #[test]
@@ -96853,6 +97530,7 @@ fn inbox_events_page_from_direct(
                     "delivered_ts": format_micros_as_iso(event.delivered_ts),
                     "subject": event.subject,
                     "from": event.sender_name,
+                    "thread_id": event.thread_id,
                     "importance": event.importance,
                     "ack_required": event.ack_required,
                 })
