@@ -6394,12 +6394,13 @@ struct FrozenDirectoryAuthority {
     expect_directory_leaf: bool,
     #[cfg(unix)]
     anchor_dir: std::fs::File,
+    // `(st_dev, st_ino)`; `dev_t` is `u64` on Linux but `i32` on macOS.
     #[cfg(unix)]
-    ancestor_chain: Vec<(PathBuf, (u64, u64))>,
+    ancestor_chain: Vec<(PathBuf, (rustix::fs::Dev, u64))>,
     #[cfg(unix)]
     unresolved_suffix: Vec<std::ffi::OsString>,
     #[cfg(unix)]
-    latched_suffix_dirs: Mutex<Vec<(u64, u64)>>,
+    latched_suffix_dirs: Mutex<Vec<(rustix::fs::Dev, u64)>>,
 }
 
 impl FrozenDirectoryAuthority {
@@ -6407,7 +6408,15 @@ impl FrozenDirectoryAuthority {
     fn existing_chain_ids(&self) -> Vec<(u64, u64)> {
         #[cfg(unix)]
         {
-            self.ancestor_chain.iter().map(|(_, id)| *id).collect()
+            // Widen `dev_t` exactly as std's `MetadataExt::dev` does, so these
+            // ids compare equal to metadata-derived ids on every unix.
+            #[allow(clippy::cast_sign_loss, clippy::unnecessary_cast)]
+            let ids = self
+                .ancestor_chain
+                .iter()
+                .map(|(_, (dev, ino))| (*dev as u64, *ino))
+                .collect();
+            ids
         }
         #[cfg(not(unix))]
         {
