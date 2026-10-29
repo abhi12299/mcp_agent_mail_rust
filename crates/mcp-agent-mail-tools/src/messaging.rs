@@ -5565,6 +5565,7 @@ pub async fn fetch_inbox_events(
                     "delivered_ts": micros_to_iso(event.delivered_ts),
                     "subject": event.subject,
                     "from": event.sender_name,
+                    "thread_id": event.thread_id,
                     "importance": event.importance,
                     "ack_required": event.ack_required,
                 })

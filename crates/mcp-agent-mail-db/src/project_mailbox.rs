@@ -621,7 +621,8 @@ pub fn product_inbox_select_sql(body_select: &str) -> String {
 pub fn visible_events_sql() -> String {
     format!(
         "SELECT e.seq, e.message_id, e.kind, e.delivered_ts, m.subject, \
-                COALESCE(sender.name, ?) AS sender_name, m.importance, m.ack_required \
+                COALESCE(sender.name, ?) AS sender_name, m.thread_id, m.importance, \
+                m.ack_required \
          FROM inbox_delivery_events AS e \
          JOIN project_mailbox_deliveries AS d ON d.message_id = e.message_id \
          JOIN messages AS m ON m.id = e.message_id \
