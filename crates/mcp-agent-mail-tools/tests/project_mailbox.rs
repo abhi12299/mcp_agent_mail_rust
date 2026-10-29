@@ -551,3 +551,74 @@ fn project_mailbox_addresses_are_validated_and_combine_with_direct_recipients() 
         );
     });
 }
+
+#[test]
+fn delivery_events_report_each_message_thread_for_listeners() {
+    run_with_storage(|cx| async move {
+        let ctx = McpContext::new(cx.clone(), 1);
+        let project = format!("/tmp/project-mailbox-{}", unique_suffix());
+        let slug = project_slug(&ctx, &project).await;
+        register(&ctx, &project, "GreenCastle", "open").await;
+        register(&ctx, &project, "BlueLake", "open").await;
+
+        for (to, thread_id) in [
+            ("BlueLake".to_string(), Some("br-direct")),
+            (format!("project:{slug}"), Some("br-shared")),
+            ("BlueLake".to_string(), None),
+        ] {
+            send_message(
+                &ctx,
+                project.clone(),
+                "GreenCastle".to_string(),
+                vec![to],
+                "Listener notice".to_string(),
+                "Body stays out of delivery events.".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                thread_id.map(str::to_string),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("send");
+        }
+
+        let page: Value = serde_json::from_str(
+            &mcp_agent_mail_tools::fetch_inbox_events(
+                &ctx,
+                project.clone(),
+                "BlueLake".to_string(),
+                None,
+                Some(100),
+                None,
+            )
+            .await
+            .expect("fetch inbox events"),
+        )
+        .expect("events JSON");
+        let threads: Vec<Value> = page["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .map(|event| {
+                assert!(event.get("body_md").is_none(), "{event}");
+                event.get("thread_id").cloned().expect("thread_id key")
+            })
+            .collect();
+        assert_eq!(
+            threads,
+            vec![
+                Value::from("br-direct"),
+                Value::from("br-shared"),
+                Value::Null
+            ]
+        );
+    });
+}

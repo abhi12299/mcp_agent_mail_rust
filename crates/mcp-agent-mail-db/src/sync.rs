@@ -27,6 +27,7 @@ pub struct InboxDeliveryEvent {
     pub delivered_ts: i64,
     pub subject: String,
     pub sender_name: String,
+    pub thread_id: Option<String>,
     pub importance: String,
     pub ack_required: bool,
 }
@@ -1101,7 +1102,8 @@ fn inbox_delivery_events_in_snapshot(
     let mut rows = conn
         .query_sync(
             "SELECT e.seq, e.message_id, e.kind, e.delivered_ts, m.subject, \
-                    COALESCE(sender.name, ?) AS sender_name, m.importance, m.ack_required \
+                    COALESCE(sender.name, ?) AS sender_name, m.thread_id, m.importance, \
+                    m.ack_required \
              FROM inbox_delivery_events AS e \
              JOIN messages AS m ON m.id = e.message_id \
              LEFT JOIN agents AS sender ON sender.id = m.sender_id \
@@ -1165,6 +1167,9 @@ fn inbox_delivery_events_in_snapshot(
                 InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
             })?,
             sender_name: row.get_named("sender_name").map_err(|error| {
+                InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
+            })?,
+            thread_id: row.get_named("thread_id").map_err(|error| {
                 InboxDeliveryEventError::Database(DbError::Sqlite(error.to_string()))
             })?,
             importance: row.get_named("importance").map_err(|error| {
@@ -2652,6 +2657,19 @@ mod tests {
                     .all(|event| event.subject == "test subject")
             );
             reader.execute_raw("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        });
+    }
+
+    #[test]
+    fn delivery_events_carry_thread_id_for_direct_and_shared_deliveries() {
+        event_snapshot_fixture(|reader, _, project, viewer| {
+            let page = inbox_delivery_events_from_conn(reader, project, viewer, None, 10).unwrap();
+            let threads: Vec<Option<&str>> = page
+                .events
+                .iter()
+                .map(|event| event.thread_id.as_deref())
+                .collect();
+            assert_eq!(threads, vec![Some("direct"), Some("shared")]);
         });
     }
 
