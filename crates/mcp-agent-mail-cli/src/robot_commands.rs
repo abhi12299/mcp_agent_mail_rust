@@ -2279,6 +2279,9 @@ struct AtcRobotSnapshot {
     experiences_open: usize,
     #[serde(default)]
     experiences_resolved: u64,
+    /// Current-process liveness feedback. Missing on older daemon snapshots.
+    #[serde(default)]
+    experiences_censored: Option<u64>,
     #[serde(default)]
     policy_revision: u64,
     #[serde(default)]
@@ -2501,6 +2504,13 @@ struct AtcRobotExecution {
 }
 
 #[derive(Debug, Serialize)]
+struct AtcLivenessFeedbackData {
+    open: usize,
+    resolved: u64,
+    censored: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct AtcSummaryData {
     enabled: bool,
     source: String,
@@ -2513,6 +2523,10 @@ struct AtcSummaryData {
     experiences_resolved: u64,
     experiences_censored: u64,
     experiences_expired: u64,
+    /// Current-process liveness decisions, separate from durable experience
+    /// rollups. Absent when an older daemon or the local DB cannot report them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    liveness_feedback: Option<AtcLivenessFeedbackData>,
     tracked_agents: usize,
     degraded_agents: usize,
     deadlock_cycles: usize,
@@ -6289,10 +6303,12 @@ fn build_robot_inbox_server_request(
     }))
 }
 
+/// No candidates when this mailbox's server cannot be confirmed: the caller
+/// labels its local fallback rather than guessing an endpoint.
 fn robot_inbox_server_urls(config: &mcp_agent_mail_core::Config) -> Vec<String> {
-    crate::check_inbox_server_urls_for_agent_mail_url(
-        &crate::local_server_url(config),
-        &config.http_path,
+    crate::local_server_url(config).map_or_else(
+        |_| Vec::new(),
+        |url| crate::check_inbox_server_urls_for_agent_mail_url(&url, &config.http_path),
     )
 }
 
@@ -8049,6 +8065,8 @@ pub struct SearchData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<mcp_agent_mail_tools::search::SearchDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_diagnostic: Option<mcp_agent_mail_db::query_plan_diagnostics::QueryPlanDiagnostic>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_index: Option<LexicalBackfillHealth>,
@@ -8169,12 +8187,14 @@ fn search_via_server(
     config: &mcp_agent_mail_core::Config,
     selection: &crate::message_read::ProjectSelection,
     query: &str,
+    recipient_kind: Option<&str>,
     importance: Option<&str>,
     since: Option<&str>,
     limit: usize,
     cursor: Option<&str>,
 ) -> Result<Option<(crate::context::ResolvedProject, SearchData)>, CliError> {
     validate_robot_search_window(limit, cursor)?;
+    let recipient_kind = parse_search_recipient_kind(recipient_kind)?;
     if !selection.permits_automatic_read(config) {
         return Ok(None);
     }
@@ -8185,6 +8205,9 @@ fn search_via_server(
         "explain": true,
         "include_body_md": true,
     });
+    if let Some(kind) = &recipient_kind {
+        arguments["recipient_kind"] = kind.as_str().into();
+    }
     if let Some(cursor) = cursor {
         arguments["cursor"] = cursor.into();
     }
@@ -8202,7 +8225,9 @@ fn search_via_server(
         else {
             return Ok(None);
         };
-        if !selection.supported_by(&session) {
+        if !selection.supported_by(&session)
+            || (recipient_kind.is_some() && !session.supports_search_recipient_kind())
+        {
             return Ok(None);
         }
         let (project_uri, project) =
@@ -8276,6 +8301,7 @@ fn search_data_from_server_response(
         assistance: response.assistance,
         guidance: response.guidance,
         next_cursor: response.next_cursor,
+        diagnostics: response.diagnostics,
         plan_diagnostic: None,
         search_index: None,
         by_thread,
@@ -8313,6 +8339,7 @@ fn build_search(
             assistance: None,
             guidance: Some(empty_search_guidance()),
             next_cursor: None,
+            diagnostics: None,
             plan_diagnostic: None,
             search_index: Some(mcp_agent_mail_db::search_service::lexical_backfill_health(
                 pool,
@@ -8401,6 +8428,7 @@ fn build_search(
         assistance: collected.assistance,
         guidance,
         next_cursor,
+        diagnostics: None,
         plan_diagnostic,
         search_index: Some(mcp_agent_mail_db::search_service::lexical_backfill_health(
             pool,
@@ -8454,6 +8482,7 @@ where
     let mut explain = None;
     let mut assistance = None;
     let mut guidance = None;
+    let mut checked_kind_presence = false;
 
     loop {
         let response = run_query(&paged_query)?;
@@ -8475,6 +8504,25 @@ where
             )?),
             None => None,
         };
+
+        // Validate and execute the query once before this shortcut, preserving
+        // backend errors and diagnostics. If no recipient of this kind exists
+        // anywhere in this snapshot, later search pages cannot contribute a
+        // match. Do not walk the whole mailbox to prove that negative result.
+        if !checked_kind_presence && let Some(kind) = recipient_kind {
+            checked_kind_presence = true;
+            if kind_id_filter.as_ref().is_some_and(HashSet::is_empty)
+                && !has_message_recipients_of_kind(conn, kind)?
+            {
+                return Ok(CollectedSearchRows {
+                    rows: out,
+                    explain,
+                    assistance,
+                    guidance,
+                    next_cursor: None,
+                });
+            }
+        }
 
         let mut omitted_matching_row_in_page = false;
         for row in response.results {
@@ -8501,21 +8549,15 @@ where
                 .then(|| out.last())
                 .flatten()
                 .and_then(|row| {
-                    // Robot search uses relevance ranking. Other rankings
-                    // require their own timestamp boundary, so refuse to
-                    // invent a continuation if this helper is reused there.
-                    if paged_query.ranking
-                        != mcp_agent_mail_db::search_planner::RankingMode::Relevance
-                    {
-                        return None;
-                    }
-                    // The SQL fallback has no relevance score. Its search
-                    // service uses zero as the cursor key, with id as the tie
-                    // breaker, so preserve that same continuation contract.
+                    // Query hints can rewrite relevance to recency. Use the
+                    // executed ranking so a timestamp cursor never becomes
+                    // an all-zero relevance boundary and loses later hits.
                     let score = row.score.unwrap_or(0.0);
                     score.is_finite().then(|| {
-                        mcp_agent_mail_db::search_planner::SearchCursor { score, id: row.id }
-                            .encode()
+                        mcp_agent_mail_db::search_service::search_result_cursor(
+                            row,
+                            response.ranking,
+                        )
                     })
                 });
             return Ok(CollectedSearchRows {
@@ -8578,6 +8620,15 @@ fn execute_robot_search_query(
     }
 }
 
+fn has_message_recipients_of_kind(conn: &DbConn, kind: &str) -> Result<bool, CliError> {
+    conn.query_sync(
+        "SELECT 1 FROM message_recipients WHERE kind = ? LIMIT 1",
+        &[Value::Text(kind.to_string())],
+    )
+    .map(|rows| !rows.is_empty())
+    .map_err(|error| CliError::Other(format!("kind presence query failed: {error}")))
+}
+
 fn search_message_ids_by_recipient_kind(
     conn: &DbConn,
     kind: &str,
@@ -8616,28 +8667,40 @@ fn search_message_ids_by_recipient_kind(
 
 fn summarize_integrity_probe(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> (HealthProbe, bool) {
     let has_checks = metrics.checks_total > 0;
-    let last_check_failed = has_checks && metrics.last_ok_ts < metrics.last_check_ts;
+    let last_check_failed = metrics.last_check_outcome
+        == mcp_agent_mail_db::IntegrityCheckOutcome::Failed
+        || (has_checks && metrics.last_ok_ts < metrics.last_check_ts);
     let full_check_failed = matches!(
         metrics.last_full_check_outcome,
         mcp_agent_mail_db::IntegrityCheckOutcome::Failed
     );
     let runtime_failures_without_checks = !has_checks && metrics.failures_total > 0;
+    let current_failures = metrics.failures_since_last_ok > 0;
+    let integrity_failed = full_check_failed
+        || last_check_failed
+        || runtime_failures_without_checks
+        || current_failures;
     let detail = if full_check_failed {
         format!(
             "latest full integrity_check failed at {}; a later quick check cannot clear it",
             metrics.last_full_check_ts
         )
-    } else if !has_checks && metrics.failures_total == 0 {
+    } else if last_check_failed {
+        format!(
+            "last check failed; {} cumulative failures across {} checks",
+            metrics.failures_total, metrics.checks_total
+        )
+    } else if !has_checks && metrics.failures_total == 0 && !current_failures {
         "No checks run yet".to_string()
     } else if runtime_failures_without_checks {
         format!(
             "No integrity checks run yet; {} runtime corruption failures recorded",
             metrics.failures_total
         )
-    } else if last_check_failed {
+    } else if current_failures {
         format!(
-            "last check failed; {} cumulative failures across {} checks",
-            metrics.failures_total, metrics.checks_total
+            "{} failures since last clean check; {} lifetime failures across {} checks",
+            metrics.failures_since_last_ok, metrics.failures_total, metrics.checks_total
         )
     } else if metrics.failures_total == 0 {
         format!("{} checks, all passed", metrics.checks_total)
@@ -8654,9 +8717,7 @@ fn summarize_integrity_probe(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> (
 
     // GH#291: an accepted full check can still carry proven never-written
     // orphan pages. Say so; it is leaked space, not a failed probe.
-    let detail = if metrics.never_written_orphan_pages > 0
-        && !(full_check_failed || last_check_failed || runtime_failures_without_checks)
-    {
+    let detail = if metrics.never_written_orphan_pages > 0 && !integrity_failed {
         format!(
             "{detail}; {} never-written orphan page(s) (leaked space, not data damage)",
             metrics.never_written_orphan_pages
@@ -8668,16 +8729,11 @@ fn summarize_integrity_probe(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> (
     (
         HealthProbe {
             name: "integrity".into(),
-            status: if full_check_failed || last_check_failed || runtime_failures_without_checks {
-                "warn"
-            } else {
-                "ok"
-            }
-            .into(),
+            status: if integrity_failed { "warn" } else { "ok" }.into(),
             latency_ms: 0.0,
             detail,
         },
-        !(full_check_failed || last_check_failed || runtime_failures_without_checks),
+        !integrity_failed,
     )
 }
 
@@ -9029,7 +9085,7 @@ struct LiveServerRobotHealthProbes {
     search_index_probe: HealthProbe,
     search_index_unhealthy: bool,
     search_index_degraded: bool,
-    integrity_metrics: Option<mcp_agent_mail_db::IntegrityMetrics>,
+    integrity_metrics: mcp_agent_mail_db::IntegrityMetrics,
 }
 
 fn live_server_archive_parity_probe_from_health(
@@ -9119,12 +9175,171 @@ fn parse_health_check_response(
     serde_json::from_value(normalized).ok()
 }
 
+#[derive(Debug)]
+struct LiveServerHealthAssessment {
+    probe: HealthProbe,
+    level: mcp_agent_mail_core::HealthLevel,
+    pressure: Option<(mcp_agent_mail_core::HealthLevel, String)>,
+    circuits: Option<mcp_agent_mail_db::DbHealthStatus>,
+}
+
+/// Preserve the serving process's verdict even when a local read succeeds.
+/// A fresh CLI's empty counters cannot disprove daemon memory pressure, a
+/// stalled archive drain, or an open write circuit.
+fn assess_live_server_health(
+    config: &mcp_agent_mail_core::Config,
+    payload: &serde_json::Value,
+    latency_ms: f64,
+) -> Result<Option<LiveServerHealthAssessment>, CliError> {
+    use mcp_agent_mail_core::HealthLevel;
+
+    if !crate::reservation_read::mailbox_config_matches(payload, config)? {
+        return Ok(None);
+    }
+    let typed = parse_health_check_response(payload).ok_or_else(|| {
+        CliError::Other(
+            "invalid server health response; refusing incomplete health evidence".into(),
+        )
+    })?;
+    let parse_level = |value: &str| match value {
+        "green" => Ok(HealthLevel::Green),
+        "yellow" => Ok(HealthLevel::Yellow),
+        "red" => Ok(HealthLevel::Red),
+        _ => Err(CliError::Other(
+            "invalid server health level; refusing unverified health evidence".into(),
+        )),
+    };
+    let mut level = parse_level(&typed.health_level)?;
+    let mut details = Vec::new();
+    match typed.status.as_str() {
+        "ok" => {}
+        "error" => {
+            level = HealthLevel::Red;
+            details.push("server reports an error".to_string());
+        }
+        _ => {
+            return Err(CliError::Other(
+                "invalid server health status; refusing unverified health evidence".into(),
+            ));
+        }
+    }
+    for (name, verdict) in [
+        ("transport_health", &typed.verdicts.transport_health),
+        ("db_health", &typed.verdicts.db_health),
+        ("write_health", &typed.verdicts.write_health),
+        ("semantic_readiness", &typed.verdicts.semantic_readiness),
+        ("archive_db_parity", &typed.verdicts.archive_db_parity),
+        ("doctor_readiness", &typed.verdicts.doctor_readiness),
+        ("integrity_check", &typed.verdicts.integrity_check),
+    ] {
+        let verdict_level = parse_level(&verdict.status)?;
+        if verdict_level != HealthLevel::Green {
+            level = level.max(if verdict.critical {
+                verdict_level
+            } else {
+                HealthLevel::Yellow
+            });
+            details.push(format!("{name}={}: {}", verdict.status, verdict.detail));
+        }
+    }
+    match typed.semantic_readiness.status.as_str() {
+        "ok" => {}
+        "warn" => {
+            level = level.max(HealthLevel::Yellow);
+            details.push(typed.semantic_readiness.detail.clone());
+        }
+        "fail" => {
+            level = HealthLevel::Red;
+            details.push(typed.semantic_readiness.detail.clone());
+        }
+        _ => {
+            return Err(CliError::Other(
+                "invalid server semantic readiness; refusing unverified health evidence".into(),
+            ));
+        }
+    }
+    let mut pressure: Option<(HealthLevel, String)> = None;
+    for contributor in &typed.health_level_contributors {
+        let contributor_level = parse_level(&contributor.level)?;
+        level = level.max(contributor_level);
+        if contributor.name == "pressure"
+            && pressure
+                .as_ref()
+                .is_none_or(|(current, _)| contributor_level >= *current)
+        {
+            pressure = Some((contributor_level, contributor.detail.clone()));
+        }
+        if contributor_level != HealthLevel::Green {
+            details.push(format!(
+                "{}={}: {}",
+                contributor.name, contributor.level, contributor.detail
+            ));
+        }
+    }
+    if let Some(recovery) = &typed.recovery
+        && recovery.mode != "healthy"
+    {
+        level = level.max(HealthLevel::Yellow);
+        details.push(format!("mailbox recovery mode: {}", recovery.mode));
+    }
+    if let Some(circuits) = &typed.circuit_breakers {
+        let valid_state = |state: &str| matches!(state, "closed" | "open" | "half_open");
+        if !valid_state(&circuits.circuit_state)
+            || circuits
+                .circuits
+                .iter()
+                .any(|circuit| circuit.subsystem.trim().is_empty() || !valid_state(&circuit.state))
+        {
+            return Err(CliError::Other(
+                "invalid server circuit state; refusing unverified health evidence".into(),
+            ));
+        }
+        if circuits.circuit_state != "closed" {
+            level = level.max(HealthLevel::Yellow);
+            details.push(format!("db circuit={}", circuits.circuit_state));
+        }
+        for circuit in &circuits.circuits {
+            if circuit.state != "closed" {
+                level = level.max(HealthLevel::Yellow);
+                details.push(format!(
+                    "{} circuit={} ({} failures)",
+                    circuit.subsystem, circuit.state, circuit.failures
+                ));
+            }
+        }
+    }
+    let detail = if details.is_empty() {
+        format!("live server health_level={level}")
+    } else {
+        format!("live server health_level={level}; {}", details.join("; "))
+    };
+    Ok(Some(LiveServerHealthAssessment {
+        probe: HealthProbe {
+            name: "server_health".into(),
+            status: match level {
+                HealthLevel::Green => "ok",
+                HealthLevel::Yellow => "degraded",
+                HealthLevel::Red => "fail",
+            }
+            .into(),
+            latency_ms: (latency_ms * 100.0).round() / 100.0,
+            detail,
+        },
+        level,
+        pressure,
+        circuits: typed.circuit_breakers,
+    }))
+}
+
 fn synthesize_robot_health_probes_from_server(
     config: &mcp_agent_mail_core::Config,
     server_health: &serde_json::Value,
     rpc_latency_ms: f64,
 ) -> Option<LiveServerRobotHealthProbes> {
     let typed = parse_health_check_response(server_health)?;
+    // Missing observations must take the local probe path. A fresh CLI's
+    // process-global counters cannot stand in for the serving daemon's state.
+    let server_integrity = typed.integrity.as_ref()?;
     if mailbox_database_identity(&config.database_url)
         != mailbox_database_identity(&typed.database_url)
         || mailbox_storage_identity(&config.storage_root)
@@ -9162,9 +9377,9 @@ fn synthesize_robot_health_probes_from_server(
 
     let archive_db_parity =
         live_server_archive_parity_probe_from_health(&config.storage_root, &typed);
-    let search_index_snapshot = server_health
-        .get("lexical_backfill")
-        .and_then(|value| serde_json::from_value::<LexicalBackfillHealth>(value.clone()).ok())
+    let search_index_snapshot = typed
+        .lexical_backfill
+        .clone()
         .or_else(|| robot_search_index_health_from_config(config).ok())?;
     let search_status = search_index_probe_status(&search_index_snapshot);
     let search_index_probe = HealthProbe {
@@ -9206,21 +9421,18 @@ fn synthesize_robot_health_probes_from_server(
         degraded: false,
     };
 
-    let integrity_metrics =
-        typed
-            .integrity
-            .map(|server_integrity| mcp_agent_mail_db::IntegrityMetrics {
-                last_ok_ts: server_integrity.last_ok_ts,
-                last_check_ts: server_integrity.last_check_ts,
-                last_full_check_ts: server_integrity.last_full_check_ts,
-                last_check_kind: server_integrity.last_check_kind,
-                last_check_outcome: server_integrity.last_check_outcome,
-                last_full_check_outcome: server_integrity.last_full_check_outcome,
-                checks_total: server_integrity.checks_total,
-                failures_total: server_integrity.failures_total,
-                failures_since_last_ok: 0,
-                never_written_orphan_pages: 0,
-            });
+    let integrity_metrics = mcp_agent_mail_db::IntegrityMetrics {
+        last_ok_ts: server_integrity.last_ok_ts,
+        last_check_ts: server_integrity.last_check_ts,
+        last_full_check_ts: server_integrity.last_full_check_ts,
+        last_check_kind: server_integrity.last_check_kind,
+        last_check_outcome: server_integrity.last_check_outcome,
+        last_full_check_outcome: server_integrity.last_full_check_outcome,
+        checks_total: server_integrity.checks_total,
+        failures_total: server_integrity.failures_total,
+        failures_since_last_ok: server_integrity.failures_since_last_ok,
+        never_written_orphan_pages: server_integrity.never_written_orphan_pages,
+    };
 
     Some(LiveServerRobotHealthProbes {
         db_file: resolved.canonical_path,
@@ -9255,7 +9467,7 @@ fn live_server_health_payload_proves_mailbox_healthy(
         || typed.verdicts.write_health.status != "green"
         || typed.verdicts.archive_db_parity.status == "red"
         || typed.semantic_readiness.status != "ok"
-        || typed.verdicts.integrity_check.status == "red"
+        || typed.verdicts.integrity_check.status != "green"
         || typed
             .verdicts
             .integrity_check
@@ -9264,10 +9476,16 @@ fn live_server_health_payload_proves_mailbox_healthy(
     {
         return false;
     }
-    if typed
-        .integrity
-        .as_ref()
-        .is_some_and(|integrity| integrity.failures_total > 0)
+    // A lifetime failure tally survives successful recovery. Reuse only
+    // affirmative current/full evidence; absent, pending or failed evidence
+    // and accepted leaked-space advisories require local doctor inspection.
+    let Some(integrity) = typed.integrity.as_ref() else {
+        return false;
+    };
+    if integrity.last_full_check_outcome != mcp_agent_mail_db::IntegrityCheckOutcome::Passed
+        || integrity.last_check_outcome != mcp_agent_mail_db::IntegrityCheckOutcome::Passed
+        || integrity.failures_since_last_ok > 0
+        || integrity.never_written_orphan_pages > 0
     {
         return false;
     }
@@ -9298,16 +9516,25 @@ pub(crate) fn live_server_proves_mailbox_healthy(
     config: &mcp_agent_mail_core::Config,
     target_database_url: &str,
     target_storage_root: &Path,
-) -> bool {
-    let Some((server_health, _latency_ms)) = crate::probe_local_jsonrpc_health_with_latency(config)
+) -> Result<bool, CliError> {
+    // Doctor may already have selected the daemon's advertised mailbox instead
+    // of the CLI's XDG default. Pin the health read to that selected pair while
+    // retaining the configured endpoint and credential.
+    let mut target_config = config.clone();
+    target_config.database_url = target_database_url.to_string();
+    target_config.storage_root = target_storage_root.to_path_buf();
+    let Some((server_health, latency_ms)) =
+        crate::probe_local_jsonrpc_health_with_latency(&target_config)?
     else {
-        return false;
+        return Ok(false);
     };
-    live_server_health_payload_proves_mailbox_healthy(
+    assess_live_server_health(&target_config, &server_health, latency_ms)?
+        .ok_or_else(|| CliError::Other("server health mailbox identity changed".into()))?;
+    Ok(live_server_health_payload_proves_mailbox_healthy(
         target_database_url,
         target_storage_root,
         &server_health,
-    )
+    ))
 }
 
 // ── Reservations command implementation ─────────────────────────────────────
@@ -12291,7 +12518,7 @@ fn append_malformed_db_agent_diagnostics(
                 reason_code: "malformed_agent_name".to_string(),
                 severity: "warn".to_string(),
                 agent: agent.name.clone(),
-                summary: "Agent name does not match adjective+noun rules".to_string(),
+                summary: "Agent name is not a valid vocabulary name or explicit task ID".to_string(),
                 detail: "The DB row is readable, but the name cannot be normalized by the current agent-name validator.".to_string(),
                 evidence: format!("agent_id={}", agent.id),
                 safe_command: format!(
@@ -15215,6 +15442,13 @@ fn atc_summary_data(
         experiences_resolved: resolved_total,
         experiences_censored: censored_total,
         experiences_expired: expired_total,
+        liveness_feedback: snapshot
+            .experiences_censored
+            .map(|censored| AtcLivenessFeedbackData {
+                open: snapshot.experiences_open,
+                resolved: snapshot.experiences_resolved,
+                censored,
+            }),
         tracked_agents: snapshot.tracked_agents.len(),
         degraded_agents: snapshot
             .tracked_agents
@@ -16610,15 +16844,15 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let config = mcp_agent_mail_core::Config::from_env();
             // br-kp1in.18: a running server answers from its live pool and
             // index in milliseconds; the private snapshot below costs seconds
-            // per call on a large mailbox. The server's search has no
-            // recipient-kind filter. Implicit CWD uses negotiated nearest
-            // ancestor selection, preserving the local project-scope contract.
-            if kind.is_none()
-                && !query.trim().is_empty()
+            // per call on a large mailbox. Recipient-kind filtering is
+            // negotiated before dispatch so older daemons cannot silently
+            // ignore it. Implicit CWD keeps nearest-ancestor project selection.
+            if !query.trim().is_empty()
                 && let Some((project, data)) = search_via_server(
                     &config,
                     &automatic_robot_project_selection(args.project.as_deref())?,
                     &query,
+                    kind.as_deref(),
                     importance.as_deref(),
                     since.as_deref(),
                     limit,
@@ -16919,7 +17153,28 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             // E4 (br-bvq1x.5.4): on a DB failure, classify it (A2) and attach the
             // safe-remediation contract so an agent knows what is safe to do.
             let mut db_error_message: Option<String> = None;
-            let live_server_health = crate::probe_local_jsonrpc_health_with_latency(&config);
+            let live_server_health = crate::probe_local_jsonrpc_health_with_latency(&config)?;
+            let server_assessment = live_server_health
+                .as_ref()
+                .map(|(payload, latency)| assess_live_server_health(&config, payload, *latency))
+                .transpose()?
+                .flatten();
+            let (server_unhealthy, server_degraded, server_pressure, server_circuits, server_alert) =
+                if let Some(assessment) = server_assessment {
+                    let unhealthy = assessment.level == mcp_agent_mail_core::HealthLevel::Red;
+                    let degraded = assessment.level != mcp_agent_mail_core::HealthLevel::Green;
+                    let alert = degraded.then(|| assessment.probe.detail.clone());
+                    probes.push(assessment.probe);
+                    (
+                        unhealthy,
+                        degraded,
+                        assessment.pressure,
+                        assessment.circuits,
+                        alert,
+                    )
+                } else {
+                    (false, false, None, None, None)
+                };
             let mut integrity_override: Option<mcp_agent_mail_db::IntegrityMetrics> = None;
 
             let (
@@ -16948,7 +17203,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 let archive_db_parity_degraded = live.archive_db_parity.degraded;
                 probes.push(live.archive_db_parity.probe);
                 probes.push(live.search_index_probe);
-                integrity_override = live.integrity_metrics;
+                integrity_override = Some(live.integrity_metrics);
                 (
                     true,
                     db_file_sanity_unhealthy,
@@ -17062,16 +17317,26 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             };
 
             // 2. Circuit breaker status
-            let db_health = mcp_agent_mail_db::db_health_status();
+            let circuit_source = if server_circuits.is_some() {
+                "live server"
+            } else {
+                "local process (daemon circuit state unavailable)"
+            };
+            let db_health = server_circuits.unwrap_or_else(mcp_agent_mail_db::db_health_status);
             let open_circuits: Vec<String> = db_health
                 .circuits
                 .iter()
                 .filter(|c| c.state != "closed")
                 .map(|c| format!("{}={} ({} failures)", c.subsystem, c.state, c.failures))
                 .collect();
-            let circuits_ok = open_circuits.is_empty();
+            let circuits_ok = open_circuits.is_empty() && db_health.circuit_state == "closed";
             let circuit_detail = if circuits_ok {
                 "All circuits closed".to_string()
+            } else if open_circuits.is_empty() {
+                format!(
+                    "Active circuit faults: db={} ({} failures)",
+                    db_health.circuit_state, db_health.circuit_failures
+                )
             } else {
                 format!("Active circuit faults: {}", open_circuits.join(", "))
             };
@@ -17079,7 +17344,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 name: "circuit_breakers".into(),
                 status: if circuits_ok { "ok" } else { "degraded" }.into(),
                 latency_ms: 0.0,
-                detail: circuit_detail,
+                detail: format!("{circuit_source}: {circuit_detail}"),
             });
 
             // Per-subsystem circuit details
@@ -17098,7 +17363,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 mcp_agent_mail_core::backpressure::compute_capacity_governor_decision(
                     "search_messages",
                 );
-            let health_str = capacity_decision.health_level.to_string();
+            let health_str = server_pressure
+                .as_ref()
+                .map_or(capacity_decision.health_level, |(level, _)| *level)
+                .to_string();
             let signals = &capacity_decision.signals;
             let backpressure_degraded = health_str != "green";
             let backpressure_unhealthy = health_str == "red";
@@ -17116,21 +17384,26 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 name: "backpressure".into(),
                 status: health_str.clone(),
                 latency_ms: 0.0,
-                detail: format!(
-                    "decision={} enforced={} shedable={} pool={}% wbq={}% commit={}% \
-                     wbq_wait_p95_us={} commit_wait_p95_us={} disk={}{} memory={}{}",
-                    capacity_decision.action,
-                    capacity_decision.enforced,
-                    capacity_decision.tool_is_shedable,
-                    signals.pool_utilization_pct,
-                    signals.wbq_depth_pct,
-                    signals.commit_depth_pct,
-                    signals.wbq_queue_p95_us,
-                    signals.commit_queue_p95_us,
-                    signals.disk_pressure_level,
-                    disk_stale,
-                    signals.memory_pressure_level,
-                    memory_stale,
+                detail: server_pressure.map_or_else(
+                    || {
+                        format!(
+                            "local process: decision={} enforced={} shedable={} pool={}% wbq={}% commit={}% \
+                             wbq_wait_p95_us={} commit_wait_p95_us={} disk={}{} memory={}{}",
+                            capacity_decision.action,
+                            capacity_decision.enforced,
+                            capacity_decision.tool_is_shedable,
+                            signals.pool_utilization_pct,
+                            signals.wbq_depth_pct,
+                            signals.commit_depth_pct,
+                            signals.wbq_queue_p95_us,
+                            signals.commit_queue_p95_us,
+                            signals.disk_pressure_level,
+                            disk_stale,
+                            signals.memory_pressure_level,
+                            memory_stale,
+                        )
+                    },
+                    |(_, detail)| format!("live server: {detail}"),
                 ),
             });
 
@@ -17332,6 +17605,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 || search_index_unhealthy
                 || backpressure_unhealthy
                 || descriptors_unhealthy
+                || server_unhealthy
             {
                 "unhealthy"
             } else if db_file_sanity_degraded
@@ -17346,6 +17620,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 || process_owner_degraded
                 || descriptors_degraded
                 || write_mode_degraded
+                || server_degraded
             {
                 "degraded"
             } else {
@@ -17490,6 +17765,13 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             }
 
             // Alerts
+            if let Some(detail) = server_alert {
+                env = env.with_alert(
+                    if server_unhealthy { "error" } else { "warn" },
+                    detail,
+                    Some("am doctor check --json".to_string()),
+                );
+            }
             if !db_ok {
                 // E4 (br-bvq1x.5.4): attach the safe-remediation contract derived
                 // from the classified DB failure (A2) and point the alert action at
@@ -19417,6 +19699,7 @@ mod tests {
             tick_count: 7,
             experiences_open: 4,
             experiences_resolved: 9,
+            experiences_censored: None,
             policy_revision: 17,
             tracked_agents: vec![
                 AtcRobotAgent {
@@ -19965,6 +20248,40 @@ mod tests {
                 .map(|execution| execution.trace_id.as_str()),
             Some("atc-trace-12")
         );
+    }
+
+    #[test]
+    fn atc_summary_distinguishes_live_feedback_from_durable_experiences() {
+        let mut snapshot = sample_atc_snapshot();
+        snapshot.experiences_censored = Some(7);
+        let summary = atc_summary_data(&snapshot, None, 5);
+        assert_eq!(summary.experiences_resolved, 9);
+        assert_eq!(summary.experiences_censored, 1);
+        let live = summary.liveness_feedback.as_ref().unwrap();
+        assert_eq!(live.open, 4);
+        assert_eq!(live.resolved, 9);
+        assert_eq!(live.censored, 7);
+
+        snapshot.experiences_censored = Some(0);
+        let summary = atc_summary_data(&snapshot, None, 5);
+        assert_eq!(summary.experiences_censored, 1);
+        assert_eq!(summary.liveness_feedback.as_ref().unwrap().censored, 0);
+        let payload = serde_json::to_value(summary).unwrap();
+        assert_eq!(payload["liveness_feedback"]["censored"], 0);
+
+        let mut legacy = serde_json::to_value(snapshot).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("experiences_censored");
+        let legacy: AtcRobotSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.experiences_censored, None);
+        let summary = atc_summary_data(&legacy, None, 5);
+        assert_eq!(summary.experiences_resolved, 9);
+        assert_eq!(summary.experiences_censored, 1);
+        assert!(summary.liveness_feedback.is_none());
+        let payload = serde_json::to_value(summary).unwrap();
+        assert!(payload.get("liveness_feedback").is_none());
     }
 
     #[test]
@@ -21358,6 +21675,7 @@ mod tests {
             assistance: None,
             guidance: None,
             next_cursor: None,
+            diagnostics: None,
             plan_diagnostic: None,
             search_index: None,
             by_thread: vec![FacetEntry {
@@ -21424,6 +21742,122 @@ mod tests {
     }
 
     #[test]
+    fn collect_search_rows_stops_after_one_page_when_recipient_kind_is_absent() {
+        use mcp_agent_mail_db::search_planner::{SearchQuery, SearchResponse};
+
+        let conn = DbConn::open_memory().expect("real recipient database");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (message_id INTEGER, kind TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO message_recipients VALUES (10, 'to'), (20, 'cc')",
+            &[],
+        )
+        .unwrap();
+        let mut calls = 0;
+        let rows = collect_search_rows_with_runner(
+            &conn,
+            SearchQuery::messages("needle", 1),
+            Some("bcc"),
+            20,
+            |_| {
+                calls += 1;
+                assert_eq!(calls, 1, "an absent kind must not scan the next page");
+                Ok(SearchResponse {
+                    results: vec![planner_search_result_row(
+                        10, "first", 0.9, 100, "th-1", "Alpha",
+                    )],
+                    ranking: Default::default(),
+                    next_cursor: Some("more-search-results".into()),
+                    explain: None,
+                    assistance: None,
+                    guidance: Some(empty_search_guidance()),
+                    audit: vec![],
+                })
+            },
+        )
+        .expect("absent recipient kind");
+        assert_eq!(calls, 1, "execute the backend once to preserve validation");
+        assert!(rows.rows.is_empty());
+        assert!(rows.next_cursor.is_none());
+        assert_eq!(
+            serde_json::to_value(rows.guidance).unwrap(),
+            serde_json::to_value(Some(empty_search_guidance())).unwrap(),
+            "keep the backend's diagnostics"
+        );
+    }
+
+    #[test]
+    fn collect_search_rows_keeps_paging_when_kind_exists_beyond_the_first_page() {
+        use mcp_agent_mail_db::search_planner::{SearchQuery, SearchResponse};
+
+        let conn = DbConn::open_memory().expect("real recipient database");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (message_id INTEGER, kind TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO message_recipients VALUES (10, 'to'), (20, 'bcc')",
+            &[],
+        )
+        .unwrap();
+        let mut calls = 0;
+        let rows = collect_search_rows_with_runner(
+            &conn,
+            SearchQuery::messages("needle", 1),
+            Some("bcc"),
+            20,
+            |query| {
+                calls += 1;
+                let (id, next_cursor) = if query.cursor.is_none() {
+                    (10, Some("second-page".into()))
+                } else {
+                    assert_eq!(query.cursor.as_deref(), Some("second-page"));
+                    (20, None)
+                };
+                Ok(SearchResponse {
+                    results: vec![planner_search_result_row(
+                        id, "match", 0.9, 100, "th-1", "Alpha",
+                    )],
+                    ranking: Default::default(),
+                    next_cursor,
+                    explain: None,
+                    assistance: None,
+                    guidance: None,
+                    audit: vec![],
+                })
+            },
+        )
+        .expect("recipient kind on a later page");
+        assert_eq!(calls, 2);
+        assert_eq!(rows.rows.iter().map(|row| row.id).collect::<Vec<_>>(), [20]);
+        assert!(rows.next_cursor.is_none());
+    }
+
+    #[test]
+    fn collect_search_rows_preserves_backend_errors_before_kind_presence_probe() {
+        use mcp_agent_mail_db::search_planner::SearchQuery;
+
+        // No recipient table: probing it before the backend would hide the
+        // actual query/cursor error behind an unrelated database error.
+        let conn = DbConn::open_memory().expect("real empty database");
+        let result = collect_search_rows_with_runner(
+            &conn,
+            SearchQuery::messages("needle", 1),
+            Some("bcc"),
+            20,
+            |_| Err(CliError::Other("invalid search cursor control".into())),
+        );
+        match result {
+            Err(CliError::Other(message)) => assert_eq!(message, "invalid search cursor control"),
+            _ => panic!("the original backend error must survive"),
+        }
+    }
+
+    #[test]
     fn collect_search_rows_with_runner_pages_until_kind_matches_fill_limit() {
         use mcp_agent_mail_db::search_planner::{SearchQuery, SearchResponse};
 
@@ -21463,6 +21897,7 @@ mod tests {
                         planner_search_result_row(10, "first", 0.9, 100, "th-1", "Alpha"),
                         planner_search_result_row(20, "second", 0.8, 200, "th-2", "Beta"),
                     ],
+                    ranking: Default::default(),
                     next_cursor: Some("cursor-2".into()),
                     explain: None,
                     assistance: None,
@@ -21473,6 +21908,7 @@ mod tests {
                     results: vec![planner_search_result_row(
                         30, "third", 0.7, 300, "th-3", "Gamma",
                     )],
+                    ranking: Default::default(),
                     next_cursor: None,
                     explain: None,
                     assistance: None,
@@ -21553,6 +21989,7 @@ mod tests {
                     }
                     Ok(SearchResponse {
                         results,
+                        ranking: Default::default(),
                         next_cursor: more_backend_pages.then(|| "cursor-after-page".into()),
                         explain: None,
                         assistance: None,
@@ -21684,6 +22121,61 @@ mod tests {
         );
         assert_eq!(probe.status, "warn");
         assert!(probe.detail.contains("later quick check cannot clear it"));
+
+        let current_evidence: Vec<_> = [
+            (
+                "failed outcome at equal timestamps",
+                mcp_agent_mail_db::IntegrityCheckOutcome::Failed,
+                0,
+                5,
+                2,
+            ),
+            (
+                "current failures after last check",
+                mcp_agent_mail_db::IntegrityCheckOutcome::Passed,
+                1,
+                5,
+                2,
+            ),
+            (
+                "failed outcome precedes the check counter",
+                mcp_agent_mail_db::IntegrityCheckOutcome::Failed,
+                0,
+                0,
+                0,
+            ),
+        ]
+        .into_iter()
+        .map(
+            |(name, outcome, failures_since_last_ok, checks_total, failures_total)| {
+                let first_check = checks_total == 0;
+                let (probe, ok) = summarize_integrity_probe(&mcp_agent_mail_db::IntegrityMetrics {
+                    last_ok_ts: if first_check { 0 } else { 3_000 },
+                    last_check_ts: 3_000,
+                    last_full_check_ts: if first_check { 0 } else { 2_000 },
+                    last_check_kind: Some(mcp_agent_mail_db::CheckKind::Quick),
+                    last_check_outcome: outcome,
+                    last_full_check_outcome: if first_check {
+                        mcp_agent_mail_db::IntegrityCheckOutcome::Unknown
+                    } else {
+                        mcp_agent_mail_db::IntegrityCheckOutcome::Passed
+                    },
+                    checks_total,
+                    failures_total,
+                    failures_since_last_ok,
+                    never_written_orphan_pages: 0,
+                });
+                (name, ok, probe.status, probe.detail)
+            },
+        )
+        .collect();
+        assert!(
+            current_evidence
+                .iter()
+                .all(|(_, ok, status, _)| !ok && status == "warn"),
+            "explicit current integrity evidence must win over timestamps: {current_evidence:?}"
+        );
+        assert!(current_evidence[2].3.contains("last check failed"));
     }
 
     #[test]
@@ -23763,6 +24255,7 @@ mod tests {
             assistance: None,
             guidance: None,
             next_cursor: None,
+            diagnostics: None,
             plan_diagnostic: None,
             search_index: None,
             by_thread: vec![FacetEntry {
@@ -23795,6 +24288,7 @@ mod tests {
             assistance: None,
             guidance: None,
             next_cursor: None,
+            diagnostics: None,
             plan_diagnostic: None,
             search_index: None,
             by_thread: vec![],
@@ -23836,9 +24330,11 @@ mod tests {
                         ProjectSelection::Exact(path.clone()),
                     ] {
                         assert!(
-                            search_via_server(&config, &selection, "deploy", None, None, 20, None)
-                                .unwrap()
-                                .is_none()
+                            search_via_server(
+                                &config, &selection, "deploy", None, None, None, 20, None,
+                            )
+                            .unwrap()
+                            .is_none()
                         );
                     }
                 }
@@ -23870,6 +24366,7 @@ mod tests {
                     config,
                     &crate::message_read::ProjectSelection::Exact("registered-project".into()),
                     "deploy",
+                    None,
                     Some("high"),
                     None,
                     20,
@@ -23888,6 +24385,113 @@ mod tests {
         );
         assert_eq!(requests[2]["params"]["arguments"]["importance"], "high");
         assert_eq!(requests.len(), 5);
+    }
+
+    #[test]
+    fn robot_search_kind_command_uses_negotiated_server_without_local_mailbox() {
+        use crate::reservation_read::tests::{TestReply, mailbox_payload, with_test_server};
+        let _lock = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = serde_json::json!({"id":7,"slug":"registered-project",
+            "human_key":"/work/demo","created_at":"2026-10-28T00:00:00Z","agents":[]});
+        let ((result, output), requests) = with_test_server(
+            |config| {
+                let mut capability = mailbox_payload(config);
+                capability["search_recipient_kind"] = "delivery_v1".into();
+                vec![
+                    TestReply::Resource(capability.clone()),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Tool(serde_json::json!({"result":[{
+                        "id":7,"subject":"Deploy","importance":"high","ack_required":0,
+                        "created_ts":"2026-10-28T00:00:00Z","thread_id":"release","from":"BlueLake",
+                        "to":["RedFox"],"cc":["GreenHill"],"body_md":"Ready to deploy","score":1.5
+                    }]})),
+                    TestReply::Resource(project.clone()),
+                    TestReply::Resource(capability),
+                ]
+            },
+            |_| {
+                let capture = ftui_runtime::StdioCapture::install().unwrap();
+                let result = handle_robot(RobotArgs {
+                    format: Some(OutputFormat::Json),
+                    json: true,
+                    project: Some("registered-project".into()),
+                    agent: None,
+                    command: RobotSubcommand::Search {
+                        query: "deploy".into(),
+                        kind: Some(" CC ".into()),
+                        importance: None,
+                        since: None,
+                        limit: 2,
+                        cursor: None,
+                    },
+                });
+                (result, capture.drain_to_string())
+            },
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let payload: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(payload["served_by"], "server");
+        assert_eq!(payload["results"][0]["id"], 7);
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[2]["method"], "tools/call");
+        assert_eq!(requests[2]["params"]["arguments"]["recipient_kind"], "cc");
+        assert_eq!(
+            requests[2]["params"]["arguments"]["project_key"],
+            "/work/demo"
+        );
+    }
+
+    #[test]
+    fn robot_search_kind_negotiates_before_dispatch_and_rechecks_capability() {
+        use crate::reservation_read::tests::{TestReply, mailbox_payload, with_test_server};
+        let project = serde_json::json!({"id":7,"slug":"registered-project",
+            "human_key":"/work/demo","created_at":"2026-10-28T00:00:00Z","agents":[]});
+        for fault in ["missing", "future", "malformed", "changed"] {
+            let (result, requests) = with_test_server(
+                |config| {
+                    let mut capability = mailbox_payload(config);
+                    match fault {
+                        "future" => capability["search_recipient_kind"] = "delivery_v2".into(),
+                        "malformed" => capability["search_recipient_kind"] = true.into(),
+                        "changed" => capability["search_recipient_kind"] = "delivery_v1".into(),
+                        _ => (),
+                    }
+                    let mut replies = vec![TestReply::Resource(capability)];
+                    if fault == "changed" {
+                        replies.extend([
+                            TestReply::Resource(project.clone()),
+                            TestReply::Tool(serde_json::json!({"result":[]})),
+                            TestReply::Resource(project.clone()),
+                            TestReply::Resource(mailbox_payload(config)),
+                        ]);
+                    }
+                    replies
+                },
+                |config| {
+                    search_via_server(
+                        config,
+                        &crate::message_read::ProjectSelection::Exact("registered-project".into()),
+                        "needle",
+                        Some("bcc"),
+                        None,
+                        None,
+                        2,
+                        None,
+                    )
+                },
+            );
+            if matches!(fault, "missing" | "future") {
+                assert!(
+                    result.unwrap().is_none(),
+                    "unsupported daemon must use explicit fallback"
+                );
+            } else {
+                assert!(result.is_err(), "{fault} authority must fail closed");
+            }
+            assert_eq!(requests.len(), if fault == "changed" { 5 } else { 1 });
+        }
     }
 
     #[test]
@@ -23919,7 +24523,7 @@ mod tests {
                     TestReply::Resource(ancestor_mailbox_payload(config)),
                 ]
             },
-            |config| search_via_server(config, &selection, "deploy", None, None, 20, None),
+            |config| search_via_server(config, &selection, "deploy", None, None, None, 20, None),
         );
         let (project, data) = result.unwrap().expect("ancestor search used the daemon");
         assert_eq!(project.human_key, human_key);
@@ -23986,6 +24590,12 @@ mod tests {
                          "from": "BlueLake", "to": [], "cc": [], "score": second_score},
                     ],
                     "next_cursor": "c2",
+                    "diagnostics": {
+                        "degraded": true,
+                        "fallback_mode": "recipient_kind_page_budget",
+                        "budget_exhausted": true,
+                        "remediation_hints": ["Continue with next_cursor"],
+                    },
                 }),
             )
             .expect("server response")
@@ -23996,6 +24606,20 @@ mod tests {
         assert_eq!(data.served_by, Some("server"));
         assert_eq!(data.total_results, 2);
         assert_eq!(data.next_cursor.as_deref(), Some("c2"));
+        let diagnostics = data
+            .diagnostics
+            .as_ref()
+            .expect("server diagnostics survive CLI mapping");
+        assert!(diagnostics.degraded);
+        assert_eq!(diagnostics.budget_exhausted, Some(true));
+        assert_eq!(
+            diagnostics.fallback_mode.as_deref(),
+            Some("recipient_kind_page_budget")
+        );
+        assert_eq!(
+            serde_json::to_value(&data).unwrap()["diagnostics"]["budget_exhausted"],
+            true
+        );
         let (first, second) = (&data.results[0], &data.results[1]);
         assert_eq!((first.id, first.relevance), (7, 1.5));
         assert_eq!(first.snippet, "Roll out the new plan");
@@ -24045,6 +24669,7 @@ mod tests {
             next_cursor: None,
             plan_diagnostic: None,
             search_index: Some(health.clone()),
+            diagnostics: None,
             by_thread: vec![],
             by_agent: vec![],
             by_importance: vec![],
@@ -24115,6 +24740,7 @@ mod tests {
                 }],
             }),
             next_cursor: Some("s3feccccccccccccd:i42".into()),
+            diagnostics: None,
             plan_diagnostic: None,
             search_index: None,
             by_thread: vec![],
@@ -29058,7 +29684,9 @@ mod tests {
                     "last_check_outcome": "passed",
                     "last_full_check_outcome": "passed",
                     "checks_total": 3,
-                    "failures_total": 0
+                    "failures_total": 0,
+                    "failures_since_last_ok": 0,
+                    "never_written_orphan_pages": 0
                 },
                 "lexical_backfill": {
                     "state": "fresh",
@@ -29102,18 +29730,222 @@ mod tests {
         assert_eq!(synthesized.search_index_probe.status, "ok");
         assert!(!synthesized.search_index_unhealthy);
         assert!(!synthesized.search_index_degraded);
-        assert_eq!(
-            synthesized
-                .integrity_metrics
-                .expect("integrity")
-                .checks_total,
-            3
-        );
+        assert_eq!(synthesized.integrity_metrics.checks_total, 3);
         assert!(live_server_health_payload_proves_mailbox_healthy(
             &db_url,
             &storage_root,
             &healthy_payload
         ));
+        let assessment = assess_live_server_health(&config, &healthy_payload, 2.345)
+            .unwrap()
+            .expect("matching live mailbox");
+        assert_eq!(assessment.level, mcp_agent_mail_core::HealthLevel::Green);
+        assert_eq!(assessment.probe.status, "ok");
+
+        // Doctor may reuse affirmative current/full evidence after recovery;
+        // a lifetime tally is not a current failure. Missing or weaker evidence
+        // must still take the real local inspection path.
+        let mut recovered = healthy_payload.clone();
+        recovered["integrity"]["failures_total"] = 7.into();
+        let mut missing_integrity = healthy_payload.clone();
+        missing_integrity
+            .as_object_mut()
+            .unwrap()
+            .remove("integrity");
+        let mut pending_full = healthy_payload.clone();
+        pending_full["integrity"]["last_check_kind"] =
+            serde_json::json!(mcp_agent_mail_db::CheckKind::Quick);
+        pending_full["integrity"]["last_full_check_outcome"] = "unknown".into();
+        pending_full["integrity"]["last_full_check_ts"] = 0.into();
+        pending_full["verdicts"]["integrity_check"]["status"] = "yellow".into();
+        pending_full["verdicts"]["integrity_check"]["detail"] =
+            "no full PRAGMA integrity_check has completed".into();
+        let mut failed_full = recovered.clone();
+        failed_full["integrity"]["last_check_kind"] =
+            serde_json::json!(mcp_agent_mail_db::CheckKind::Quick);
+        failed_full["integrity"]["last_full_check_outcome"] = "failed".into();
+        let mut failed_latest = recovered.clone();
+        failed_latest["integrity"]["last_check_outcome"] = "failed".into();
+        let mut current_failures = recovered.clone();
+        current_failures["integrity"]["failures_since_last_ok"] = 1.into();
+        let mut accepted_orphans = healthy_payload.clone();
+        accepted_orphans["integrity"]["never_written_orphan_pages"] = 425.into();
+        let cases = [
+            ("recovered historical failures", recovered, true),
+            ("missing integrity object", missing_integrity, false),
+            ("pending full check", pending_full, false),
+            ("failed full after quick pass", failed_full, false),
+            ("latest check failed", failed_latest, false),
+            ("failures since last ok", current_failures, false),
+            ("accepted orphan-page advisory", accepted_orphans, false),
+        ];
+        let outcomes: Vec<_> = cases
+            .iter()
+            .map(|(name, payload, expected)| {
+                assert!(
+                    parse_health_check_response(payload).is_some(),
+                    "{name} must exercise a schema-valid health payload"
+                );
+                (
+                    *name,
+                    live_server_health_payload_proves_mailbox_healthy(
+                        &db_url,
+                        &storage_root,
+                        payload,
+                    ),
+                    *expected,
+                )
+            })
+            .collect();
+        assert!(
+            outcomes
+                .iter()
+                .all(|(_, actual, expected)| actual == expected),
+            "doctor integrity attestation (name, actual, expected): {outcomes:?}"
+        );
+
+        let unavailable_integrity: Vec<_> = [
+            ("missing integrity object", None),
+            ("null integrity object", Some(serde_json::Value::Null)),
+        ]
+        .into_iter()
+        .map(|(name, integrity)| {
+            let mut payload = healthy_payload.clone();
+            let fields = payload.as_object_mut().unwrap();
+            if let Some(integrity) = integrity {
+                fields.insert("integrity".into(), integrity);
+            } else {
+                fields.remove("integrity");
+            }
+            assert!(
+                parse_health_check_response(&payload).is_some(),
+                "{name} must be a schema-valid unavailable observation"
+            );
+            (
+                name,
+                synthesize_robot_health_probes_from_server(&config, &payload, 0.5).is_some(),
+            )
+        })
+        .collect();
+        assert!(
+            unavailable_integrity.iter().all(|(_, accepted)| !accepted),
+            "unavailable daemon integrity must use local probes: {unavailable_integrity:?}"
+        );
+
+        // Retain the daemon's measured counters rather than manufacturing
+        // zeros in the CLI's fresh process. A real local DB remains required.
+        let mut counter_payload = healthy_payload.clone();
+        counter_payload["integrity"]["never_written_orphan_pages"] = 425.into();
+        let counters = synthesize_robot_health_probes_from_server(&config, &counter_payload, 0.5)
+            .expect("matching real local mailbox")
+            .integrity_metrics;
+        assert_eq!(counters.never_written_orphan_pages, 425);
+        assert_eq!(counters.failures_since_last_ok, 0);
+        let (probe, _) = summarize_integrity_probe(&counters);
+        assert!(probe.detail.contains("425 never-written orphan page(s)"));
+        counter_payload["integrity"]["failures_since_last_ok"] = 2.into();
+        let counters = synthesize_robot_health_probes_from_server(&config, &counter_payload, 0.5)
+            .unwrap()
+            .integrity_metrics;
+        assert_eq!(counters.failures_since_last_ok, 2);
+        for field in ["failures_since_last_ok", "never_written_orphan_pages"] {
+            let mut incomplete = counter_payload.clone();
+            incomplete["integrity"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                parse_health_check_response(&incomplete).is_none(),
+                "{field}"
+            );
+            assert!(
+                synthesize_robot_health_probes_from_server(&config, &incomplete, 0.5).is_none(),
+                "a missing {field} is unavailable evidence, never an attested zero"
+            );
+        }
+
+        // Each of these faults lives in the daemon, not in the CLI's fresh
+        // process-global counters. A successful local DB probe must not make
+        // the robot report greener than the daemon's current observation.
+        for (contributor, reported, expected) in [
+            ("pressure", "red", mcp_agent_mail_core::HealthLevel::Red),
+            ("archive_lag", "red", mcp_agent_mail_core::HealthLevel::Red),
+            (
+                "coalescer_latency",
+                "yellow",
+                mcp_agent_mail_core::HealthLevel::Yellow,
+            ),
+            (
+                "retention",
+                "yellow",
+                mcp_agent_mail_core::HealthLevel::Yellow,
+            ),
+        ] {
+            let mut payload = healthy_payload.clone();
+            // A stale top-level green cannot erase a stronger named finding.
+            payload["health_level_contributors"] = serde_json::json!([
+                {"name":contributor, "level":reported, "detail":"serving process fault"}
+            ]);
+            assert!(
+                synthesize_robot_health_probes_from_server(&config, &payload, 0.5).is_some(),
+                "the real local DB remains healthy in this control"
+            );
+            let assessed = assess_live_server_health(&config, &payload, 0.5)
+                .unwrap()
+                .unwrap();
+            assert_eq!(assessed.level, expected, "{contributor}");
+            assert!(assessed.probe.detail.contains(contributor));
+            if contributor == "pressure" {
+                assert_eq!(assessed.pressure.unwrap().0, expected);
+            }
+        }
+        let mut write_failure = healthy_payload.clone();
+        write_failure["verdicts"]["write_health"]["status"] = "red".into();
+        write_failure["verdicts"]["write_health"]["detail"] =
+            "write circuit is open; reads still succeed".into();
+        assert!(synthesize_robot_health_probes_from_server(&config, &write_failure, 0.5).is_none());
+        assert_eq!(
+            assess_live_server_health(&config, &write_failure, 0.5)
+                .unwrap()
+                .unwrap()
+                .level,
+            mcp_agent_mail_core::HealthLevel::Red,
+            "a local fallback cannot clear the daemon's write failure"
+        );
+        let mut circuit_failure = healthy_payload.clone();
+        circuit_failure["circuit_breakers"] = serde_json::json!({
+            "circuit_state":"closed", "circuit_failures":0,
+            "circuits":[{
+                "subsystem":"git", "state":"open", "failures":9,
+                "threshold":5, "reset_secs":30, "half_open_successes":0,
+                "recommendation":"inspect the archive writer"
+            }]
+        });
+        let assessed = assess_live_server_health(&config, &circuit_failure, 0.5)
+            .unwrap()
+            .unwrap();
+        assert_eq!(assessed.level, mcp_agent_mail_core::HealthLevel::Yellow);
+        assert!(
+            assessed
+                .probe
+                .detail
+                .contains("git circuit=open (9 failures)")
+        );
+        let circuits = assessed.circuits.expect("daemon circuits retained");
+        assert_eq!(circuits.circuits[0].state, "open");
+        assert_eq!(circuits.circuits[0].failures, 9);
+        circuit_failure["circuit_breakers"]["circuits"][0]["state"] = "unknown".into();
+        assert!(assess_live_server_health(&config, &circuit_failure, 0.5).is_err());
+        for field in ["status", "health_level"] {
+            let mut invalid = healthy_payload.clone();
+            invalid[field] = "unknown".into();
+            assert!(assess_live_server_health(&config, &invalid, 1.0).is_err());
+        }
+        let mut invalid = healthy_payload.clone();
+        invalid["health_level_contributors"] = serde_json::json!([
+            {"name":"pressure", "level":"unknown", "detail":"not a verdict"}
+        ]);
+        assert!(assess_live_server_health(&config, &invalid, 1.0).is_err());
 
         // Different mailbox on the server must fall back to local probes.
         let other_db = temp_dir.path().join("other.sqlite3");
@@ -29127,6 +29959,11 @@ mod tests {
             "full integrity_check passed",
         );
         assert!(synthesize_robot_health_probes_from_server(&config, &other_payload, 1.0).is_none());
+        assert!(
+            assess_live_server_health(&config, &other_payload, 1.0)
+                .unwrap()
+                .is_none()
+        );
         assert!(!live_server_health_payload_proves_mailbox_healthy(
             &db_url,
             &storage_root,
@@ -30309,7 +31146,11 @@ mod tests {
             ..mcp_agent_mail_db::DbPoolConfig::default()
         })
         .expect("create real search pool");
-        for kind in [None, Some("to"), Some("cc")] {
+        for (query, kind) in ["pagewalk", "from:Alice"].into_iter().flat_map(|query| {
+            [None, Some("to"), Some("cc")]
+                .into_iter()
+                .map(move |kind| (query, kind))
+        }) {
             let mut cursor = None;
             let mut ids = HashSet::new();
             let mut cursors = HashSet::new();
@@ -30318,7 +31159,7 @@ mod tests {
                     &conn,
                     &pool,
                     1,
-                    "pagewalk",
+                    query,
                     kind,
                     None,
                     None,
@@ -30351,7 +31192,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 ids, expected,
-                "every matching message must be reachable for {kind:?}"
+                "every matching message must be reachable for {query} {kind:?}"
             );
         }
     }

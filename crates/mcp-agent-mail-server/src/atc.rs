@@ -19,7 +19,8 @@ pub use engine::*;
 #[path = "atc_population.rs"]
 mod population;
 pub use population::{
-    AtcPopulationHydrationStats, atc_population_hydration_stats, atc_sync_population_from_db,
+    AtcPopulationHealthSnapshot, AtcPopulationHydrationStats, atc_population_health_snapshot,
+    atc_population_hydration_stats, atc_sync_population_from_db,
 };
 
 #[path = "atc_delivery.rs"]
@@ -143,6 +144,14 @@ pub fn atc_delivery_stats() -> AtcDeliveryStats {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .admission
         .stats()
+}
+
+/// Recheck population and engine coverage before executing a queued release.
+/// A report admitted before a failed or unfinished refresh grants no exemption.
+/// Locks are released before the caller enters the reservation tool.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn atc_release_capacity_admission() -> Result<(), &'static str> {
+    population::release_capacity_admission()
 }
 
 /// Advance bounded hydration or inference, then admit actionable notifications.

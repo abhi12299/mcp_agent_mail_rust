@@ -31,8 +31,11 @@ pub mod staging;
 
 pub use staging::{ProactiveBackupStagingInventory, inspect_proactive_backup_staging};
 
+// Only a Linux test builds non-Unicode staging names from the prefix.
+#[cfg(all(test, target_os = "linux"))]
+use staging::PROACTIVE_STAGING_PREFIX;
 #[cfg(test)]
-use staging::{PROACTIVE_STAGING_PREFIX, inspect_proactive_backup_staging_with_limit};
+use staging::inspect_proactive_backup_staging_with_limit;
 
 #[cfg(unix)]
 pub use namespace::{
@@ -41,7 +44,13 @@ pub use namespace::{
 };
 
 #[cfg(unix)]
-pub(crate) use namespace::{delete_inventoried_file, preflight_inventoried_file_readers};
+pub(crate) use namespace::{
+    delete_inventoried_file, delete_superseded_snapshot_file, preflight_inventoried_file_readers,
+    preflight_superseded_snapshot_readers,
+};
+
+#[cfg(target_os = "linux")]
+pub(crate) use namespace::preflight_current_thread_file_locks;
 
 #[cfg(all(test, unix))]
 use namespace::{

@@ -31,11 +31,15 @@ pub(super) struct RetryQueue {
 }
 
 impl RetryQueue {
+    pub(super) fn next_ready_at(&self) -> Option<Instant> {
+        self.pending.iter().map(|retry| retry.ready_at).min()
+    }
+
     fn contains(&self, id: i64) -> bool {
         self.pending.iter().any(|retry| retry.id == id)
     }
 
-    fn is_full(&self) -> bool {
+    pub(super) fn is_full(&self) -> bool {
         self.pending.len() >= MAX_RETRY_IDS
     }
 
@@ -90,7 +94,8 @@ pub(super) fn transient(error: &StorageError) -> bool {
     ) || matches!(error, StorageError::Io(error)
         if matches!(error.kind(),
             ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::ResourceBusy
-                | ErrorKind::StorageFull | ErrorKind::QuotaExceeded | ErrorKind::OutOfMemory))
+                | ErrorKind::StorageFull | ErrorKind::QuotaExceeded | ErrorKind::OutOfMemory)
+            || crate::recovery::is_file_descriptor_exhaustion(error))
 }
 
 fn finish(
@@ -106,6 +111,58 @@ fn advance(position: &mut ScanPosition, id: i64) {
     if position.ceiling == Some(id) {
         position.ceiling = None;
     }
+}
+
+/// Only temporary admission pressure may yield a successful partial report.
+/// A changed or untrusted source must still abort the pass.
+#[derive(Debug, thiserror::Error)]
+enum PassFailure {
+    #[error("reservation reconciliation deferred: recovery promotion or admission contention")]
+    Busy,
+    #[error("{0}")]
+    Source(String),
+}
+
+impl From<PassFailure> for String {
+    fn from(error: PassFailure) -> Self {
+        error.to_string()
+    }
+}
+
+/// Hold promotion exclusion only for one source observation/publication.
+/// A pass may be resumed after a promotion starts, so each scope must refuse
+/// a retired or rebound pool before observing another numeric reservation ID.
+fn admit_source(
+    pool: &DbPool,
+    config: &Config,
+    expected_identity: Option<&str>,
+) -> Result<mcp_agent_mail_db::write_barrier::WriteActivityGuard, PassFailure> {
+    let activity =
+        mcp_agent_mail_db::write_barrier::try_begin_write_activity().ok_or(PassFailure::Busy)?;
+    if pool.is_closed()
+        || expected_identity.is_some_and(|expected| pool.sqlite_identity_key() != expected)
+    {
+        return Err(PassFailure::Source(
+            "reservation reconciliation source changed; rescan required".into(),
+        ));
+    }
+    validate_source(pool, config).map_err(PassFailure::Source)?;
+    if corruption_circuit_breaker().is_tripped() {
+        return Err(PassFailure::Source(
+            "reservation reconciliation refused: corruption breaker open".into(),
+        ));
+    }
+    Ok(activity)
+}
+
+#[derive(Clone, Copy)]
+struct PassControl<'a> {
+    identity: &'a str,
+    // The checkpointed maintenance path binds its logical generation too.
+    // Some(None) is an admitted legacy source without a generation row;
+    // None preserves the ordinary in-memory API's per-release source proof.
+    generation: Option<Option<&'a str>>,
+    stop: &'a AtomicBool,
 }
 
 // History already walks a bounded primary-key page. Priority must bound the
@@ -125,70 +182,73 @@ fn select_ids(
         .ok()
         .filter(|limit| *limit > 0 && *limit <= PRIORITY_ROWS_PER_PAGE)
         .ok_or("invalid reservation priority candidate budget")?;
-    let conn = outcome(block_on(pool.acquire(cx)))?;
-    let mode = conn
-        .query_sync("PRAGMA query_only", &[])
-        .map_err(source_error)?;
-    if mode.first().and_then(|row| row.get_as::<i64>(0).ok()) != Some(0) {
-        return Err("query-only snapshots cannot authorize reservation archive repair".into());
-    }
-    if position.ceiling.is_none() {
-        let rows = conn
-            .query_sync("SELECT COALESCE(MAX(id), 0) FROM file_reservations", &[])
-            .map_err(source_error)?;
-        let ceiling = rows
-            .first()
-            .ok_or("reservation ID aggregate is missing")?
-            .get_as::<i64>(0)
-            .map_err(source_error)?;
-        position.ceiling = Some(ceiling);
-        position.after = 0;
-    }
-    let ceiling = position.ceiling.unwrap_or(0);
-    // Eligibility is a projection, not a WHERE predicate. One SQL snapshot
-    // supplies the bounded IDs and both hot-row/ledger release evidence.
-    // No unbounded path/reason strings are materialized during discovery.
-    let sql = format!(
-        "SELECT fr.id, CASE WHEN fr.expires_ts > ?3 AND \
+    let mut selected = ScanPosition {
+        after: position.after,
+        ceiling: position.ceiling,
+    };
+    let ids = read_discovery(cx, pool, |conn| {
+        require_writable(conn)?;
+        if selected.ceiling.is_none() {
+            let rows = discovery_query(
+                conn,
+                "SELECT COALESCE(MAX(id), 0) FROM file_reservations",
+                &[],
+            )?;
+            selected.ceiling = Some(
+                rows.first()
+                    .ok_or("reservation ID aggregate is missing")?
+                    .get_as::<i64>(0)
+                    .map_err(source_error)?,
+            );
+            selected.after = 0;
+        }
+        let ceiling = selected.ceiling.unwrap_or(0);
+        // Eligibility is a projection, not a WHERE predicate. One SQL snapshot
+        // supplies the bounded IDs and both hot-row/ledger release evidence.
+        // No unbounded path/reason strings are materialized during discovery.
+        let sql = format!(
+            "SELECT fr.id, CASE WHEN fr.expires_ts > ?3 AND \
          (fr.released_ts IS NOT NULL OR EXISTS \
           (SELECT 1 FROM file_reservation_releases rr WHERE rr.reservation_id = fr.id)) \
          THEN 1 ELSE 0 END AS eligible \
          FROM file_reservations fr WHERE fr.id > ?1 AND fr.id <= ?2 \
          ORDER BY fr.id LIMIT {PRIORITY_ROWS_PER_PAGE}"
-    );
-    let rows = conn
-        .query_sync(
+        );
+        let rows = discovery_query(
+            conn,
             &sql,
             &[
-                position.after.into(),
+                selected.after.into(),
                 ceiling.into(),
                 mcp_agent_mail_db::now_micros().into(),
             ],
-        )
-        .map_err(source_error)?;
-    if rows.is_empty() {
-        position.ceiling = None;
-        return Ok(Vec::new());
-    }
-    let mut ids = Vec::new();
-    let mut last = position.after;
-    for row in &rows {
-        let id = row.get_named::<i64>("id").map_err(source_error)?;
-        let eligible = row.get_named::<i64>("eligible").map_err(source_error)?;
-        if id <= last || id > ceiling || !matches!(eligible, 0 | 1) {
-            return Err("reservation priority page contains invalid selection evidence".into());
+        )?;
+        if rows.is_empty() {
+            selected.ceiling = None;
+            return Ok(Vec::new());
         }
-        last = id;
-        if eligible == 1 && ids.len() < limit {
-            ids.push(id);
+        let mut ids = Vec::new();
+        let mut last = selected.after;
+        for row in &rows {
+            let id = row.get_named::<i64>("id").map_err(source_error)?;
+            let eligible = row.get_named::<i64>("eligible").map_err(source_error)?;
+            if id <= last || id > ceiling || !matches!(eligible, 0 | 1) {
+                return Err("reservation priority page contains invalid selection evidence".into());
+            }
+            last = id;
+            if eligible == 1 && ids.len() < limit {
+                ids.push(id);
+            }
         }
-    }
-    // An entirely nonmatching page has no publication/retry debt to retain.
-    // Otherwise leave advancement to the existing per-ID execution loop:
-    // even a two-write budget break cannot consume the unprocessed page tail.
-    if ids.is_empty() && !cx.checkpoint().is_err() {
-        advance(position, last);
-    }
+        // An entirely nonmatching page has no publication/retry debt to retain.
+        // Otherwise leave advancement to the existing per-ID execution loop:
+        // even a two-write budget break cannot consume the unprocessed page tail.
+        if ids.is_empty() && !cx.checkpoint().is_err() {
+            advance(&mut selected, last);
+        }
+        Ok(ids)
+    })?;
+    *position = selected;
     Ok(ids)
 }
 
@@ -197,17 +257,28 @@ fn attempt(
     cx: &Cx,
     pool: &DbPool,
     config: &Config,
+    control: PassControl<'_>,
     id: i64,
     queue: &mut RetryQueue,
     report: &mut ReservationReconcileReport,
-    stop: &AtomicBool,
-) -> bool {
+) -> Result<bool, PassFailure> {
+    let activity = admit_source(pool, config, Some(control.identity))?;
     let mut attempted = false;
     // Failed checkout/query operations retain retry debt. Validated malformed
     // identity or missing holder evidence still remains a conflict; neither
     // outcome can authorize publication without a fresh live source read.
-    let result = read_source(cx, pool, id).and_then(|source| {
-        source.map_or(Ok(false), |source| {
+    let (source, result) = match read_source(cx, pool, id) {
+        Ok(Some(source)) => {
+            if control
+                .generation
+                .is_some_and(|expected| source.generation.as_deref() != expected)
+            {
+                // This ID belonged to a different pass binding. Refuse the
+                // whole pass without consuming its scan position or retry.
+                return Err(PassFailure::Source(
+                    "reservation reconciliation source generation changed; rescan required".into(),
+                ));
+            }
             let result = publish_release(
                 cx,
                 pool,
@@ -216,20 +287,29 @@ fn attempt(
                 ReleaseTargets::WithOwnedAliases,
                 &mut attempted,
             );
-            tracing::info!(target: "maintenance", event = "reservation_release_reconcile",
-                reservation_id = id, project = %source.project_slug,
-                generation = ?source.generation, db_state = "released",
-                action = "verify_terminal_release", outcome = ?result,
-                "reservation archive release reconciliation decision");
-            result
-        })
-    });
-    report.attempted += usize::from(attempted);
-    if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
-        report.interrupted = true;
-        return false;
+            (Some(source), result)
+        }
+        Ok(None) => (None, Ok(false)),
+        Err(error) => (None, Err(error)),
+    };
+    // The source connection and all archive guards have already returned.
+    // Neither diagnostics nor another item may prolong this exclusion.
+    drop(activity);
+    #[cfg(test)]
+    tests::observe_boundary(tests::Boundary::Attempt(id));
+    if let Some(source) = source {
+        tracing::info!(target: "maintenance", event = "reservation_release_reconcile",
+            reservation_id = id, project = %source.project_slug,
+            generation = ?source.generation, db_state = "released",
+            action = "verify_terminal_release", outcome = ?result,
+            "reservation archive release reconciliation decision");
     }
-    record_result(id, result, queue, report, Instant::now())
+    report.attempted += usize::from(attempted);
+    if control.stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
+        report.interrupted = true;
+        return Ok(false);
+    }
+    Ok(record_result(id, result, queue, report, Instant::now()))
 }
 
 /// Record one completed source/publication outcome, after cancellation has
@@ -286,51 +366,77 @@ pub(super) fn run(
         report.interrupted = true;
         return Ok(finish(report, &cursor.retries));
     }
-    let _write_activity =
-        mcp_agent_mail_db::write_barrier::try_begin_write_activity().ok_or_else(|| {
-            "reservation reconciliation deferred: recovery promotion or admission contention"
-                .to_string()
-        })?;
-    validate_source(pool, config)?;
-    if corruption_circuit_breaker().is_tripped() {
-        return Err("reservation reconciliation refused: corruption breaker open".into());
-    }
     // Retry work precedes ordinary selection, so it must independently pass
     // the same writable-source admission before touching any archive path.
     {
-        let conn = outcome(block_on(pool.acquire(cx)))?;
-        let mode = conn
-            .query_sync("PRAGMA query_only", &[])
-            .map_err(source_error)?;
-        if mode.first().and_then(|row| row.get_as::<i64>(0).ok()) != Some(0) {
-            return Err("query-only snapshots cannot authorize reservation archive repair".into());
+        let _admission = admit_source(pool, config, None)?;
+        read_discovery(cx, pool, require_writable)?;
+        let identity = pool.sqlite_identity_key();
+        if identity != cursor.source_identity {
+            // Pool turnover alone must not release checkpoint ownership or
+            // discard unsaved retry debt. An empty key is explicit source
+            // invalidation, while unknown/changed bindings still require the
+            // ordinary reset before any retained ID can be attempted.
+            if !cursor.source_identity.is_empty()
+                && cursor
+                    .retries
+                    .checkpoint
+                    .matches_live_source(cx, pool, config)?
+            {
+                cursor.source_identity = identity;
+            } else {
+                let checkpoint_enabled = cursor.retries.checkpoint.enabled;
+                *cursor = ReservationReconcileCursor {
+                    source_identity: identity,
+                    ..Default::default()
+                };
+                cursor.retries.checkpoint.enabled = checkpoint_enabled;
+            }
         }
     }
-    let identity = pool.sqlite_identity_key();
-    if identity != cursor.source_identity {
-        let checkpoint_enabled = cursor.retries.checkpoint.enabled;
-        *cursor = ReservationReconcileCursor {
-            source_identity: identity,
-            ..Default::default()
-        };
-        cursor.retries.checkpoint.enabled = checkpoint_enabled;
-    }
-    // This admission lease also brackets checkpoint load/save. The admitted
-    // scanner must not reacquire admission after a promotion begins draining us.
-    checkpoint::run_admitted(cx, pool, config, cursor, stop)
+    // Checkpoint staging, decision logging and the gaps between items retain
+    // no database activity. Every later source scope is independently admitted.
+    checkpoint::run(cx, pool, config, cursor, stop)
 }
 
-fn run_admitted(
+/// Admission may close between successfully completed items. Preserve that
+/// progress for the maintenance observer, including its last-repair health
+/// timestamp, while yielding the unconsumed work to a later bounded pass.
+fn refused_pass(
+    error: PassFailure,
+    mut report: ReservationReconcileReport,
+    queue: &RetryQueue,
+    discovery_progress: bool,
+) -> Result<ReservationReconcileReport, String> {
+    if matches!(error, PassFailure::Busy)
+        && (discovery_progress || report.scanned > 0 || report.attempted > 0)
+    {
+        report.budget_exhausted = true;
+        Ok(finish(report, queue))
+    } else {
+        Err(error.into())
+    }
+}
+
+fn run_batch(
     cx: &Cx,
     pool: &DbPool,
     config: &Config,
     cursor: &mut ReservationReconcileCursor,
     stop: &AtomicBool,
+    expected_generation: Option<Option<&str>>,
 ) -> Result<ReservationReconcileReport, String> {
     let mut report = ReservationReconcileReport::default();
+    let source_identity = cursor.source_identity.clone();
+    let control = PassControl {
+        identity: &source_identity,
+        generation: expected_generation,
+        stop,
+    };
     let due = cursor.retries.due(Instant::now());
     let mut selected_count = i64::try_from(due.len()).expect("bounded retry selection");
     let mut seen = HashSet::new();
+    let mut discovery_progress = false;
     for id in due {
         if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
             report.interrupted = true;
@@ -343,8 +449,20 @@ fn run_admitted(
         if corruption_circuit_breaker().is_tripped() {
             return Err("reservation reconciliation stopped: source corruption observed".into());
         }
-        if !attempt(cx, pool, config, id, &mut cursor.retries, &mut report, stop) {
-            return Ok(finish(report, &cursor.retries));
+        match attempt(
+            cx,
+            pool,
+            config,
+            control,
+            id,
+            &mut cursor.retries,
+            &mut report,
+        ) {
+            Ok(true) => {}
+            Ok(false) => return Ok(finish(report, &cursor.retries)),
+            Err(error) => {
+                return refused_pass(error, report, &cursor.retries, discovery_progress);
+            }
         }
         seen.insert(id);
     }
@@ -372,7 +490,17 @@ fn run_admitted(
         } else {
             MAX_REPAIRS_PER_BATCH
         };
-        let ids = select_ids(cx, pool, position, id_limit, unexpired_only)?;
+        let before_selection = (position.after, position.ceiling);
+        let ids = match admit_source(pool, config, Some(&source_identity)) {
+            Ok(_selection) => select_ids(cx, pool, position, id_limit, unexpired_only)?,
+            Err(error) => {
+                return refused_pass(error, report, &cursor.retries, discovery_progress);
+            }
+        };
+        discovery_progress |= before_selection != (position.after, position.ceiling);
+        report.scan_advanced |= before_selection != (position.after, position.ceiling);
+        #[cfg(test)]
+        tests::observe_boundary(tests::Boundary::Selection(unexpired_only));
         selected_count += i64::try_from(ids.len()).expect("bounded selection");
         for id in ids {
             if stop.load(Ordering::Acquire) || cx.checkpoint().is_err() {
@@ -383,6 +511,8 @@ fn run_admitted(
             // may advance because their debt remains recorded, never evicted.
             if seen.contains(&id) || cursor.retries.contains(id) {
                 advance(position, id);
+                discovery_progress = true;
+                report.scan_advanced = true;
                 continue;
             }
             if report.attempted >= repair_limit || cursor.retries.is_full() {
@@ -394,11 +524,24 @@ fn run_admitted(
                     "reservation reconciliation stopped: source corruption observed".into(),
                 );
             }
-            if !attempt(cx, pool, config, id, &mut cursor.retries, &mut report, stop) {
-                return Ok(finish(report, &cursor.retries));
+            match attempt(
+                cx,
+                pool,
+                config,
+                control,
+                id,
+                &mut cursor.retries,
+                &mut report,
+            ) {
+                Ok(true) => {}
+                Ok(false) => return Ok(finish(report, &cursor.retries)),
+                Err(error) => {
+                    return refused_pass(error, report, &cursor.retries, discovery_progress);
+                }
             }
             seen.insert(id);
             advance(position, id);
+            report.scan_advanced = true;
         }
     }
     // Consuming a healthy page is discovery progress, not proof that the
@@ -410,7 +553,10 @@ fn run_admitted(
     // one round while the other ends, hot-scanning a fully healthy mailbox.
     // Conflicts do not accelerate discovery, and history completion returns
     // to idle unless actual publication limits or retry debt require more work.
-    if report.deferred == 0 && report.scanned > 0 && cursor.history.ceiling.is_some() {
+    if report.deferred == 0
+        && (report.scanned > 0 || report.scan_advanced)
+        && cursor.history.ceiling.is_some()
+    {
         report.budget_exhausted = true;
     }
     Ok(finish(report, &cursor.retries))
@@ -420,10 +566,219 @@ fn run_admitted(
 mod tests {
     use super::*;
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Boundary {
+        Selection(bool),
+        Attempt(i64),
+    }
+
+    type BoundaryObserver = Box<dyn FnMut(Boundary)>;
+
+    std::thread_local! {
+        static BOUNDARY_OBSERVER: std::cell::RefCell<Option<BoundaryObserver>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn observe_boundary(boundary: Boundary) {
+        BOUNDARY_OBSERVER.with(|slot| {
+            if let Some(observer) = slot.borrow_mut().as_mut() {
+                observer(boundary);
+            }
+        });
+    }
+
+    struct ObserveBoundary;
+
+    impl ObserveBoundary {
+        fn new(observer: impl FnMut(Boundary) + 'static) -> Self {
+            BOUNDARY_OBSERVER.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(Box::new(observer));
+            });
+            Self
+        }
+    }
+
+    impl Drop for ObserveBoundary {
+        fn drop(&mut self) {
+            BOUNDARY_OBSERVER.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    fn exercise_promotion_between_items(boundary: Boundary) {
+        use mcp_agent_mail_db::write_barrier::{
+            active_writer_count, try_acquire_promotion_barrier_if_idle,
+        };
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        super::super::tests::fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES(402, 71, 81, 'another/*.rs', 1, 'another terminal release', 1000000, 9000000, 6000000)").unwrap();
+            drop(conn);
+            let visited = Rc::new(Cell::new(false));
+            let observed_writers = Rc::new(Cell::new(usize::MAX));
+            let source_available = Rc::new(Cell::new(false));
+            let held = Rc::new(RefCell::new(None));
+            let observer_visited = Rc::clone(&visited);
+            let observer_writers = Rc::clone(&observed_writers);
+            let observer_available = Rc::clone(&source_available);
+            let observer_held = Rc::clone(&held);
+            let observer_pool = pool.clone();
+            let observer_cx = cx.clone();
+            let observer = ObserveBoundary::new(move |stage| {
+                if stage != boundary || observer_visited.replace(true) {
+                    return;
+                }
+                observer_writers.set(active_writer_count());
+                *observer_held.borrow_mut() = try_acquire_promotion_barrier_if_idle();
+                // A real checkout from this capacity-one pool establishes
+                // that selection/publication also returned its source reader.
+                observer_available
+                    .set(outcome(block_on(observer_pool.acquire(&observer_cx))).is_ok());
+            });
+            let mut cursor = ReservationReconcileCursor::default();
+            let stop = AtomicBool::new(false);
+            let result = run(cx, pool, config, &mut cursor, &stop);
+            let promotion_admitted = held.borrow().is_some();
+            let after = cursor.history.after;
+            let first = config
+                .storage_root
+                .join("projects/project/file_reservations/id-401-gaabb.json");
+            let second = config
+                .storage_root
+                .join("projects/project/file_reservations/id-402-gaabb.json");
+            let first_published = first.exists();
+            let second_published = second.exists();
+            drop(observer);
+            drop(held.borrow_mut().take());
+
+            assert!(visited.get());
+            assert_eq!(observed_writers.get(), 0);
+            assert!(source_available.get());
+            assert!(promotion_admitted, "the pass retained promotion exclusion");
+            let partial = result.unwrap();
+            let completed = usize::from(boundary == Boundary::Attempt(401));
+            assert_eq!(
+                (partial.scanned, partial.attempted, partial.repaired),
+                (completed, completed, completed),
+                "admission closure lost completed progress from maintenance reporting"
+            );
+            assert_eq!((partial.deferred, partial.retry_len), (0, 0));
+            assert!(partial.budget_exhausted);
+            assert!(!partial.interrupted);
+            assert_eq!(
+                after,
+                if boundary == Boundary::Attempt(401) {
+                    401
+                } else {
+                    0
+                }
+            );
+            assert_eq!(first_published, boundary == Boundary::Attempt(401));
+            assert!(!second_published, "closed admission consumed the next ID");
+            assert_eq!(active_writer_count(), 0);
+
+            let resumed = run(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(resumed.deferred, 0);
+            assert_eq!(resumed.retry_len, 0);
+            for id in [401, 402] {
+                let relative = format!("projects/project/file_reservations/id-{id}-gaabb.json");
+                let bytes = fs::read(config.storage_root.join(&relative)).unwrap();
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["db_generation"], "aabb");
+                assert!(timestamp(&value["released_ts"]).unwrap() > 0);
+                let repo = Repository::open(&config.storage_root).unwrap();
+                let tree = repo.head().unwrap().peel_to_tree().unwrap();
+                let entry = tree.get_path(Path::new(&relative)).unwrap();
+                assert_eq!(repo.find_blob(entry.id()).unwrap().content(), bytes);
+            }
+        });
+    }
+
+    #[test]
+    fn promotion_can_begin_after_selection_without_consuming_the_page() {
+        exercise_promotion_between_items(Boundary::Selection(false));
+    }
+
+    #[test]
+    fn promotion_can_begin_between_terminal_releases_and_later_work_resumes() {
+        exercise_promotion_between_items(Boundary::Attempt(401));
+    }
+
+    #[test]
+    fn changed_pass_generation_does_not_consume_the_next_retained_release() {
+        use mcp_agent_mail_db::write_barrier::try_acquire_promotion_barrier_if_idle;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        super::super::tests::fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) VALUES(402, 71, 81, 'another/*.rs', 1, 'another terminal release', 1000000, 9000000, 6000000)").unwrap();
+            drop(conn);
+            let now = Instant::now();
+            let mut cursor = ReservationReconcileCursor {
+                source_identity: pool.sqlite_identity_key(),
+                ..Default::default()
+            };
+            assert!(cursor.retries.defer(401, now));
+            assert!(cursor.retries.defer(402, now));
+            let visited = Rc::new(Cell::new(false));
+            let observer_visited = Rc::clone(&visited);
+            let observer_pool = pool.clone();
+            let observer_cx = cx.clone();
+            let observer = ObserveBoundary::new(move |stage| {
+                if stage != Boundary::Attempt(401) || observer_visited.replace(true) {
+                    return;
+                }
+                let _promotion = try_acquire_promotion_barrier_if_idle()
+                    .expect("completed first release returned source authority");
+                let conn = outcome(block_on(observer_pool.acquire(&observer_cx))).unwrap();
+                conn.execute_raw("UPDATE db_identity SET generation_id='ccdd' WHERE singleton=0")
+                    .unwrap();
+            });
+            let result = cursor.reconcile_checkpointed(cx, pool, config, &AtomicBool::new(false));
+            drop(observer);
+            assert!(visited.get());
+            assert!(result.unwrap_err().contains("source generation changed"));
+            assert_eq!(cursor.retries.pending.len(), 1);
+            let retained = cursor.retries.pending.front().unwrap();
+            assert_eq!(
+                (retained.id, retained.attempts, retained.ready_at),
+                (402, 0, now)
+            );
+            assert_eq!(cursor.history.after, 0);
+            assert!(
+                config
+                    .storage_root
+                    .join("projects/project/file_reservations/id-401-gaabb.json")
+                    .is_file()
+            );
+            for generation in ["aabb", "ccdd"] {
+                assert!(
+                    !config
+                        .storage_root
+                        .join(format!(
+                            "projects/project/file_reservations/id-402-g{generation}.json"
+                        ))
+                        .exists(),
+                    "an old pass must not authorize its next numeric ID in another generation"
+                );
+            }
+            assert_eq!(mcp_agent_mail_db::write_barrier::active_writer_count(), 0);
+        });
+    }
+
     #[test]
     fn resource_pressure_is_retryable_without_trusting_error_text() {
         use std::io::{Error, ErrorKind};
 
+        #[cfg(any(unix, windows))]
+        for error in crate::recovery::descriptor_exhaustion_errors() {
+            assert!(transient(&error.into()));
+        }
         for kind in [
             ErrorKind::WouldBlock,
             ErrorKind::TimedOut,
@@ -624,15 +979,22 @@ mod tests {
                     Instant::now()
                 ));
             } else {
-                assert!(attempt(
-                    cx,
-                    pool,
-                    config,
-                    401,
-                    &mut cursor.retries,
-                    &mut failed,
-                    &AtomicBool::new(false),
-                ));
+                assert!(
+                    attempt(
+                        cx,
+                        pool,
+                        config,
+                        PassControl {
+                            identity: &pool.sqlite_identity_key(),
+                            generation: None,
+                            stop: &AtomicBool::new(false),
+                        },
+                        401,
+                        &mut cursor.retries,
+                        &mut failed,
+                    )
+                    .unwrap()
+                );
             }
             assert_eq!(
                 (failed.scanned, failed.deferred, failed.deferred_transient),
@@ -734,15 +1096,22 @@ mod tests {
             assert!(queue.defer(401, Instant::now()));
             assert!(queue.defer(402, Instant::now()));
             let mut report = ReservationReconcileReport::default();
-            assert!(attempt(
-                cx,
-                pool,
-                config,
-                401,
-                &mut queue,
-                &mut report,
-                &AtomicBool::new(false)
-            ));
+            assert!(
+                attempt(
+                    cx,
+                    pool,
+                    config,
+                    PassControl {
+                        identity: &pool.sqlite_identity_key(),
+                        generation: None,
+                        stop: &AtomicBool::new(false),
+                    },
+                    401,
+                    &mut queue,
+                    &mut report,
+                )
+                .unwrap()
+            );
             assert_eq!(
                 (report.deferred, report.deferred_transient, report.attempted),
                 (1, 0, 0)
@@ -1283,6 +1652,8 @@ mod tests {
             assert_eq!(report.attempted, 0);
             assert_eq!(report.retry_len, MAX_RETRY_IDS);
             assert!(report.budget_exhausted);
+            assert!(!cursor.has_retry_capacity());
+            assert_eq!(cursor.next_retry_at(), Some(now + MAX_BACKOFF));
             assert_eq!(cursor.history.after, 0);
             assert!(!config.storage_root.join("projects").exists());
         });

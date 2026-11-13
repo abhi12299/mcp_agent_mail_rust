@@ -472,7 +472,7 @@ const WBQ_ENQUEUE_MAX_BACKOFF_MS: u64 = 8;
 const WBQ_FLUSH_BUDGET_SECS: u64 = 30;
 /// Budget for delivering the Shutdown message at `wbq_shutdown`. Short and
 /// separate from the flush budget: if the channel is still full after the
-/// flush phase, the thread is wedged and we detach instead of hanging.
+/// flush phase, retain the worker for later reaping instead of hanging.
 const WBQ_SHUTDOWN_SEND_BUDGET_SECS: u64 = 5;
 
 static WBQ: OnceLock<WriteBehindQueue> = OnceLock::new();
@@ -611,6 +611,26 @@ fn publish_oldest_fence_wait(waits: &BTreeMap<u64, u64>) {
 /// (see [`admit_direct_publication`]).
 static DIRECT_FENCE_WAITERS: AtomicUsize = AtomicUsize::new(0);
 
+/// Bounded message-repair admissions use the same give-way window as direct
+/// requests. A single unsuccessful try on each worker tick otherwise lets
+/// continuously reacquiring background writers starve deferred repair forever.
+static REPAIR_FENCE_WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+struct RepairFenceWaiter;
+
+impl RepairFenceWaiter {
+    fn register() -> Self {
+        REPAIR_FENCE_WAITERS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for RepairFenceWaiter {
+    fn drop(&mut self) {
+        REPAIR_FENCE_WAITERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Longest a blocking fence acquirer gives way to waiting direct writers.
 ///
 /// The fence is a plain `Mutex`. A writer that releases it and takes it again
@@ -640,14 +660,19 @@ impl Drop for DirectFenceWaiter {
 }
 
 /// Before a blocking acquisition, wait up to [`DIRECT_WAITER_GIVE_WAY`] for
-/// waiting direct writers to take and release the fence. One atomic load when
-/// none is waiting.
+/// waiting direct writers or bounded repair admissions to take the fence.
+/// The pause is bounded even if requests or repairs keep arriving; it grants
+/// an execution opportunity without reserving the fence or a project lock.
 fn give_way_to_direct_writers() {
-    if DIRECT_FENCE_WAITERS.load(Ordering::Acquire) == 0 {
+    let waiting = || {
+        DIRECT_FENCE_WAITERS.load(Ordering::Acquire) != 0
+            || REPAIR_FENCE_WAITERS.load(Ordering::Acquire) != 0
+    };
+    if !waiting() {
         return;
     }
     let deadline = Instant::now() + DIRECT_WAITER_GIVE_WAY;
-    while DIRECT_FENCE_WAITERS.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+    while waiting() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_micros(200));
     }
 }
@@ -1184,6 +1209,35 @@ pub fn archive_epoch_read_stamp(storage_root: &Path) -> Result<Option<ArchiveEpo
     }))
 }
 
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+type CoalescerAfterSpawnHook = Box<dyn FnMut(usize)>;
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+std::thread_local! {
+    static STORAGE_WORKER_FAIL_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static COALESCER_AFTER_SPAWN_TEST_HOOK: std::cell::RefCell<Option<CoalescerAfterSpawnHook>> = const { std::cell::RefCell::new(None) };
+}
+
+fn storage_worker_stack_size() -> usize {
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    if STORAGE_WORKER_FAIL_AFTER.with(|remaining| match remaining.get() {
+        Some(0) => {
+            remaining.set(None);
+            true
+        }
+        Some(count) => {
+            remaining.set(Some(count - 1));
+            false
+        }
+        None => false,
+    }) {
+        // Page-aligned and larger than Linux x86_64's entire user address
+        // space. Exercise the real OS spawn error, not an injected Result.
+        return 1_usize << 62;
+    }
+    mcp_agent_mail_core::worker_stack_size()
+}
+
 fn new_write_behind_queue() -> WriteBehindQueue {
     let op_depth = Arc::new(AtomicU64::new(0));
     let channel_capacity = Config::get().wbq_channel_capacity;
@@ -1202,11 +1256,14 @@ fn new_write_behind_queue() -> WriteBehindQueue {
 }
 
 fn wbq_start_inner(wbq: &WriteBehindQueue) {
-    let _lifecycle = wbq
+    let lifecycle = wbq
         .lifecycle
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    wbq_start_locked(wbq, &lifecycle);
+}
 
+fn wbq_start_locked(wbq: &WriteBehindQueue, _lifecycle: &std::sync::MutexGuard<'_, ()>) {
     let should_spawn = {
         let handle = wbq.drain_handle.lock();
         handle
@@ -1228,10 +1285,6 @@ fn wbq_start_inner(wbq: &WriteBehindQueue) {
     let channel_capacity = config.wbq_channel_capacity;
     let drain_batch_cap = config.wbq_drain_batch_cap;
     let (tx, rx) = std::sync::mpsc::sync_channel(channel_capacity);
-    // A (re)started drain is the progress baseline: salvaged ops it never
-    // drains still read as stalled (br-kp1in.23).
-    WBQ_LAST_PROGRESS_US.store(now_micros_u64().max(1), Ordering::Relaxed);
-
     // br-b9x63: a dead drain thread leaves its buffered ops in the old
     // channel. Salvage them into the fresh channel instead of silently
     // dropping them, and reconcile op_depth/wbq_depth to what the fresh
@@ -1300,9 +1353,11 @@ fn wbq_start_inner(wbq: &WriteBehindQueue) {
     });
     let receiver_slot = Arc::clone(&wbq.receiver_slot);
     let op_depth_worker = Arc::clone(&wbq.op_depth);
+    let previous_progress_us = WBQ_LAST_PROGRESS_US.load(Ordering::Relaxed);
+    let started_at_us = now_micros_u64().max(1);
     let handle = std::thread::Builder::new()
         .name("wbq-drain".into())
-        .stack_size(mcp_agent_mail_core::worker_stack_size())
+        .stack_size(storage_worker_stack_size())
         .spawn(move || {
             wbq_drain_loop(
                 receiver_slot,
@@ -1310,9 +1365,29 @@ fn wbq_start_inner(wbq: &WriteBehindQueue) {
                 channel_capacity,
                 drain_batch_cap,
             );
-        })
-        .unwrap_or_else(|error| panic!("failed to spawn wbq-drain thread: {error}"));
+        });
+    let handle = match handle {
+        Ok(handle) => handle,
+        Err(error) => {
+            // The staged receiver retains salvaged operations. Do not publish
+            // a sender without its consumer: callers already handle rejection.
+            *wbq.sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            tracing::error!(%error, "wbq drain could not start; retained work remains retryable");
+            return;
+        }
+    };
 
+    // A successfully (re)started drain establishes a progress baseline for
+    // salvaged ops (br-kp1in.23). A failed attempt is not progress, and a
+    // newly running worker may already have recorded actual progress.
+    let _ = WBQ_LAST_PROGRESS_US.compare_exchange(
+        previous_progress_us,
+        started_at_us,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
     *wbq.sender
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
@@ -1324,6 +1399,19 @@ fn wbq_sender_clone(wbq: &WriteBehindQueue) -> Option<std::sync::mpsc::SyncSende
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
+}
+
+fn wbq_sender_for_enqueue(wbq: &WriteBehindQueue) -> Option<std::sync::mpsc::SyncSender<WbqMsg>> {
+    // Startup shares the same lifecycle gate as restart, shutdown, and counted
+    // publication. Request admission must not wait behind a shutdown flush or
+    // restart salvage before reaching its bounded channel-send path.
+    let lifecycle = match wbq.lifecycle.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    wbq_start_locked(wbq, &lifecycle);
+    wbq_sender_clone(wbq)
 }
 
 /// Spawn the WBQ drain thread. Safe to call multiple times.
@@ -1382,6 +1470,10 @@ std::thread_local! {
     // backoff, so liveness tests do not depend on catching a timed sleep.
     static WBQ_BEFORE_RETRY_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    // Observe the real drain between publication groups, after their project
+    // locks and fence have been released. Never pause inside a mutation window.
+    static WBQ_BETWEEN_GROUPS_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -1404,7 +1496,7 @@ fn wbq_try_send_counted(
     sender: &std::sync::mpsc::SyncSender<WbqMsg>,
     op_depth: &AtomicU64,
     msg: WbqMsg,
-    lifecycle: Option<&Mutex<()>>,
+    queue: Option<&WriteBehindQueue>,
 ) -> std::result::Result<(), std::sync::mpsc::TrySendError<WbqMsg>> {
     // Restart/shutdown own this mutex while replacing the receiver and its
     // counters. Serialize only this nonblocking admission attempt: a reserve
@@ -1412,7 +1504,7 @@ fn wbq_try_send_counted(
     // and no accepted op may arrive after the salvage pass has finished.
     // Contention shares the bounded channel-full retry path; neither shutdown
     // nor another producer can extend admission by holding us in a mutex wait.
-    let _admission = match lifecycle.map(Mutex::try_lock) {
+    let _admission = match queue.map(|wbq| wbq.lifecycle.try_lock()) {
         Some(Ok(guard)) => Some(guard),
         Some(Err(std::sync::TryLockError::Poisoned(error))) => Some(error.into_inner()),
         Some(Err(std::sync::TryLockError::WouldBlock)) => {
@@ -1420,6 +1512,17 @@ fn wbq_try_send_counted(
         }
         None => None,
     };
+    // A producer may have captured this sender before shutdown acquired the
+    // lifecycle gate. Retired workers retain their receiver until they exit;
+    // do not acknowledge new work into that channel after admission closes.
+    if queue.is_some_and(|wbq| {
+        wbq.sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+    }) {
+        return Err(std::sync::mpsc::TrySendError::Disconnected(msg));
+    }
     // Account for the op BEFORE the receiver can observe it. Incrementing
     // after try_send lets a fast drain subtract from zero; saturating counters
     // then strand a phantom queued op and eventually report a false stall.
@@ -1473,7 +1576,7 @@ fn wbq_enqueue_with_sender_admission(
     sender: &std::sync::mpsc::SyncSender<WbqMsg>,
     op_depth: &AtomicU64,
     op: WriteOp,
-    lifecycle: Option<&Mutex<()>>,
+    queue: Option<&WriteBehindQueue>,
 ) -> WbqEnqueueResult {
     let envelope = WbqOpEnvelope {
         enqueued_at: Instant::now(),
@@ -1481,7 +1584,7 @@ fn wbq_enqueue_with_sender_admission(
     };
 
     let msg = WbqMsg::Op(envelope);
-    match wbq_try_send_counted(sender, op_depth, msg, lifecycle) {
+    match wbq_try_send_counted(sender, op_depth, msg, queue) {
         Ok(()) => WbqEnqueueResult::Enqueued,
         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => WbqEnqueueResult::QueueUnavailable,
         Err(std::sync::mpsc::TrySendError::Full(msg)) => {
@@ -1499,7 +1602,7 @@ fn wbq_enqueue_with_sender_admission(
             let mut backoff = Duration::from_millis(1);
             let max_backoff = Duration::from_millis(WBQ_ENQUEUE_MAX_BACKOFF_MS);
             loop {
-                match wbq_try_send_counted(sender, op_depth, cur, lifecycle) {
+                match wbq_try_send_counted(sender, op_depth, cur, queue) {
                     Ok(()) => break WbqEnqueueResult::Enqueued,
                     Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                         break WbqEnqueueResult::QueueUnavailable;
@@ -1544,16 +1647,15 @@ pub fn wbq_enqueue(op: WriteOp) -> WbqEnqueueResult {
         .system
         .disk_pressure_level
         .load();
-
-    let wbq = WBQ.get_or_init(new_write_behind_queue);
-    wbq_start_inner(wbq);
-    let Some(sender) = wbq_sender_clone(wbq) else {
-        return WbqEnqueueResult::QueueUnavailable;
-    };
     if disk_pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
         return WbqEnqueueResult::SkippedDiskCritical;
     }
-    wbq_enqueue_with_sender_admission(&sender, wbq.op_depth.as_ref(), op, Some(&wbq.lifecycle))
+
+    let wbq = WBQ.get_or_init(new_write_behind_queue);
+    let Some(sender) = wbq_sender_for_enqueue(wbq) else {
+        return WbqEnqueueResult::QueueUnavailable;
+    };
+    wbq_enqueue_with_sender_admission(&sender, wbq.op_depth.as_ref(), op, Some(wbq))
 }
 
 /// Execute a write op synchronously on the caller thread.
@@ -1646,11 +1748,26 @@ const DIRECT_FENCE_ADMISSION_BUDGET: Duration = Duration::from_secs(5);
 /// blocking acquirers leave it.
 const DIRECT_FENCE_ADMISSION_MAX_PAUSE: Duration = Duration::from_millis(1);
 
+/// A scheduling hint only: never reserve the fence or change holder metadata
+/// or mutation epochs while deciding whether to give a repair an opening.
+fn publication_fence_available_for_repair_turn() -> bool {
+    let guard = match ARCHIVE_PUBLICATION_FENCE.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return false,
+    };
+    drop(guard);
+    true
+}
+
 /// Admit a direct write to the publication fence. Contention is retried with a
 /// doubling pause until `deadline` (normally [`DIRECT_FENCE_ADMISSION_BUDGET`]
 /// after the write began); every attempt checks `cancelled` first, and any
 /// other error returns at once. While it retries, the writer is registered so
 /// blocking acquirers give way to it ([`give_way_to_direct_writers`]).
+/// A waiting message repair also receives one short opening per direct
+/// admission. Without it, back-to-back direct requests can take every release
+/// gap even when background publishers yield to the repair.
 fn admit_direct_publication(
     path: &Path,
     deadline: Instant,
@@ -1658,7 +1775,32 @@ fn admit_direct_publication(
 ) -> Result<ArchiveMutationGuard> {
     let mut pause = Duration::from_micros(200);
     let mut waiting = None;
+    let mut repair_turn_given = false;
     loop {
+        if !repair_turn_given
+            && REPAIR_FENCE_WAITERS.load(Ordering::Acquire) != 0
+            && ARCHIVE_MUTATION_DEPTH
+                .try_with(std::cell::Cell::get)
+                .is_ok_and(|depth| depth == 0)
+            && publication_fence_available_for_repair_turn()
+        {
+            repair_turn_given = true;
+            let turn_deadline = deadline.min(Instant::now() + DIRECT_WAITER_GIVE_WAY);
+            while REPAIR_FENCE_WAITERS.load(Ordering::Acquire) != 0 {
+                if cancelled() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "direct archive publication admission cancelled",
+                    )
+                    .into());
+                }
+                let remaining = turn_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                std::thread::sleep(remaining.min(Duration::from_micros(200)));
+            }
+        }
         let contention = match ArchiveMutationGuard::try_begin_repair(path, &mut *cancelled) {
             Err(error @ StorageError::LockContention { .. }) => error,
             admitted_or_failed => return admitted_or_failed,
@@ -1686,7 +1828,17 @@ fn admit_direct_publication(
 /// reservation's JSON files (a cheap, bounded, local filesystem write) and
 /// defers the git commit to the async commit coalescer, so a reservation grant
 /// can never be coupled to another agent's archive-drain latency.
-fn write_op_sync_direct_with_cancel(
+///
+/// `cancelled` is checked while waiting for the publication fence. Prepared
+/// reservation writes also check it while waiting for the project lock and
+/// immediately before publishing staged artifacts. Supply the request's full
+/// liveness check when its transport cancellation is independent of its
+/// asupersync context. Cancellation returns [`DirectArchiveWrite::Failed`]
+/// with [`StorageError::Io`] of kind [`std::io::ErrorKind::Interrupted`]. A
+/// caller that already committed a database mutation must retain that receipt
+/// and arrange archive reconciliation after any failed publication.
+#[must_use]
+pub fn write_op_sync_direct_with_cancel(
     op: &WriteOp,
     mut cancelled: impl FnMut() -> bool,
 ) -> DirectArchiveWrite {
@@ -1707,14 +1859,20 @@ fn write_op_sync_direct_with_cancel(
         // directories under the blocking fence, so it keeps the bounded
         // window of the path below.
         let started = Instant::now();
+        let mut cancellation_observed = false;
+        let mut observe_cancellation = || {
+            let stopped = cancelled();
+            cancellation_observed |= stopped;
+            stopped
+        };
         let mut admission = ReservationAdmission::Direct {
             deadline: started + DIRECT_FENCE_ADMISSION_BUDGET,
-            cancelled: &mut cancelled,
+            cancelled: &mut observe_cancellation,
         };
         let result = ensure_archive(config, project_slug).and_then(|archive| {
             write_file_reservation_records_admitted(&archive, config, reservations, &mut admission)
         });
-        return finish_direct_write(op, started, result);
+        return finish_direct_write(op, started, result, cancellation_observed);
     }
     write_archive_sync_direct_with_cancel(op, cancelled, || wbq_execute_op(op, "archive-direct"))
 }
@@ -1760,11 +1918,16 @@ fn write_archive_sync_direct_with_cancel(
         };
 
     let started = Instant::now();
-    finish_direct_write(op, started, write())
+    finish_direct_write(op, started, write(), false)
 }
 
 /// Record a direct write's metrics and archive outcome.
-fn finish_direct_write(op: &WriteOp, started: Instant, result: Result<()>) -> DirectArchiveWrite {
+fn finish_direct_write(
+    op: &WriteOp,
+    started: Instant,
+    result: Result<()>,
+    cancellation_observed: bool,
+) -> DirectArchiveWrite {
     let metrics = mcp_agent_mail_core::global_metrics();
     metrics.storage.archive_direct_writes_total.add(1);
     metrics
@@ -1778,7 +1941,19 @@ fn finish_direct_write(op: &WriteOp, started: Instant, result: Result<()>) -> Di
             &result,
             Err(StorageError::LockContention { .. } | StorageError::LockTimeout(_))
         );
+    // A request abandoning admission is not evidence that its archive failed.
+    // Keep the failed-request counters, but do not let cancelled callers trip
+    // the archive breaker or trigger recovery of a healthy repository. An
+    // actual filesystem interruption still counts unless admission observed
+    // the request's cancellation itself.
+    let cancelled_reservation = cancellation_observed
+        && matches!(op, WriteOp::FileReservation { .. })
+        && matches!(
+            &result,
+            Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted
+        );
     if !contended_reservation
+        && !cancelled_reservation
         && !matches!(
             &result,
             Err(StorageError::ReservationPublicationConflict { .. })
@@ -1849,9 +2024,9 @@ pub fn write_agent_reaper_exemption_sync_direct(
 //
 // This backlog replaces that inline fallback with a durable retry queue drained
 // by a dedicated background thread:
-//   * `archive_backlog_push` is non-blocking for the reply path except for a
-//     single small local-disk journal write (bounded by fsync, NOT git) so the
-//     op survives a crash — the tool reply is never gated on the archive.
+//   * `archive_backlog_push` performs a small local-disk journal publication
+//     on the reply path: file sync plus directory-ancestry sync on Unix, never
+//     a git commit. Other platforms retain the existing file-flush contract.
 //   * A dedicated `archive-backlog-drain` thread retries `wbq_enqueue`; after a
 //     bounded number of failed re-enqueues it materializes the op with
 //     `write_op_sync` ON THE BACKLOG THREAD (never the request thread).
@@ -1861,9 +2036,9 @@ pub fn write_agent_reaper_exemption_sync_direct(
 //     the message on restart via `archive_backlog_recover` (messages have no
 //     DB->archive reconcile-on-read, unlike reservations, so the journal is the
 //     crash-safety mechanism).
-//   * On backlog overflow (or a journal-write failure) the op is dropped: the
-//     DB row stays authoritative and the loss is bounded and surfaced via the
-//     `dropped_total` counter and the archive-lag health metric.
+//   * On backlog overflow the op is dropped; unconfirmed journal durability
+//     instead yields a best-effort in-memory entry. Both outcomes are surfaced
+//     by backlog counters and archive-lag health; the DB stays authoritative.
 
 /// Default cap on ops held in the archive retry backlog before overflow drops
 /// the op (DB stays authoritative). Overridable via `AM_ARCHIVE_BACKLOG_CAP`.
@@ -1922,15 +2097,18 @@ pub fn archive_lag_critical_threshold_us() -> u64 {
 /// Outcome of pushing an op onto the archive retry backlog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveBacklogPush {
-    /// The op was **durably** journaled to local disk (fsync + atomic rename)
-    /// AND enqueued for background retry. It survives a crash: `archive_backlog_recover`
-    /// replays it on the next boot.
+    /// The op was journaled and enqueued after publication flushes succeeded.
+    /// Unix flushes file data and the containing directory's full ancestry, so
+    /// the pending journal survives a crash and can be replayed on next boot.
+    /// Other platforms retain file flush + atomic rename without claiming
+    /// Unix directory-fsync guarantees.
     Queued,
     /// The op was enqueued in memory for best-effort background retry, but its
-    /// durable journal could NOT be written (local-disk error). It is drained if
-    /// the process survives, but a crash before materialization loses the archive
-    /// write — the DB row stays authoritative and the archive-lag health metric
-    /// counts it. Callers MUST NOT report this as a durable acknowledgment
+    /// journal durability could NOT be confirmed (local-disk error). A complete
+    /// candidate may still be available for recovery, but a crash before
+    /// materialization can lose the archive write. The DB stays authoritative
+    /// and archive-lag health counts it. Callers MUST NOT report this as a
+    /// durable acknowledgment
     /// (br-ack-fast: "do not report queued/durable unless the journal persisted").
     QueuedEphemeral,
     /// The backlog was at capacity; the op was dropped. The DB row remains
@@ -2083,21 +2261,51 @@ impl PersistedWriteOp {
     }
 }
 
+#[derive(Clone)]
+enum ArchiveBacklogPayload {
+    Ready(Arc<WriteOp>),
+    /// Recovery retains only the path and a shared runtime configuration until
+    /// this entry reaches the front. Historical bodies stay on disk.
+    Journal(Arc<Config>),
+    /// Retirement retries never need the decoded payload again.
+    Released,
+}
+
 struct ArchiveBacklogEntry {
-    op: WriteOp,
-    /// On-disk journal file backing this entry (None if journaling was disabled
-    /// or the journal write failed; then the entry is in-memory only).
+    payload: ArchiveBacklogPayload,
+    /// On-disk journal candidate backing this entry. Retain it even when a
+    /// post-rename directory sync failed: recovery can replay it, and successful
+    /// materialization must retire it. None means no complete candidate was
+    /// published.
     journal_path: Option<PathBuf>,
     /// Monotonic enqueue instant, used for the archive-lag age. Reset on
     /// recovery (the pre-crash age is not recoverable and not worth persisting).
     first_enqueued_at: Instant,
     attempts: u32,
+    /// Once materialization or dead-lettering completes, retry only journal
+    /// retirement. Reapplying a mutable op while its journal move is blocked
+    /// could overwrite newer archive state.
+    retirement: Option<ArchiveBacklogRetirement>,
+}
+
+#[derive(Clone, Copy)]
+enum ArchiveBacklogRetirement {
+    Resolved,
+    Failed,
+    Corrupt,
 }
 
 struct ArchiveRetryBacklog {
     queue: Mutex<VecDeque<ArchiveBacklogEntry>>,
+    /// Canonical paths owned by publishing, queued, executing, or retiring
+    /// entries. Publication registers before the final rename, and ownership
+    /// ends only after the journal leaves the active recovery directory.
+    owned_journals: Mutex<BTreeSet<PathBuf>>,
     drain_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     lifecycle: Mutex<()>,
+    /// Claim and admit each sorted recovery batch together. Ordinary producers
+    /// do not take this gate, and no journal payload is read while it is held.
+    recovery_admission: Mutex<()>,
     depth: AtomicU64,
     /// Slots reserved by in-flight pushers between the capacity check and the
     /// enqueue. Mutated ONLY while holding the `queue` lock, so the capacity
@@ -2107,10 +2315,9 @@ struct ArchiveRetryBacklog {
     enqueued_total: AtomicU64,
     drained_total: AtomicU64,
     dropped_total: AtomicU64,
-    /// Ops abandoned after [`ARCHIVE_BACKLOG_MAX_ATTEMPTS`] failed
-    /// materializations and appended to the dead-letter ledger (F3). Nonzero
-    /// means an operator has archive work to inspect/replay from
-    /// `<storage_root>/doctor/backlog_dead_letter.jsonl`.
+    /// Ops retired after permanent materialization or journal read/decode
+    /// failure. Nonzero means an operator has work to inspect in the
+    /// dead-letter ledger and preserved failed/corrupt journals.
     dead_lettered_total: AtomicU64,
     /// Ops enqueued in memory whose durable journal could not be written
     /// (returned [`ArchiveBacklogPush::QueuedEphemeral`]). Surfaced through the
@@ -2126,17 +2333,22 @@ enum ArchiveBacklogDrainStep {
     Empty,
     Materialized,
     RetryLater(u32),
-    /// The front op exhausted [`ARCHIVE_BACKLOG_MAX_ATTEMPTS`] and was moved to
-    /// the dead-letter ledger; the queue advanced to the next entry.
+    /// The front op exhausted its attempts or its journal could not be decoded;
+    /// its evidence was quarantined and the queue advanced to the next entry.
     DeadLettered,
+    /// A completed op still owns a journal whose retirement failed. It was
+    /// rotated behind unprocessed work, so the drainer should continue now.
+    RetirementDeferred,
 }
 
 impl ArchiveRetryBacklog {
     const fn new() -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
+            owned_journals: Mutex::new(BTreeSet::new()),
             drain_handle: Mutex::new(None),
             lifecycle: Mutex::new(()),
+            recovery_admission: Mutex::new(()),
             depth: AtomicU64::new(0),
             reserved: AtomicU64::new(0),
             enqueued_total: AtomicU64::new(0),
@@ -2155,12 +2367,13 @@ impl ArchiveRetryBacklog {
     }
 
     /// Durably journal and enqueue an op. `cap` bounds the in-memory queue; on
-    /// overflow the op is dropped (DB stays authoritative). Non-blocking apart
-    /// from the single local-disk journal fsync.
+    /// overflow the op is dropped (DB stays authoritative). The request path
+    /// performs journal file sync and, on Unix, directory-ancestry sync.
     ///
     /// Capacity is *reserved* under the queue lock before the (unlocked) journal
-    /// fsync and released when the entry is enqueued, so concurrent pushers can
-    /// never exceed `cap` (br-ack-fast: fixed a check-then-enqueue TOCTOU race).
+    /// publication and released when the entry is enqueued, so concurrent
+    /// pushers can never exceed `cap` (br-ack-fast: fixed a check-then-enqueue
+    /// TOCTOU race).
     /// The return value reflects **actual durability**: [`ArchiveBacklogPush::Queued`]
     /// only when the journal persisted, else [`ArchiveBacklogPush::QueuedEphemeral`].
     fn push(&self, op: WriteOp, cap: u64) -> ArchiveBacklogPush {
@@ -2188,9 +2401,10 @@ impl ArchiveRetryBacklog {
             // next pusher's capacity check.
             self.reserved.fetch_add(1, Ordering::Relaxed);
         }
-        // Journal outside the queue lock: the fsync must not stall other pushers.
-        let journal_path = archive_backlog_journal_write(&op);
-        let durable = journal_path.is_some();
+        // Journal outside the queue lock: syncs must not stall other pushers.
+        let journal = archive_backlog_journal_write(&op, Some(self));
+        let durable = journal.as_ref().is_some_and(|journal| journal.durable);
+        let journal_path = journal.map(|journal| journal.path);
         {
             let mut queue = self
                 .queue
@@ -2199,10 +2413,11 @@ impl ArchiveRetryBacklog {
             // Release the reservation and enqueue the real entry atomically.
             self.reserved.fetch_sub(1, Ordering::Relaxed);
             queue.push_back(ArchiveBacklogEntry {
-                op,
+                payload: ArchiveBacklogPayload::Ready(Arc::new(op)),
                 journal_path,
                 first_enqueued_at: Instant::now(),
                 attempts: 0,
+                retirement: None,
             });
             self.store_depth(&queue);
         }
@@ -2210,47 +2425,130 @@ impl ArchiveRetryBacklog {
         if durable {
             ArchiveBacklogPush::Queued
         } else {
-            // The op is in memory only; a crash before the drain thread
-            // materializes it loses the archive write. Surface it — never claim
-            // durability the disk did not provide.
+            // No confirmed durable journal backs this entry. A complete
+            // candidate may still exist, but its directory publication was not
+            // confirmed. Never claim durability the disk did not provide.
             self.ephemeral_total.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
-                "archive retry backlog: op enqueued WITHOUT a durable journal \
-                 (local-disk journal write failed); a crash before drain loses the \
+                "archive retry backlog: op enqueued WITHOUT confirmed journal durability \
+                 (local-disk publication failed); a crash before drain can lose the \
                  archive materialization (DB authoritative; surfaced via archive-lag metric)"
             );
             ArchiveBacklogPush::QueuedEphemeral
         }
     }
 
-    /// Enqueue an op recovered from its on-disk journal (already durable).
-    fn push_recovered(&self, op: WriteOp, journal_path: PathBuf) {
+    fn claim_journal(&self, path: PathBuf) -> Option<ArchiveBacklogJournalClaim<'_>> {
+        let inserted = self
+            .owned_journals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.clone());
+        inserted.then(|| ArchiveBacklogJournalClaim {
+            backlog: self,
+            path: Some(path),
+        })
+    }
+
+    fn owns_journal(&self, path: &Path) -> bool {
+        archive_backlog_journal_key(path).is_ok_and(|path| {
+            self.owned_journals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&path)
+        })
+    }
+
+    /// Admit a complete sorted recovery batch without decoding its payloads.
+    /// Claims cover queued, executing and retiring entries, including aliases.
+    /// Batching prevents newer live enqueues from splitting recovered order;
+    /// it does not reorder live work already admitted before this batch.
+    fn push_recovered(&self, config: &Config, files: Vec<PathBuf>) -> u64 {
+        let _admission = self
+            .recovery_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = Arc::new(config.clone());
+        let mut prepared = Vec::new();
+        for path in files {
+            if self.owns_journal(&path) {
+                continue;
+            }
+            let journal_path = match archive_backlog_journal_key(&path) {
+                Ok(path) => path,
+                Err(error) => {
+                    tracing::warn!(error = %error, path = %path.display(), "archive backlog: recovery candidate is no longer available");
+                    continue;
+                }
+            };
+            let Some(claim) = self.claim_journal(journal_path.clone()) else {
+                continue;
+            };
+            // A previous owner may have retired this candidate after the scan.
+            // Do not follow a replacement symlink, and do not reopen payloads
+            // here: permission/read failures belong to the bounded drain retry.
+            match fs::symlink_metadata(&journal_path) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => {
+                    tracing::warn!(path = %journal_path.display(), "archive backlog: recovery candidate is not a regular file");
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::warn!(error = %error, path = %journal_path.display(), "archive backlog: recovery candidate changed before admission");
+                    continue;
+                }
+                Err(error) => {
+                    // A transient stat failure must not silently strand an
+                    // otherwise claimed candidate outside the retry queue.
+                    tracing::warn!(error = %error, path = %journal_path.display(), "archive backlog: cannot inspect recovery candidate; deferring to checked read");
+                }
+            }
+            prepared.push((
+                ArchiveBacklogEntry {
+                    payload: ArchiveBacklogPayload::Journal(Arc::clone(&config)),
+                    journal_path: Some(journal_path),
+                    first_enqueued_at: Instant::now(),
+                    attempts: 0,
+                    retirement: None,
+                },
+                claim,
+            ));
+        }
+        let recovered = u64::try_from(prepared.len()).unwrap_or(u64::MAX);
         let mut queue = self
             .queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        queue.push_back(ArchiveBacklogEntry {
-            op,
-            journal_path: Some(journal_path),
-            first_enqueued_at: Instant::now(),
-            attempts: 0,
-        });
+        for (entry, claim) in prepared {
+            queue.push_back(entry);
+            claim.retain();
+        }
         self.store_depth(&queue);
         drop(queue);
-        self.enqueued_total.fetch_add(1, Ordering::Relaxed);
+        self.enqueued_total.fetch_add(recovered, Ordering::Relaxed);
+        recovered
     }
 
     /// Current `(depth, oldest_age_us)` of the backlog.
     fn backlog_state(&self) -> (u64, u64) {
-        let queue = self
-            .queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.sample_backlog_state(ArchiveLagLockPolicy::Wait)
+            .unwrap_or_default()
+    }
+
+    fn sample_backlog_state(
+        &self,
+        policy: ArchiveLagLockPolicy,
+    ) -> std::result::Result<(u64, u64), &'static str> {
+        let queue = archive_lag_lock(&self.queue, policy, "archive_backlog.queue")?;
         let depth = u64::try_from(queue.len()).unwrap_or(u64::MAX);
-        let oldest = queue.front().map_or(0, |entry| {
-            duration_as_micros_u64(entry.first_enqueued_at.elapsed())
-        });
-        (depth, oldest)
+        let oldest = queue
+            .iter()
+            .map(|entry| entry.first_enqueued_at)
+            .min()
+            .map_or(0, |enqueued_at| {
+                duration_as_micros_u64(enqueued_at.elapsed())
+            });
+        Ok((depth, oldest))
     }
 
     /// Process the front entry once (single-drainer; the front is stable across
@@ -2259,42 +2557,77 @@ impl ArchiveRetryBacklog {
     /// AND enqueues the batched async git commit — so the journal is removed only
     /// once the artifact is on disk.
     fn drain_step(&self) -> ArchiveBacklogDrainStep {
+        let retiring = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .front()
+            .is_some_and(|entry| entry.retirement.is_some());
+        if retiring {
+            return self.retire_front();
+        }
         let front = {
             let queue = self
                 .queue
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            queue
-                .front()
-                .map(|entry| (entry.op.clone(), entry.attempts, entry.journal_path.clone()))
+            queue.front().map(|entry| {
+                (
+                    entry.payload.clone(),
+                    entry.journal_path.clone(),
+                    entry.attempts,
+                )
+            })
         };
-        let Some((op, attempts, journal_path)) = front else {
+        let Some((payload, journal_path, attempts)) = front else {
             return ArchiveBacklogDrainStep::Empty;
+        };
+        let op = match payload {
+            ArchiveBacklogPayload::Ready(op) => op,
+            ArchiveBacklogPayload::Released => return self.retire_front(),
+            ArchiveBacklogPayload::Journal(config) => {
+                let loaded = journal_path
+                    .as_deref()
+                    .ok_or_else(|| {
+                        ArchiveBacklogReadError::Io(std::io::Error::other(
+                            "recovery journal path is missing",
+                        ))
+                    })
+                    .and_then(|path| archive_backlog_read_journal(&config, path));
+                let op = match loaded {
+                    Ok(op) => Arc::new(op),
+                    Err(error) => {
+                        return self.recovery_read_failed(
+                            &config,
+                            journal_path.as_deref(),
+                            attempts,
+                            error,
+                        );
+                    }
+                };
+                if let Some(front) = self
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .front_mut()
+                {
+                    front.payload = ArchiveBacklogPayload::Ready(Arc::clone(&op));
+                }
+                op
+            }
         };
         match write_op_sync(&op) {
             Ok(()) => {
-                let mut queue = self
-                    .queue
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                queue.pop_front();
-                self.store_depth(&queue);
-                drop(queue);
-                self.drained_total.fetch_add(1, Ordering::Relaxed);
-                if let Some(path) = journal_path {
-                    // Op is now durable in the archive: retire the journal
-                    // entry non-destructively (RULE 1) so recovery won't replay it.
-                    archive_backlog_journal_resolve(&path);
-                }
-                ArchiveBacklogDrainStep::Materialized
+                self.mark_front_for_retirement(ArchiveBacklogRetirement::Resolved);
+                drop(op);
+                self.retire_front()
             }
             Err(error) => {
                 let next_attempts = attempts.saturating_add(1);
                 if next_attempts >= ARCHIVE_BACKLOG_MAX_ATTEMPTS {
                     // F3: a permanently-failing head must not block the queue
                     // forever. Move it to the dead-letter ledger and advance.
-                    self.dead_letter_front(&op, next_attempts, &error);
-                    return ArchiveBacklogDrainStep::DeadLettered;
+                    return self.dead_letter_front(op, next_attempts, &error);
                 }
                 tracing::warn!(
                     error = %error,
@@ -2316,6 +2649,48 @@ impl ArchiveRetryBacklog {
         }
     }
 
+    fn recovery_read_failed(
+        &self,
+        config: &Config,
+        journal_path: Option<&Path>,
+        attempts: u32,
+        error: ArchiveBacklogReadError,
+    ) -> ArchiveBacklogDrainStep {
+        let (error, corrupt) = match error {
+            ArchiveBacklogReadError::Io(error) => (error.to_string(), false),
+            ArchiveBacklogReadError::Corrupt { line, column } => (
+                format!("invalid archive journal JSON at line {line}, column {column}"),
+                true,
+            ),
+        };
+        let next_attempts = attempts.saturating_add(1);
+        if !corrupt && next_attempts < ARCHIVE_BACKLOG_MAX_ATTEMPTS {
+            if let Some(front) = self
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .front_mut()
+            {
+                front.attempts = next_attempts;
+            }
+            tracing::warn!(error = %error, path = ?journal_path, attempts = next_attempts, "archive backlog: recovery journal read failed; retaining it for retry");
+            return ArchiveBacklogDrainStep::RetryLater(next_attempts);
+        }
+        archive_backlog_dead_letter_append_record(
+            config,
+            None,
+            journal_path,
+            next_attempts,
+            &error,
+        );
+        self.mark_front_for_retirement(if corrupt {
+            ArchiveBacklogRetirement::Corrupt
+        } else {
+            ArchiveBacklogRetirement::Failed
+        });
+        self.retire_front()
+    }
+
     /// Move the permanently-failing front entry to the dead-letter ledger and
     /// advance the queue (concurrency audit F3). Work is never silently thrown
     /// away: the serialized op plus failure context is appended to
@@ -2327,20 +2702,124 @@ impl ArchiveRetryBacklog {
     /// Ordering: ledger append happens BEFORE the queue pop / journal
     /// quarantine. If the process dies in between, restart replays the journal
     /// idempotently and, at worst, appends a duplicate ledger line.
-    fn dead_letter_front(&self, op: &WriteOp, attempts: u32, error: &StorageError) {
-        archive_backlog_dead_letter_append(op, attempts, error);
-        let journal_path = {
-            let mut queue = self
-                .queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let entry = queue.pop_front();
-            self.store_depth(&queue);
-            entry.and_then(|entry| entry.journal_path)
+    fn dead_letter_front(
+        &self,
+        op: Arc<WriteOp>,
+        attempts: u32,
+        error: &StorageError,
+    ) -> ArchiveBacklogDrainStep {
+        archive_backlog_dead_letter_append(&op, attempts, error);
+        self.mark_front_for_retirement(ArchiveBacklogRetirement::Failed);
+        drop(op);
+        self.retire_front()
+    }
+
+    fn mark_front_for_retirement(&self, retirement: ArchiveBacklogRetirement) {
+        if let Some(front) = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .front_mut()
+        {
+            front.retirement = Some(retirement);
+            front.payload = ArchiveBacklogPayload::Released;
+        }
+    }
+
+    fn retire_front(&self) -> ArchiveBacklogDrainStep {
+        let pending = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .front()
+            .and_then(|entry| {
+                entry
+                    .retirement
+                    .map(|retirement| (retirement, entry.journal_path.clone()))
+            });
+        let Some((retirement, journal_path)) = pending else {
+            return ArchiveBacklogDrainStep::Empty;
         };
-        self.dead_lettered_total.fetch_add(1, Ordering::Relaxed);
+        if let Some(path) = journal_path.as_ref() {
+            let result = match retirement {
+                ArchiveBacklogRetirement::Resolved => archive_backlog_journal_resolve(path),
+                ArchiveBacklogRetirement::Failed => archive_backlog_quarantine_file(path, "failed"),
+                ArchiveBacklogRetirement::Corrupt => archive_backlog_quarantine_corrupt(path),
+            };
+            if let Err(error) = result {
+                let mut queue = self
+                    .queue
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let attempts = queue.front_mut().map_or(1, |entry| {
+                    entry.attempts = entry.attempts.saturating_add(1);
+                    entry.attempts
+                });
+                if let Some(entry) = queue.pop_front() {
+                    queue.push_back(entry);
+                }
+                let has_unprocessed = queue.iter().any(|entry| entry.retirement.is_none());
+                tracing::warn!(
+                    error = %error,
+                    path = %path.display(),
+                    attempts,
+                    "archive backlog: journal retirement failed; retaining ownership and retrying the move"
+                );
+                return if has_unprocessed {
+                    ArchiveBacklogDrainStep::RetirementDeferred
+                } else {
+                    ArchiveBacklogDrainStep::RetryLater(attempts)
+                };
+            }
+        }
+
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.pop_front();
+        self.store_depth(&queue);
+        drop(queue);
         if let Some(path) = journal_path {
-            archive_backlog_quarantine_file(&path, "failed");
+            self.owned_journals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&path);
+        }
+        match retirement {
+            ArchiveBacklogRetirement::Resolved => {
+                self.drained_total.fetch_add(1, Ordering::Relaxed);
+                ArchiveBacklogDrainStep::Materialized
+            }
+            ArchiveBacklogRetirement::Failed | ArchiveBacklogRetirement::Corrupt => {
+                self.dead_lettered_total.fetch_add(1, Ordering::Relaxed);
+                ArchiveBacklogDrainStep::DeadLettered
+            }
+        }
+    }
+}
+
+/// Releases an unpublished/rejected claim on early return or unwind. Once its
+/// entry is queued, the drainer owns the claim until journal retirement succeeds.
+struct ArchiveBacklogJournalClaim<'a> {
+    backlog: &'a ArchiveRetryBacklog,
+    path: Option<PathBuf>,
+}
+
+impl ArchiveBacklogJournalClaim<'_> {
+    fn retain(mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for ArchiveBacklogJournalClaim<'_> {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.as_ref() {
+            self.backlog
+                .owned_journals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(path);
         }
     }
 }
@@ -2352,24 +2831,41 @@ impl ArchiveRetryBacklog {
 /// queue, and the entry's quarantined journal under
 /// `.archive_backlog/failed/` preserves the op regardless.
 fn archive_backlog_dead_letter_append(op: &WriteOp, attempts: u32, error: &StorageError) {
-    let config = write_op_config(op);
+    archive_backlog_dead_letter_append_record(
+        write_op_config(op),
+        Some(op),
+        None,
+        attempts,
+        &error.to_string(),
+    );
+}
+
+/// Undecodable journals retain their raw evidence on disk. Record the path and
+/// failure without loading the body again or exposing it in an error message.
+fn archive_backlog_dead_letter_append_record(
+    config: &Config,
+    op: Option<&WriteOp>,
+    journal_path: Option<&Path>,
+    attempts: u32,
+    error: &str,
+) {
     let doctor_dir = archive_storage_root(config).join("doctor");
     let ledger_path = doctor_dir.join("backlog_dead_letter.jsonl");
     tracing::error!(
         ledger = %ledger_path.display(),
         attempts,
         error = %error,
-        storage_root = %write_op_storage_root(op).display(),
+        storage_root = %archive_storage_root(config).display(),
         "archive backlog: head op failed permanently; dead-lettering it and \
          advancing the queue (op NOT applied to the archive; DB remains \
-         authoritative — replay from the ledger or .archive_backlog/failed/)"
+         authoritative — inspect the ledger and quarantined journal)"
     );
     if let Err(create_error) = fs::create_dir_all(&doctor_dir) {
         tracing::error!(
             error = %create_error,
             dir = %doctor_dir.display(),
             "archive backlog: cannot create doctor dir for dead-letter ledger; \
-             op record survives only in .archive_backlog/failed/"
+             op record survives only in its quarantined journal"
         );
         return;
     }
@@ -2381,29 +2877,35 @@ fn archive_backlog_dead_letter_append(op: &WriteOp, attempts: u32, error: &Stora
             cap = ARCHIVE_BACKLOG_DEAD_LETTER_MAX_BYTES,
             "archive backlog: dead-letter ledger at size cap; SKIPPING append \
              (entry still advanced past; op record survives only in \
-             .archive_backlog/failed/ — operator should rotate the ledger)"
+             its quarantined journal — operator should rotate the ledger)"
         );
         return;
     }
     // Serialize the op fallibly BEFORE building the record: `json!` would
     // panic on a serialize error, and the drain thread must never panic here.
-    let op_value = match serde_json::to_value(PersistedWriteOp::from_op(op)) {
+    let op_value = match op
+        .map(|op| serde_json::to_value(PersistedWriteOp::from_op(op)))
+        .transpose()
+    {
         Ok(value) => value,
         Err(serialize_error) => {
             tracing::error!(
                 error = %serialize_error,
                 "archive backlog: dead-letter op serialize failed; op record \
-                 survives only in .archive_backlog/failed/"
+                 survives only in its quarantined journal"
             );
             return;
         }
     };
-    let record = serde_json::json!({
+    let mut record = serde_json::json!({
         "dead_lettered_at_us": now_micros_u64(),
         "attempts": attempts,
-        "error": error.to_string(),
+        "error": error,
         "op": op_value,
     });
+    if let Some(path) = journal_path {
+        record["journal_path"] = serde_json::Value::String(path.display().to_string());
+    }
     let mut bytes = record.to_string().into_bytes();
     bytes.push(b'\n');
     let append = fs::OpenOptions::new()
@@ -2419,7 +2921,7 @@ fn archive_backlog_dead_letter_append(op: &WriteOp, attempts: u32, error: &Stora
             error = %io_error,
             ledger = %ledger_path.display(),
             "archive backlog: dead-letter ledger append failed; op record \
-             survives only in .archive_backlog/failed/"
+             survives only in its quarantined journal"
         );
     }
 }
@@ -2435,6 +2937,46 @@ static ARCHIVE_BACKLOG_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn archive_backlog_journal_dir_for(config: &Config) -> PathBuf {
     archive_storage_root(config).join(".archive_backlog")
+}
+
+enum ArchiveBacklogReadError {
+    Io(std::io::Error),
+    Corrupt { line: usize, column: usize },
+}
+
+/// Hydrate only the claimed front entry, through a checked file handle. A
+/// buffered reader avoids retaining another full encoded copy of a large body.
+fn archive_backlog_read_journal(
+    config: &Config,
+    path: &Path,
+) -> std::result::Result<WriteOp, ArchiveBacklogReadError> {
+    let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)
+        .map_err(ArchiveBacklogReadError::Io)?;
+    let persisted: PersistedWriteOp = serde_json::from_reader(std::io::BufReader::new(file))
+        .map_err(|error| {
+            if error.is_io() {
+                ArchiveBacklogReadError::Io(std::io::Error::other(error))
+            } else {
+                ArchiveBacklogReadError::Corrupt {
+                    line: error.line(),
+                    column: error.column(),
+                }
+            }
+        })?;
+    Ok(persisted.into_op(config.clone()))
+}
+
+/// Alias spellings of the directory share one key, but the leaf is never
+/// resolved through a symlink into another directory's retirement target.
+fn archive_backlog_journal_key(path: &Path) -> std::io::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("journal path has no filename"))?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(fs::canonicalize(parent)?.join(name))
 }
 
 /// Borrow the runtime `Config` carried by any `WriteOp` variant.
@@ -2461,10 +3003,52 @@ fn archive_backlog_write_tmp(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Durably journal an op; returns the final journal path, or `None` if
-/// journaling is unavailable (the entry then lives in memory only and heals via
-/// reconcile on the next successful drain or is bounded-lost on crash).
-fn archive_backlog_journal_write(op: &WriteOp) -> Option<PathBuf> {
+struct ArchiveBacklogJournal {
+    path: PathBuf,
+    /// All publication flushes supported by this platform completed. Unix
+    /// includes directory ancestry; other platforms retain file-flush behavior.
+    durable: bool,
+}
+
+#[cfg(all(test, unix))]
+type ArchiveBacklogDirectorySyncTestHook = Box<dyn FnMut(&Path) -> std::io::Result<()>>;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static ARCHIVE_BACKLOG_DIRECTORY_SYNC_TEST_HOOK:
+        std::cell::RefCell<Option<ArchiveBacklogDirectorySyncTestHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Confirm the published journal's directory entries on Unix. Always sync the
+/// complete physical ancestry: another pusher may have just created a parent
+/// that exists but whose own parent entry has not reached disk yet. Canonical
+/// paths also keep relative or symlink-spelled storage roots from truncating
+/// the chain. This uses the existing trusted, stable directory namespace.
+#[cfg(unix)]
+fn archive_backlog_sync_journal_ancestry(dir: &Path) -> std::io::Result<()> {
+    let canonical = fs::canonicalize(dir)?;
+    for directory in canonical.ancestors() {
+        #[cfg(test)]
+        ARCHIVE_BACKLOG_DIRECTORY_SYNC_TEST_HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(directory)?;
+            }
+            Ok::<(), std::io::Error>(())
+        })?;
+        fs::File::open(directory)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Publish a journal candidate and report whether every supported durability
+/// step succeeded. Keep a complete post-rename candidate even when directory
+/// sync fails, so it remains replayable and its successful drain can retire it.
+/// None means no complete candidate was published; only memory backs the op.
+fn archive_backlog_journal_write(
+    op: &WriteOp,
+    owner: Option<&ArchiveRetryBacklog>,
+) -> Option<ArchiveBacklogJournal> {
     let dir = archive_backlog_journal_dir_for(write_op_config(op));
     if let Err(error) = fs::create_dir_all(&dir) {
         tracing::warn!(
@@ -2474,6 +3058,15 @@ fn archive_backlog_journal_write(op: &WriteOp) -> Option<PathBuf> {
         );
         return None;
     }
+    // Freeze the same physical spelling used by recovery before registering
+    // ownership. Alias spellings must not admit a second copy of a live op.
+    let dir = match fs::canonicalize(&dir) {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::warn!(error = %error, dir = %dir.display(), "archive backlog: cannot resolve journal dir; in-memory only");
+            return None;
+        }
+    };
     let persisted = PersistedWriteOp::from_op(op);
     let bytes = match serde_json::to_vec(&persisted) {
         Ok(bytes) => bytes,
@@ -2489,64 +3082,108 @@ fn archive_backlog_journal_write(op: &WriteOp) -> Option<PathBuf> {
         std::process::id()
     ));
     let tmp_path = final_path.with_extension("json.tmp");
+    let claim = if let Some(owner) = owner {
+        let Some(claim) = owner.claim_journal(final_path.clone()) else {
+            tracing::warn!(path = %final_path.display(), "archive backlog: journal name is already owned; in-memory only");
+            return None;
+        };
+        Some(claim)
+    } else {
+        None
+    };
     if let Err(error) = archive_backlog_write_tmp(&tmp_path, &bytes) {
         tracing::warn!(error = %error, "archive backlog: journal write failed; in-memory only");
-        archive_backlog_quarantine_file(&tmp_path, "failed");
+        let _ = archive_backlog_quarantine_file(&tmp_path, "failed");
         return None;
     }
     if let Err(error) = fs::rename(&tmp_path, &final_path) {
         tracing::warn!(error = %error, "archive backlog: journal rename failed; in-memory only");
-        archive_backlog_quarantine_file(&tmp_path, "failed");
+        let _ = archive_backlog_quarantine_file(&tmp_path, "failed");
         return None;
     }
-    Some(final_path)
+    #[cfg(unix)]
+    let durable = match archive_backlog_sync_journal_ancestry(&dir) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                path = %final_path.display(),
+                "archive backlog: journal directory sync failed; candidate retained \
+                 without confirmed durability"
+            );
+            false
+        }
+    };
+    // Keep the existing file-flush/atomic-rename receipt on other platforms;
+    // the portable standard library has no directory-fsync equivalent there.
+    #[cfg(not(unix))]
+    let durable = true;
+    if let Some(claim) = claim {
+        claim.retain();
+    }
+    Some(ArchiveBacklogJournal {
+        path: final_path,
+        durable,
+    })
 }
 
 /// RULE 1: the ack-fast backlog NEVER deletes journal files. Instead of removing
 /// `path`, move it into a `<journal-dir>/<subdir>/` sibling (created on demand),
-/// preserving the record for forensics/operator reclaim. Best-effort: a missing
-/// source is a no-op; a failed move leaves the file in place (recovery re-materializes
-/// idempotently, so a stray journal is never a correctness problem, only tidiness).
+/// preserving the record for forensics/operator reclaim. A missing source is a
+/// no-op; other failures retain the source and are returned to the drainer so
+/// it keeps ownership until retirement succeeds.
 ///
 /// The `resolved/`/`failed/` subdirs are NOT re-scanned by [`archive_backlog_recover`]
 /// (it reads only top-level `*.json`), so quarantined entries are never replayed.
 /// In practice these dirs stay small because the backlog is used only on the
 /// degraded WBQ-unavailable fallback path; operators reclaim them like other
 /// `.doctor`/recovery debris.
-fn archive_backlog_quarantine_file(path: &Path, subdir: &str) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    let quarantine_dir = parent.join(subdir);
-    if let Err(error) = fs::create_dir_all(&quarantine_dir) {
-        tracing::debug!(
-            error = %error,
-            dir = %quarantine_dir.display(),
-            "archive backlog: cannot create {subdir} quarantine dir; leaving journal in place"
-        );
-        return;
+fn archive_backlog_quarantine_file(path: &Path, subdir: &str) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+        Ok(_) => {}
     }
-    let Some(name) = path.file_name() else {
-        return;
-    };
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("journal path has no parent"))?;
+    let quarantine_dir = parent.join(subdir);
+    fs::create_dir_all(&quarantine_dir)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("journal path has no filename"))?;
     let dest = quarantine_dir.join(name);
-    if let Err(error) = fs::rename(path, &dest) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            tracing::debug!(
-                error = %error,
-                from = %path.display(),
-                to = %dest.display(),
-                "archive backlog: quarantine move failed (recovery replays idempotently)"
-            );
+    archive_backlog_move_journal(path, &dest)
+}
+
+/// Preserve the established sibling `.corrupt` evidence path while retaining
+/// the claim if the move is temporarily blocked.
+fn archive_backlog_quarantine_corrupt(path: &Path) -> std::io::Result<()> {
+    archive_backlog_move_journal(path, &path.with_extension("corrupt"))
+}
+
+fn archive_backlog_move_journal(path: &Path, dest: &Path) -> std::io::Result<()> {
+    // An older quarantine record is evidence too. Refuse occupied targets
+    // atomically and let retirement retain its claim until the conflict clears.
+    match mcp_agent_mail_db::pool::rename_noreplace_preserving_source(path, dest) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // The destination directory can disappear too. Do not release
+            // ownership while the original active journal still exists.
+            match fs::symlink_metadata(path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(error),
+            }
         }
+        Err(error) => Err(error),
     }
 }
 
 /// Retire a durably-materialized journal entry non-destructively (RULE 1): its
 /// op is now durable in the git archive, so the entry is moved into `resolved/`
 /// rather than deleted, and recovery no longer replays it.
-fn archive_backlog_journal_resolve(path: &Path) {
-    archive_backlog_quarantine_file(path, "resolved");
+fn archive_backlog_journal_resolve(path: &Path) -> std::io::Result<()> {
+    archive_backlog_quarantine_file(path, "resolved")
 }
 
 fn archive_backlog_ensure_drain(backlog: &'static ArchiveRetryBacklog) {
@@ -2565,9 +3202,17 @@ fn archive_backlog_ensure_drain(backlog: &'static ArchiveRetryBacklog) {
     }
     let handle = std::thread::Builder::new()
         .name("archive-backlog-drain".into())
-        .stack_size(mcp_agent_mail_core::worker_stack_size())
-        .spawn(move || archive_backlog_drain_loop(backlog))
-        .unwrap_or_else(|error| panic!("failed to spawn archive-backlog-drain thread: {error}"));
+        .stack_size(storage_worker_stack_size())
+        .spawn(move || archive_backlog_drain_loop(backlog));
+    let handle = match handle {
+        Ok(handle) => handle,
+        Err(error) => {
+            // Journal ownership and queued entries remain intact. Another
+            // handoff, recovery or flush can retry creating the consumer.
+            tracing::error!(%error, "archive backlog drain could not start; journals remain retained");
+            return;
+        }
+    };
     *backlog
         .drain_handle
         .lock()
@@ -2595,7 +3240,9 @@ fn archive_backlog_drain_loop(backlog: &'static ArchiveRetryBacklog) {
             // Materialized: loop immediately to drain the next entry with no sleep.
             // DeadLettered (F3): the poisoned head was ledgered and removed;
             // likewise continue immediately with the next entry.
-            ArchiveBacklogDrainStep::Materialized | ArchiveBacklogDrainStep::DeadLettered => {}
+            ArchiveBacklogDrainStep::Materialized
+            | ArchiveBacklogDrainStep::DeadLettered
+            | ArchiveBacklogDrainStep::RetirementDeferred => {}
             ArchiveBacklogDrainStep::RetryLater(attempts) => {
                 let backoff = ARCHIVE_BACKLOG_DRAIN_INTERVAL_MS
                     .saturating_mul(u64::from(attempts.min(50)))
@@ -2609,8 +3256,9 @@ fn archive_backlog_drain_loop(backlog: &'static ArchiveRetryBacklog) {
 /// Durably queue an archive write op for strictly-asynchronous background retry.
 ///
 /// This is the ack-fast replacement for the inline `write_op_sync` fallback used
-/// when the write-behind queue is unavailable: the reply path incurs at most one
-/// small local-disk journal fsync (not a git commit), then returns.
+/// when the write-behind queue is unavailable: the reply path publishes a small
+/// local-disk journal with file sync and, on Unix, directory-ancestry sync. Git
+/// archive materialization remains on the background worker.
 #[must_use]
 pub fn archive_backlog_push(op: WriteOp) -> ArchiveBacklogPush {
     let backlog = &*ARCHIVE_BACKLOG;
@@ -2630,7 +3278,11 @@ pub fn archive_backlog_push(op: WriteOp) -> ArchiveBacklogPush {
 /// after the DB commit but before the archive materialized. Idempotent and safe
 /// to call at every boot; message re-materialization is path-keyed by message id
 /// so a replay after a partially-written bundle rewrites the same files (never a
-/// duplicate).
+/// duplicate). Recovery queues sorted path metadata and decodes only the front
+/// journal when the worker reaches it. Payload memory is bounded by one
+/// recovered operation plus the bounded live queue; path metadata remains
+/// proportional to the number of pending journals. The whole recovery batch
+/// precedes subsequently admitted writes, including mutable profiles/signals.
 pub fn archive_backlog_recover(config: &Config) {
     let dir = archive_backlog_journal_dir_for(config);
     let read_dir = match fs::read_dir(&dir) {
@@ -2653,41 +3305,18 @@ pub fn archive_backlog_recover(config: &Config) {
     files.sort();
 
     let backlog = &*ARCHIVE_BACKLOG;
-    let mut recovered = 0u64;
-    for path in files {
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                tracing::warn!(error = %error, path = %path.display(), "archive backlog: unreadable journal entry");
-                continue;
-            }
-        };
-        let persisted: PersistedWriteOp = match serde_json::from_slice(&bytes) {
-            Ok(persisted) => persisted,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    path = %path.display(),
-                    "archive backlog: corrupt journal entry; quarantining"
-                );
-                let _ = fs::rename(&path, path.with_extension("corrupt"));
-                continue;
-            }
-        };
-        let op = persisted.into_op(config.clone());
-        backlog.push_recovered(op, path);
-        recovered = recovered.saturating_add(1);
-    }
+    let recovered = backlog.push_recovered(config, files);
     if recovered > 0 {
         tracing::warn!(
             recovered,
-            "archive backlog: recovered pending archive writes from journal after restart"
+            "archive backlog: admitted pending journals for background recovery after restart"
         );
         archive_backlog_ensure_drain(backlog);
     }
 }
 
-/// Current number of ops waiting in the archive retry backlog.
+/// Current number of entries in the archive retry backlog, including journals
+/// awaiting hydration and completed operations awaiting journal retirement.
 #[must_use]
 pub fn archive_backlog_depth() -> u64 {
     ARCHIVE_BACKLOG.depth.load(Ordering::Relaxed)
@@ -2723,7 +3352,8 @@ pub fn archive_backlog_flush_blocking(timeout: Duration) -> bool {
 /// unmaterialized-write backlog. Surfaced via `health_check` (br-hpv61 ask #1).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveLagSnapshot {
-    /// Ops in the durable retry backlog (WBQ-unavailable fallback path).
+    /// Entries in the retry backlog, including unhydrated recovery journals
+    /// and pending retirements (WBQ-unavailable fallback path).
     pub backlog_depth: u64,
     /// Age (microseconds) of the oldest op in the retry backlog, 0 if empty.
     pub backlog_oldest_age_us: u64,
@@ -2744,9 +3374,9 @@ pub struct ArchiveLagSnapshot {
     pub drained_total: u64,
     /// Lifetime count of ops dropped because the retry backlog was full.
     pub dropped_total: u64,
-    /// Lifetime count of ops moved to the dead-letter ledger after exhausting
-    /// their materialization attempts (F3). Nonzero means
-    /// `<storage_root>/doctor/backlog_dead_letter.jsonl` has operator work.
+    /// Lifetime count of ops retired after permanent materialization or journal
+    /// read/decode failure. Nonzero means the dead-letter ledger and preserved
+    /// failed/corrupt journals have operator work.
     #[serde(default)]
     pub dead_lettered_total: u64,
     /// Lifetime count of ops enqueued WITHOUT a durable journal (local-disk
@@ -2770,6 +3400,34 @@ pub struct ArchiveLagSnapshot {
     /// age this also grows when the drain thread is dead or never dequeues.
     #[serde(default)]
     pub wbq_since_progress_us: u64,
+}
+
+/// A diagnostic sample could not inspect a queue without waiting for its owner.
+#[derive(Debug, Clone, Copy, Error)]
+#[error("archive lag sample unavailable at {unavailable_lock}")]
+pub struct ArchiveLagSnapshotUnavailable {
+    pub unavailable_lock: &'static str,
+    /// Confirmed lower bounds only. Missing queue evidence is not an empty queue.
+    pub lower_bound: ArchiveLagSnapshot,
+}
+
+#[derive(Clone, Copy)]
+enum ArchiveLagLockPolicy {
+    Wait,
+    Try,
+}
+
+fn archive_lag_lock<'a, T>(
+    mutex: &'a Mutex<T>,
+    policy: ArchiveLagLockPolicy,
+    site: &'static str,
+) -> std::result::Result<std::sync::MutexGuard<'a, T>, &'static str> {
+    match policy {
+        ArchiveLagLockPolicy::Wait => Ok(mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)),
+        ArchiveLagLockPolicy::Try => mutex.try_lock().map_err(|_| site),
+    }
 }
 
 /// Wall-clock µs at which the WBQ drain dequeued the batch it is executing
@@ -2849,7 +3507,9 @@ fn wbq_inflight_ages_us(now_us: u64) -> (u64, u64) {
     )
 }
 
-/// Snapshot the live archive-materialization lag for `health_check`.
+/// Blocking archive-materialization lag snapshot for accounting.
+///
+/// Health diagnostics use [`try_archive_lag_snapshot`] to avoid queue waits.
 ///
 /// `oldest_unmaterialized_us` covers the retry backlog, the commit coalescer
 /// AND the batch the WBQ drain is executing. Before br-kp1in.23 the WBQ was
@@ -2857,13 +3517,41 @@ fn wbq_inflight_ages_us(now_us: u64) -> (u64, u64) {
 /// reported 0 ms of lag (observed 2026-09-23).
 #[must_use]
 pub fn archive_lag_snapshot() -> ArchiveLagSnapshot {
+    sample_archive_lag(ArchiveLagLockPolicy::Wait).0
+}
+
+/// Sample health without waiting for an archive queue mutex.
+///
+/// Unavailable queue ages must remain unknown. The error retains already
+/// observed lower bounds, including the lock-free WBQ stall signals.
+///
+/// # Errors
+/// Returns the unavailable lock and confirmed lower bounds on contention or
+/// a poisoned queue mutex.
+pub fn try_archive_lag_snapshot()
+-> std::result::Result<ArchiveLagSnapshot, Box<ArchiveLagSnapshotUnavailable>> {
+    let (snapshot, unavailable_lock) = sample_archive_lag(ArchiveLagLockPolicy::Try);
+    unavailable_lock.map_or(Ok(snapshot), |unavailable_lock| {
+        Err(Box::new(ArchiveLagSnapshotUnavailable {
+            unavailable_lock,
+            lower_bound: snapshot,
+        }))
+    })
+}
+
+fn sample_archive_lag(policy: ArchiveLagLockPolicy) -> (ArchiveLagSnapshot, Option<&'static str>) {
     let backlog = &*ARCHIVE_BACKLOG;
-    let (backlog_depth, backlog_oldest_age_us) = backlog.backlog_state();
-    let (coalescer_pending, coalescer_lag) = COMMIT_COALESCER
-        .get()
-        .map_or((0, CoalescerLagState::default()), |c| {
-            (c.pending_requests(), c.lag_state())
-        });
+    // Blocking accounting samples WBQ ages after queue waits, as before.
+    // Diagnostics need those lock-free lower bounds before any try-lock fails.
+    let blocking = matches!(policy, ArchiveLagLockPolicy::Wait).then(|| {
+        let backlog_state = backlog.backlog_state();
+        let coalescer = COMMIT_COALESCER
+            .get()
+            .map_or((0, CoalescerLagState::default()), |coalescer| {
+                (coalescer.pending_requests(), coalescer.lag_state())
+            });
+        (backlog_state, coalescer)
+    });
     let now_us = now_micros_u64();
     let (wbq_inflight_oldest_age_us, wbq_inflight_execution_us) = wbq_inflight_ages_us(now_us);
     let wbq_depth = mcp_agent_mail_core::global_metrics()
@@ -2876,18 +3564,18 @@ pub fn archive_lag_snapshot() -> ArchiveLagSnapshot {
         WBQ_LAST_PROGRESS_US.load(Ordering::Relaxed),
         WBQ_BACKLOG_SINCE_US.load(Ordering::Relaxed),
     );
-    ArchiveLagSnapshot {
-        backlog_depth,
-        backlog_oldest_age_us,
-        coalescer_pending,
-        coalescer_oldest_age_us: coalescer_lag.oldest_age_us,
-        coalescer_since_progress_us: coalescer_lag.since_progress_us,
+    let mut snapshot = ArchiveLagSnapshot {
+        coalescer_pending: blocking.map_or_else(
+            || {
+                COMMIT_COALESCER
+                    .get()
+                    .map_or(0, CommitCoalescer::pending_requests)
+            },
+            |(_, (pending, _))| pending,
+        ),
         // Queued work that has not advanced for this long is at least this
         // stale, even when no batch is in flight (dead or idle drain).
-        oldest_unmaterialized_us: backlog_oldest_age_us
-            .max(coalescer_lag.oldest_age_us)
-            .max(wbq_inflight_oldest_age_us)
-            .max(wbq_since_progress_us),
+        oldest_unmaterialized_us: wbq_inflight_oldest_age_us.max(wbq_since_progress_us),
         wbq_depth,
         wbq_inflight_oldest_age_us,
         wbq_inflight_execution_us,
@@ -2897,7 +3585,40 @@ pub fn archive_lag_snapshot() -> ArchiveLagSnapshot {
         dropped_total: backlog.dropped_total.load(Ordering::Relaxed),
         dead_lettered_total: backlog.dead_lettered_total.load(Ordering::Relaxed),
         ephemeral_total: backlog.ephemeral_total.load(Ordering::Relaxed),
+        ..ArchiveLagSnapshot::default()
+    };
+    let backlog_state = blocking.map_or_else(
+        || backlog.sample_backlog_state(policy),
+        |(state, _)| Ok(state),
+    );
+    let mut unavailable_lock = None;
+    match backlog_state {
+        Ok((depth, age)) => {
+            snapshot.backlog_depth = depth;
+            snapshot.backlog_oldest_age_us = age;
+            snapshot.oldest_unmaterialized_us = snapshot.oldest_unmaterialized_us.max(age);
+        }
+        Err(site) => unavailable_lock = Some(site),
     }
+    // A busy retry queue does not make the independent coalescer evidence
+    // unavailable. Keep collecting confirmed bounds without waiting, while
+    // retaining the first refusal so this never becomes a complete sample.
+    if let Some(coalescer) = COMMIT_COALESCER.get() {
+        let (lag, unavailable) = if let Some((_, (_, lag))) = blocking {
+            (lag, None)
+        } else {
+            match coalescer.sample_lag_state(policy) {
+                Ok(lag) => (lag, None),
+                Err((site, lag)) => (lag, Some(site)),
+            }
+        };
+        snapshot.coalescer_oldest_age_us = lag.oldest_age_us;
+        snapshot.coalescer_since_progress_us = lag.since_progress_us;
+        snapshot.oldest_unmaterialized_us =
+            snapshot.oldest_unmaterialized_us.max(lag.oldest_age_us);
+        unavailable_lock = unavailable_lock.or(unavailable);
+    }
+    (snapshot, unavailable_lock)
 }
 
 /// Failure modes for delivering a control message (`Flush`/`Shutdown`) to the
@@ -3028,82 +3749,107 @@ pub fn wbq_flush() {
 /// its loop.  Without this, the thread would block on `recv_timeout`
 /// indefinitely because the sender lives in a `OnceLock` static and is
 /// never dropped.
+/// An unfinished worker remains registered after an unsuccessful shutdown;
+/// startup can reap it and salvage its channel only after it actually exits.
 pub fn wbq_shutdown() {
     if let Some(wbq) = WBQ.get() {
-        let _lifecycle = wbq
-            .lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Join only when the drain thread demonstrably keeps consuming (flush
-        // acknowledged and Shutdown delivered) or is already gone. A wedged
-        // thread with a full channel must not hang shutdown forever (br-lrrry).
-        let mut safe_to_join = true;
-        if let Some(sender) = wbq_sender_clone(wbq) {
-            let deadline = Instant::now() + Duration::from_secs(WBQ_FLUSH_BUDGET_SECS);
-            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-            match wbq_send_control_with_deadline(&sender, WbqMsg::Flush(done_tx), deadline) {
-                Ok(()) => {
-                    match done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                        Ok(()) => {}
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            tracing::warn!(
-                                "wbq_shutdown: flush timed out after {WBQ_FLUSH_BUDGET_SECS}s; \
-                                 drain thread may be stuck"
-                            );
-                            safe_to_join = false;
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            tracing::warn!("wbq_shutdown: drain thread channel disconnected");
-                        }
+        wbq_shutdown_inner(
+            wbq,
+            Duration::from_secs(WBQ_FLUSH_BUDGET_SECS),
+            Duration::from_secs(WBQ_SHUTDOWN_SEND_BUDGET_SECS),
+        );
+    }
+}
+
+fn wbq_shutdown_inner(
+    wbq: &WriteBehindQueue,
+    flush_budget: Duration,
+    shutdown_send_budget: Duration,
+) {
+    let _lifecycle = wbq
+        .lifecycle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Join only when the drain thread demonstrably keeps consuming (flush
+    // acknowledged and Shutdown delivered) or is already gone. A wedged
+    // thread with a full channel must not hang shutdown forever (br-lrrry).
+    // In particular, a second shutdown with no sender must not join a
+    // still-running worker retained by an earlier timeout.
+    let mut flush_acked = false;
+    let mut shutdown_delivered = false;
+    if let Some(sender) = wbq_sender_clone(wbq) {
+        let deadline = Instant::now() + flush_budget;
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        match wbq_send_control_with_deadline(&sender, WbqMsg::Flush(done_tx), deadline) {
+            Ok(()) => {
+                match done_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(()) => flush_acked = true,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        tracing::warn!(
+                            "wbq_shutdown: flush timed out after {flush_budget:?}; \
+                             drain thread may be stuck"
+                        );
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        tracing::warn!("wbq_shutdown: drain thread channel disconnected");
                     }
                 }
-                Err(WbqControlSendError::TimedOut) => {
-                    tracing::warn!(
-                        "wbq_shutdown: could not deliver flush request within \
-                         {WBQ_FLUSH_BUDGET_SECS}s (channel full); drain thread may be stuck"
-                    );
-                    safe_to_join = false;
-                }
-                Err(WbqControlSendError::Disconnected) => {}
             }
-            // Tell the drain thread to exit, bounded for the same reason.
-            match wbq_send_control_with_deadline(
-                &sender,
-                WbqMsg::Shutdown,
-                Instant::now() + Duration::from_secs(WBQ_SHUTDOWN_SEND_BUDGET_SECS),
-            ) {
-                Ok(()) => {}
-                Err(WbqControlSendError::TimedOut) => {
-                    tracing::warn!(
-                        "wbq_shutdown: could not deliver Shutdown within \
-                         {WBQ_SHUTDOWN_SEND_BUDGET_SECS}s (channel full); detaching drain \
-                         thread without join"
-                    );
-                    safe_to_join = false;
-                }
-                Err(WbqControlSendError::Disconnected) => {}
-            }
-        }
-        // Dropping the stored sender (and our clone above, at scope end) lets
-        // the channel disconnect once in-flight clones die, which is a second
-        // exit path for the drain loop even if Shutdown was never delivered.
-        *wbq.sender
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        let handle = {
-            let mut guard = wbq.drain_handle.lock();
-            guard.take()
-        };
-        if let Some(h) = handle {
-            if safe_to_join || h.is_finished() {
-                let _ = h.join();
-            } else {
+            Err(WbqControlSendError::TimedOut) => {
                 tracing::warn!(
-                    "wbq_shutdown: detaching wedged drain thread; ops it still holds will be \
-                     salvaged if the queue is restarted"
+                    "wbq_shutdown: could not deliver flush request within \
+                     {flush_budget:?} (channel full); drain thread may be stuck"
                 );
             }
+            Err(WbqControlSendError::Disconnected) => {}
         }
+        // Tell the drain thread to exit, bounded for the same reason.
+        match wbq_send_control_with_deadline(
+            &sender,
+            WbqMsg::Shutdown,
+            Instant::now() + shutdown_send_budget,
+        ) {
+            Ok(()) => shutdown_delivered = true,
+            Err(WbqControlSendError::TimedOut) => {
+                tracing::warn!(
+                    "wbq_shutdown: could not deliver Shutdown within \
+                     {shutdown_send_budget:?} (channel full); retaining drain \
+                     thread for later reaping"
+                );
+            }
+            Err(WbqControlSendError::Disconnected) => {}
+        }
+    }
+    // Dropping the stored sender (and our clone above, at scope end) lets
+    // the channel disconnect once in-flight clones die, which is a second
+    // exit path for the drain loop even if Shutdown was never delivered.
+    *wbq.sender
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    let safe_to_join = flush_acked && shutdown_delivered;
+    let (handle, retained) = {
+        let mut guard = wbq.drain_handle.lock();
+        if safe_to_join
+            || guard
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            (guard.take(), false)
+        } else {
+            (None, guard.is_some())
+        }
+    };
+    if let Some(h) = handle {
+        let _ = h.join();
+    }
+    if retained {
+        // The worker still reads the shared receiver slot between batches.
+        // Losing its identity would let startup replace that slot beneath
+        // it and run two drain generations against one queue and counters.
+        tracing::warn!(
+            "wbq_shutdown: retaining unfinished drain thread; queue restart remains \
+             unavailable until it exits"
+        );
     }
 }
 
@@ -3713,6 +4459,9 @@ fn wbq_drain_loop(
                 note_archive_write_outcome(envelopes[0].op.as_ref(), group_failed);
             }
             idx = end;
+            if idx < batch.len() {
+                wbq_yield_between_groups();
+            }
         }
 
         metrics.storage.wbq_drained_total.add(drained_u64);
@@ -3820,19 +4569,113 @@ fn message_bundle_batch_group_key(op: &WriteOp) -> Option<(&str, &Path, &str, &s
     }
 }
 
+// A dequeued burst is not one publication transaction. Bound how much of it
+// can stage/fsync while excluding unrelated publishers (GH#344, br-kp1in.13).
+// A single bundle is indivisible and may exceed either target; it runs alone.
+const WBQ_MESSAGE_BATCH_MAX_FILES: usize = 64;
+const WBQ_MESSAGE_BATCH_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Count the pretty-printed envelope without allocating another payload.
+/// Going over the target makes the entire bundle a singleton; the ordinary
+/// writer remains responsible for validation and publication errors.
+#[derive(Default)]
+struct WbqMessageByteCount(usize);
+
+impl IoWrite for WbqMessageByteCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        if self.0 > WBQ_MESSAGE_BATCH_MAX_BYTES {
+            return Err(std::io::Error::other("message batch byte target exceeded"));
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn message_bundle_batch_cost(op: &WriteOp) -> (usize, usize) {
+    let WriteOp::MessageBundle {
+        message_json,
+        body_md,
+        recipients,
+        extra_paths,
+        ..
+    } = op
+    else {
+        return (usize::MAX, usize::MAX);
+    };
+    let copies = 2usize.saturating_add(recipients.len());
+    // Charge each digest append and attachment reference too, even when a
+    // shared thread/path makes this conservative. Do not deduplicate copies:
+    // the existing writer also stages repeated recipient destinations.
+    let files = copies
+        .saturating_add(extra_paths.len())
+        .saturating_add(usize::from(
+            message_json
+                .get("thread_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|thread| !thread.trim().is_empty()),
+        ));
+    let mut frontmatter = WbqMessageByteCount::default();
+    let bytes = if serde_json::to_writer_pretty(&mut frontmatter, message_json).is_ok() {
+        frontmatter
+            .0
+            .saturating_add(body_md.len())
+            .saturating_add("---json\n\n---\n\n".len())
+            .saturating_mul(copies)
+    } else {
+        usize::MAX
+    };
+    // This bounds rendered message copies, not attachment contents or an
+    // existing thread digest. BCC-redacted inboxes can only be smaller than
+    // the full-envelope upper bound. No body or private routing is logged.
+    (files, bytes)
+}
+
 fn wbq_message_bundle_batch_end(batch: &[WbqOpEnvelope], start: usize) -> usize {
     let Some(anchor_key) = message_bundle_batch_group_key(batch[start].op.as_ref()) else {
         return start + 1;
     };
 
+    let (mut files, mut bytes) = message_bundle_batch_cost(batch[start].op.as_ref());
     let mut end = start + 1;
-    while end < batch.len() {
+    while end < batch.len()
+        && files < WBQ_MESSAGE_BATCH_MAX_FILES
+        && bytes < WBQ_MESSAGE_BATCH_MAX_BYTES
+    {
         if message_bundle_batch_group_key(batch[end].op.as_ref()) != Some(anchor_key) {
             break;
         }
+        let (next_files, next_bytes) = message_bundle_batch_cost(batch[end].op.as_ref());
+        let next_files = files.saturating_add(next_files);
+        let next_bytes = bytes.saturating_add(next_bytes);
+        if next_files > WBQ_MESSAGE_BATCH_MAX_FILES || next_bytes > WBQ_MESSAGE_BATCH_MAX_BYTES {
+            break;
+        }
+        files = next_files;
+        bytes = next_bytes;
         end += 1;
     }
     end
+}
+
+fn wbq_yield_between_groups() {
+    #[cfg(test)]
+    {
+        let mut hook = WBQ_BETWEEN_GROUPS_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook.as_mut() {
+            hook();
+        }
+        WBQ_BETWEEN_GROUPS_TEST_HOOK.with(|slot| *slot.borrow_mut() = hook);
+    }
+    // Immutable-message fast admission uses a try-lock, so it otherwise
+    // bypasses FenceLease::acquire's give-way for waiting request writers.
+    // Yield only after all group guards have unwound, with the same bounded
+    // waiter policy and no change to an individual bundle's durability.
+    give_way_to_direct_writers();
+    std::thread::yield_now();
 }
 
 /// Keep an archive-writer panic inside its group, after mutation and project
@@ -4222,25 +5065,176 @@ fn quarantine_startup_artifact_if_exists(
     path: &Path,
     fallback_name: &str,
     context: &str,
+    absent_counterpart: &Path,
 ) -> Option<PathBuf> {
-    if !path_is_occupied(path) {
-        return None;
-    }
-
-    let quarantine = next_startup_quarantine_path(path, fallback_name);
-    match fs::rename(path, &quarantine) {
-        Ok(()) => Some(quarantine),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+    let file = match mcp_agent_mail_core::disk::open_regular_file_no_follow(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
             tracing::warn!(
                 path = %path.display(),
-                quarantine = %quarantine.display(),
                 error = %error,
-                "[startup-heal] failed to quarantine {context}"
+                "[startup-heal] failed to inspect {context}; preserving it"
             );
-            None
+            return None;
+        }
+    };
+    quarantine_startup_artifact_with_witness(
+        path,
+        fallback_name,
+        context,
+        &file,
+        Some(absent_counterpart),
+    )
+}
+
+/// Bind cleanup to an opened regular file, not a pathname that another owner
+/// may have replaced while we inspected its metadata or waited for its lock.
+fn startup_artifact_matches_file(path: &Path, file: &fs::File) -> std::io::Result<bool> {
+    if path_existing_prefix_has_symlink(path)? || !file.metadata()?.file_type().is_file() {
+        return Ok(false);
+    }
+    let observed = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let expected = file.metadata()?;
+        Ok(expected.dev() == observed.dev() && expected.ino() == observed.ino())
+    }
+    #[cfg(windows)]
+    {
+        let _ = observed;
+        let current = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
+        Ok(mcp_agent_mail_core::disk::windows_file_identity(file)?
+            == mcp_agent_mail_core::disk::windows_file_identity(&current)?)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = observed;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "startup quarantine requires a stable file identity",
+        ))
+    }
+}
+
+fn move_startup_artifact_noreplace(
+    path: &Path,
+    quarantine: &Path,
+    file: &fs::File,
+) -> std::io::Result<bool> {
+    move_startup_artifact_noreplace_with_parent_sync(
+        path,
+        quarantine,
+        file,
+        sync_startup_artifact_move_parents,
+    )
+}
+
+fn sync_startup_artifact_move_parents(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        fn parent(path: &Path) -> &Path {
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+        }
+        let source_parent = parent(source);
+        let destination_parent = parent(destination);
+        fs::File::open(destination_parent)?.sync_all()?;
+        if destination_parent != source_parent {
+            fs::File::open(source_parent)?.sync_all()?;
         }
     }
+    // The Windows no-replace primitive uses MOVEFILE_WRITE_THROUGH. Portable
+    // File::open cannot open Windows directories; match recovery's Unix-only
+    // additional parent-directory durability barrier.
+    #[cfg(not(unix))]
+    let _ = (source, destination);
+    Ok(())
+}
+
+fn move_startup_artifact_noreplace_with_parent_sync(
+    path: &Path,
+    quarantine: &Path,
+    file: &fs::File,
+    sync_parents: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    if !startup_artifact_matches_file(path, file)? {
+        return Ok(false);
+    }
+    mcp_agent_mail_db::pool::rename_noreplace_preserving_source(path, quarantine)?;
+    // A replacement that wins after the pre-move check is not our evidence.
+    // Restore it without overwriting a subsequently installed source path.
+    if !matches!(startup_artifact_matches_file(quarantine, file), Ok(true)) {
+        let mut detail = match mcp_agent_mail_db::pool::rename_noreplace_preserving_source(
+            quarantine, path,
+        ) {
+            Ok(()) => "startup artifact changed during quarantine; restored raced file".to_string(),
+            Err(error) => format!(
+                "startup artifact changed during quarantine; retained {} because restoring {} without replacement failed: {error}",
+                quarantine.display(),
+                path.display(),
+            ),
+        };
+        // Sync the final namespace even when restoration failed and the raced
+        // artifact must remain at the quarantine name for recovery.
+        if let Err(error) = sync_parents(path, quarantine) {
+            detail.push_str(&format!(
+                "; failed to sync affected parent directories: {error}"
+            ));
+        }
+        return Err(std::io::Error::other(detail));
+    }
+    sync_parents(path, quarantine).map_err(|error| {
+        // The move already happened. Do not let a NotFound or AlreadyExists
+        // sync error look like a harmless pre-publication race to the caller.
+        std::io::Error::other(format!(
+            "startup artifact remains at {} after moving from {}, but parent directory sync failed: {error}",
+            quarantine.display(),
+            path.display(),
+        ))
+    })?;
+    Ok(true)
+}
+
+fn quarantine_startup_artifact_with_witness(
+    path: &Path,
+    fallback_name: &str,
+    context: &str,
+    file: &fs::File,
+    absent_counterpart: Option<&Path>,
+) -> Option<PathBuf> {
+    for _ in 0..1024 {
+        // A new lock owner may have installed its metadata after the old lock
+        // moved. Do not quarantine that owner's sidecar as an orphan.
+        if absent_counterpart.is_some_and(path_is_occupied) {
+            return None;
+        }
+        let quarantine = next_startup_quarantine_path(path, fallback_name);
+        match move_startup_artifact_noreplace(path, &quarantine, file) {
+            Ok(true) => return Some(quarantine),
+            Ok(false) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    quarantine = %quarantine.display(),
+                    error = %error,
+                    "[startup-heal] failed to quarantine {context}; preserving evidence"
+                );
+                return None;
+            }
+        }
+    }
+    tracing::warn!(path = %path.display(), "[startup-heal] no unoccupied quarantine destination for {context}");
+    None
 }
 
 static FILE_LOCK_GENERATIONS: LazyLock<Mutex<HashMap<PathBuf, Arc<AtomicU64>>>> =
@@ -4551,6 +5545,9 @@ impl FileLock {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e.into()),
         };
+        if file_meta.file_type() != path_meta.file_type() {
+            return Ok(false);
+        }
 
         #[cfg(unix)]
         {
@@ -4581,10 +5578,11 @@ impl FileLock {
             return Ok(false);
         }
 
-        let file = match fs::OpenOptions::new().write(true).open(&self.path) {
-            Ok(f) => f,
-            Err(_) => return Ok(false),
-        };
+        let file =
+            match mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(&self.path) {
+                Ok(f) => f,
+                Err(_) => return Ok(false),
+            };
         if file.try_lock_exclusive().is_err() {
             return Ok(false);
         }
@@ -4633,25 +5631,29 @@ impl FileLock {
             return Ok(false);
         }
 
-        // Try quarantining while lock is held (best race safety).
-        let quarantine = next_startup_quarantine_path(&self.path, "archive-lock-artifact");
-        let quarantined = match fs::rename(&self.path, &quarantine) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                // Windows can require closing/unlocking first before renaming.
-                let _ = file.unlock();
-                drop(file);
-                fs::rename(&self.path, &quarantine).is_ok()
-            }
-            Err(_) => false,
-        };
+        let metadata_file =
+            mcp_agent_mail_core::disk::open_regular_file_no_follow(&self.metadata_path).ok();
+        // Retain the exclusive lock through publication. An unlock-and-retry
+        // fallback would let a live owner acquire the inode before we move it.
+        let quarantined = quarantine_startup_artifact_with_witness(
+            &self.path,
+            "archive-lock-artifact",
+            "stale archive lock",
+            &file,
+            None,
+        )
+        .is_some();
 
         if quarantined {
-            let _ = quarantine_startup_artifact_if_exists(
-                &self.metadata_path,
-                "archive-lock-artifact",
-                "stale lock owner metadata",
-            );
+            if let Some(metadata_file) = metadata_file {
+                let _ = quarantine_startup_artifact_with_witness(
+                    &self.metadata_path,
+                    "archive-lock-artifact",
+                    "stale lock owner metadata",
+                    &metadata_file,
+                    Some(&self.path),
+                );
+            }
             return Ok(true);
         }
 
@@ -5308,7 +6310,9 @@ const MIN_COALESCER_FLUSH_INTERVAL: Duration = Duration::from_millis(MIN_COALESC
 const DEFAULT_COALESCER_ADAPTIVE_FLUSH_ENABLED: bool = false;
 const DEFAULT_COALESCER_TARGET_ARCHIVE_LAG_MS: u64 = DEFAULT_ARCHIVE_BATCH_MS;
 
-const COMMIT_COALESCER_SOFT_CAP: u64 = 8_192;
+/// Configured outstanding-request bound, available before lazy worker startup
+/// so health reporting can remain observational.
+pub const COMMIT_COALESCER_SOFT_CAP: u64 = 8_192;
 
 const COALESCER_SPILL_PATH_CAP: usize = 4_096;
 const COALESCER_SPILL_MESSAGE_CAP: usize = 32;
@@ -5537,6 +6541,34 @@ fn coalescer_worker_count() -> usize {
         .clamp(2, max_workers)
 }
 
+struct CoalescerStartup {
+    handles: Vec<std::thread::JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+    work_cv: Arc<(Mutex<u64>, std::sync::Condvar)>,
+    committed: bool,
+}
+
+impl Drop for CoalescerStartup {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        {
+            let (lock, wake) = &*self.work_cv;
+            let _guard = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.shutdown.store(true, Ordering::Release);
+            wake.notify_all();
+        }
+        for handle in self.handles.drain(..) {
+            if handle.join().is_err() {
+                tracing::warn!("coalescer startup worker panicked during rollback");
+            }
+        }
+    }
+}
+
 impl CommitCoalescer {
     /// Create a new coalescer and spawn the worker pool.
     pub fn new(flush_interval: Duration) -> Self {
@@ -5551,6 +6583,12 @@ impl CommitCoalescer {
         let force_flush = Arc::new(AtomicBool::new(false));
 
         let worker_count = coalescer_worker_count();
+        let mut startup = CoalescerStartup {
+            handles: Vec::with_capacity(worker_count),
+            shutdown: Arc::clone(&shutdown),
+            work_cv: Arc::clone(&work_cv),
+            committed: false,
+        };
 
         for worker_idx in 0..worker_count {
             let w_repos = Arc::clone(&repos);
@@ -5561,9 +6599,9 @@ impl CommitCoalescer {
             let w_sizes = Arc::clone(&batch_sizes);
             let w_pending = Arc::clone(&pending_requests);
 
-            std::thread::Builder::new()
+            let handle = std::thread::Builder::new()
                 .name(format!("commit-coalescer-{worker_idx}"))
-                .stack_size(mcp_agent_mail_core::worker_stack_size())
+                .stack_size(storage_worker_stack_size())
                 .spawn(move || {
                     // I5 (br-bvq1x.9.5): mark this worker alive for its whole
                     // lifetime. The guard's Drop decrements even on panic unwind,
@@ -5582,8 +6620,15 @@ impl CommitCoalescer {
                     );
                 })
                 .unwrap_or_else(|error| {
-                    panic!("failed to spawn commit-coalescer-{worker_idx} thread: {error}")
+                    panic!("failed to spawn commit-coalescer-{worker_idx} thread: {error}") // ubs:ignore -- constructor refuses an unavailable pool; startup rollback joins all earlier workers before unwinding completes.
                 });
+            startup.handles.push(handle);
+            #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+            COALESCER_AFTER_SPAWN_TEST_HOOK.with(|slot| {
+                if let Some(hook) = slot.borrow_mut().as_mut() {
+                    hook(worker_idx);
+                }
+            });
         }
 
         // I5: record how many workers should stay alive so health can detect
@@ -5595,7 +6640,7 @@ impl CommitCoalescer {
             .commit_soft_cap
             .set(COMMIT_COALESCER_SOFT_CAP);
 
-        Self {
+        let coalescer = Self {
             repos,
             work_cv,
             shutdown,
@@ -5604,7 +6649,9 @@ impl CommitCoalescer {
             pending_requests,
             _batch_sizes: batch_sizes,
             worker_count,
-        }
+        };
+        startup.committed = true;
+        coalescer
     }
 
     /// Get or create a per-repo queue for the given `repo_root`.
@@ -5852,50 +6899,68 @@ impl CommitCoalescer {
     }
 
     fn lag_state(&self) -> CoalescerLagState {
+        self.sample_lag_state(ArchiveLagLockPolicy::Wait)
+            .unwrap_or_else(|(_, lower_bound)| lower_bound)
+    }
+
+    fn sample_lag_state(
+        &self,
+        policy: ArchiveLagLockPolicy,
+    ) -> std::result::Result<CoalescerLagState, (&'static str, CoalescerLagState)> {
         let now = Instant::now();
-        let repos = self
-            .repos
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut lag = CoalescerLagState::default();
+        let repos = archive_lag_lock(&self.repos, policy, "commit_coalescer.repos")
+            .map_err(|site| (site, lag))?;
+        let mut unavailable_lock = None;
         for rq in repos.values() {
-            // Keep all three ownership locations locked together. In
-            // particular, a failed commit can move from in-flight back into
-            // the queue while this snapshot is being sampled.
-            let queue = rq
-                .queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let spill = rq
-                .spill
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut oldest = queue.iter().map(|request| request.enqueued_at).min();
-            if let Some(repo) = spill.inner.as_ref() {
-                oldest = Some(oldest.map_or(repo.earliest_enqueued_at, |o| {
-                    o.min(repo.earliest_enqueued_at)
-                }));
-            }
-            let progress = rq
-                .progress
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(inflight) = progress.inflight_oldest {
-                oldest = Some(oldest.map_or(inflight, |current| current.min(inflight)));
-            }
-            if let Some(oldest) = oldest {
-                lag.oldest_age_us = lag.oldest_age_us.max(duration_as_micros_u64(
-                    now.saturating_duration_since(oldest),
-                ));
-                let last_progress = progress
-                    .last_completed
-                    .map_or(oldest, |completed| completed.max(oldest));
-                lag.since_progress_us = lag.since_progress_us.max(duration_as_micros_u64(
-                    now.saturating_duration_since(last_progress),
-                ));
+            let sampled = (|| {
+                // Keep all three ownership locations locked together. In
+                // particular, a failed commit can move from in-flight back into
+                // the queue while this snapshot is being sampled.
+                let queue = archive_lag_lock(&rq.queue, policy, "commit_coalescer.queue")?;
+                let mut oldest = queue.iter().map(|request| request.enqueued_at).min();
+                if let Some(oldest) = oldest {
+                    lag.oldest_age_us = lag.oldest_age_us.max(duration_as_micros_u64(
+                        now.saturating_duration_since(oldest),
+                    ));
+                }
+                let spill = archive_lag_lock(&rq.spill, policy, "commit_coalescer.spill")?;
+                if let Some(repo) = spill.inner.as_ref() {
+                    oldest = Some(oldest.map_or(repo.earliest_enqueued_at, |o| {
+                        o.min(repo.earliest_enqueued_at)
+                    }));
+                }
+                // Queued work is already confirmed pending while these
+                // guards are held. Preserve its age if progress is unavailable.
+                if let Some(oldest) = oldest {
+                    lag.oldest_age_us = lag.oldest_age_us.max(duration_as_micros_u64(
+                        now.saturating_duration_since(oldest),
+                    ));
+                }
+                let progress = archive_lag_lock(&rq.progress, policy, "commit_coalescer.progress")?;
+                if let Some(inflight) = progress.inflight_oldest {
+                    oldest = Some(oldest.map_or(inflight, |current| current.min(inflight)));
+                }
+                if let Some(oldest) = oldest {
+                    lag.oldest_age_us = lag.oldest_age_us.max(duration_as_micros_u64(
+                        now.saturating_duration_since(oldest),
+                    ));
+                    let last_progress = progress
+                        .last_completed
+                        .map_or(oldest, |completed| completed.max(oldest));
+                    lag.since_progress_us = lag.since_progress_us.max(duration_as_micros_u64(
+                        now.saturating_duration_since(last_progress),
+                    ));
+                }
+                Ok(())
+            })();
+            // Each repository has independent ownership locations. A busy
+            // one must not hide another repository's confirmed stalled work.
+            if let Err(site) = sampled {
+                unavailable_lock = unavailable_lock.or(Some(site));
             }
         }
-        lag
+        unavailable_lock.map_or(Ok(lag), |site| Err((site, lag)))
     }
 
     /// Get coalescer statistics (aggregate across all repos).
@@ -6242,17 +7307,39 @@ fn coalescer_pool_worker(
                 continue;
             }
 
-            // Successfully claimed repo.
-            let had_failure = self_process_repo(
-                &repo_root,
-                &rq,
-                &stats,
-                &batch_sizes,
-                &pending_requests,
-                worker_count,
-                &repos,
-                &work_cv,
-            );
+            // Keep the fixed worker pool alive after a repository-local panic.
+            // self_process_repo's guards restore unfinished queue/spill work
+            // and install retry backoff before releasing the repository claim.
+            let had_failure = std::panic::catch_unwind(|| {
+                self_process_repo(
+                    &repo_root,
+                    &rq,
+                    &stats,
+                    &batch_sizes,
+                    &pending_requests,
+                    worker_count,
+                    &repos,
+                    &work_cv,
+                )
+            })
+            .unwrap_or_else(|_| {
+                rq.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                mcp_agent_mail_core::global_metrics()
+                    .storage
+                    .commit_errors_total
+                    .inc();
+                {
+                    let mut stats = stats
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    stats.errors = stats.errors.saturating_add(1);
+                }
+                tracing::error!(
+                    repo = %repo_root.display(),
+                    "[commit-coalescer] commit processing panicked; retaining work for retry"
+                );
+                true
+            });
             if had_failure {
                 heartbeat.finish_failure();
             } else {
@@ -6275,7 +7362,6 @@ fn self_process_repo(
     work_cv: &Arc<(Mutex<u64>, std::sync::Condvar)>,
 ) -> bool {
     let mut had_failure = false;
-    let max_batch_size = configured_coalescer_batch_size();
 
     // RAII guard to ensure processing flag is cleared even on panic
     struct ProcessingGuard<'a> {
@@ -6287,6 +7373,14 @@ fn self_process_repo(
     impl Drop for ProcessingGuard<'_> {
         fn drop(&mut self) {
             // PanicGuard restores uncommitted work before this guard drops.
+            // Back off before publishing the repository as available: another
+            // worker must not immediately retry a repeatedly panicking commit.
+            if std::thread::panicking() {
+                coalescer_note_commit_failure(self.rq);
+            }
+            self.rq
+                .last_serviced_us
+                .store(now_micros_u64(), Ordering::Relaxed);
             // Release the claim before waking peers; otherwise a peer can
             // consume the notification while the repository is unselectable.
             self.rq.set_inflight_oldest(None);
@@ -6308,6 +7402,7 @@ fn self_process_repo(
         work_cv,
         worker_count,
     };
+    let max_batch_size = configured_coalescer_batch_size();
 
     // Phase 3: Drain queue + spill for this repo
     let mut batch: Vec<CoalescerCommitFields> = Vec::new();
@@ -6529,11 +7624,6 @@ fn self_process_repo(
         }
         panic_guard.inflight_spilled = None;
     }
-
-    // ProcessingGuard releases the claim and then wakes peers, including on
-    // panic after PanicGuard has restored unfinished work.
-    rq.last_serviced_us
-        .store(now_micros_u64(), Ordering::Relaxed);
 
     had_failure
 }
@@ -6876,173 +7966,258 @@ fn coalescer_commit_spilled_work(
     }
 }
 
-/// Commit a batch of requests targeting the same repository.
+/// Pure grouping policy, independent of Git, runtime and queue ownership.
+mod coalescer_batch_groups {
+    use std::collections::HashSet;
+    use std::ops::Range;
+
+    /// Keep request order while merging only disjoint paths from one author.
+    /// A conflict ends the current group, not batching for the entire drain.
+    /// Paths are borrowed; grouping never clones or rewrites queued requests.
+    pub(super) fn contiguous_ranges<'a>(
+        requests: impl IntoIterator<Item = (&'a str, &'a str, &'a [String])>,
+        max_batch_size: usize,
+    ) -> Vec<Range<usize>> {
+        let max_batch_size = max_batch_size.max(1);
+        let mut ranges = Vec::new();
+        let mut paths = HashSet::new();
+        let mut author = None;
+        let mut start = 0;
+        let mut end = 0;
+        for (index, (name, email, request_paths)) in requests.into_iter().enumerate() {
+            if index > start
+                && (index - start >= max_batch_size
+                    || author != Some((name, email))
+                    || request_paths
+                        .iter()
+                        .any(|path| paths.contains(path.as_str())))
+            {
+                ranges.push(start..index);
+                paths.clear();
+                start = index;
+            }
+            author = Some((name, email));
+            paths.extend(request_paths.iter().map(String::as_str));
+            end = index + 1;
+        }
+        if start < end {
+            ranges.push(start..end);
+        }
+        ranges
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::contiguous_ranges;
+
+        fn paths(names: &[&str]) -> Vec<String> {
+            names.iter().map(|name| (*name).to_string()).collect()
+        }
+
+        #[test]
+        fn sparse_conflict_keeps_unrelated_requests_batched_in_order() {
+            let mut requests = (0..32)
+                .map(|index| vec![format!("projects/p{}/message-{index}.md", index % 3)])
+                .collect::<Vec<_>>();
+            requests[0].push("projects/p0/threads/shared.md".to_string());
+            requests[16].push("projects/p0/threads/shared.md".to_string());
+
+            assert_eq!(
+                contiguous_ranges(
+                    requests
+                        .iter()
+                        .map(|paths| ("Test", "test@example.com", paths.as_slice())),
+                    32,
+                ),
+                vec![0..16, 16..32],
+            );
+        }
+
+        #[test]
+        fn repeated_mutable_path_keeps_every_commit_boundary() {
+            let shared = paths(&["threads/shared.md"]);
+            assert_eq!(
+                contiguous_ranges(
+                    (0..32).map(|_| ("Test", "test@example.com", shared.as_slice())),
+                    32
+                ),
+                (0..32).map(|index| index..index + 1).collect::<Vec<_>>(),
+            );
+        }
+
+        #[test]
+        fn size_bound_splits_disjoint_requests_without_reordering() {
+            let requests = (0..7)
+                .map(|index| vec![format!("{index}.md")])
+                .collect::<Vec<_>>();
+            assert_eq!(
+                contiguous_ranges(
+                    requests
+                        .iter()
+                        .map(|paths| ("Test", "test@example.com", paths.as_slice())),
+                    3,
+                ),
+                vec![0..3, 3..6, 6..7],
+            );
+            assert_eq!(
+                contiguous_ranges(
+                    requests
+                        .iter()
+                        .map(|paths| ("Test", "test@example.com", paths.as_slice())),
+                    0,
+                ),
+                (0..7).map(|index| index..index + 1).collect::<Vec<_>>(),
+            );
+        }
+
+        #[test]
+        fn author_name_and_email_changes_each_end_a_group() {
+            let a = paths(&["a.md"]);
+            let b = paths(&["b.md"]);
+            let c = paths(&["c.md"]);
+            let d = paths(&["d.md"]);
+            assert_eq!(
+                contiguous_ranges(
+                    [
+                        ("First", "same@example.com", a.as_slice()),
+                        ("Second", "same@example.com", b.as_slice()),
+                        ("Second", "other@example.com", c.as_slice()),
+                        ("Second", "other@example.com", d.as_slice()),
+                    ],
+                    32,
+                ),
+                vec![0..1, 1..2, 2..4],
+            );
+        }
+
+        #[test]
+        fn duplicate_paths_within_one_request_do_not_block_disjoint_neighbors() {
+            let a = paths(&["a.md", "a.md"]);
+            let b = paths(&["b.md"]);
+            let c = paths(&["a.md"]);
+            assert_eq!(
+                contiguous_ranges(
+                    [&a, &b, &c].map(|paths| ("Test", "test@example.com", paths.as_slice())),
+                    32,
+                ),
+                vec![0..2, 2..3],
+            );
+        }
+
+        #[test]
+        fn empty_input_has_no_commit_group() {
+            assert!(contiguous_ranges(std::iter::empty(), 32).is_empty());
+        }
+    }
+}
+
+/// Commit one nonempty, same-author group whose requests have disjoint paths.
+fn coalescer_commit_group(repo_root: &Path, requests: &[CoalescerCommitFields]) -> Result<()> {
+    let first = &requests[0];
+    let config = Config {
+        git_author_name: first.git_author_name.clone(),
+        git_author_email: first.git_author_email.clone(),
+        ..Config::default()
+    };
+    if requests.len() == 1 {
+        return coalescer_commit_with_retry(repo_root, &config, &first.message, &first.rel_paths);
+    }
+
+    let merged_paths = requests
+        .iter()
+        .flat_map(|request| request.rel_paths.iter().cloned())
+        .collect::<Vec<_>>();
+    let mut combined_msg = coalescer_batch_commit_message(requests);
+    combined_msg.push_str("\n\n");
+    for (index, request) in requests.iter().enumerate() {
+        if index > 0 {
+            combined_msg.push('\n');
+        }
+        combined_msg.push_str("- ");
+        combined_msg.push_str(request.message.lines().next().unwrap_or(""));
+    }
+    coalescer_commit_with_retry(repo_root, &config, &combined_msg, &merged_paths)
+}
+
+/// Commit a repository batch as ordered, bounded, conflict-free groups.
 ///
-/// Merges non-conflicting paths into a single commit. Falls back to
-/// sequential commits if paths conflict (same file modified by multiple requests).
+/// Conflicting paths retain separate commit boundaries. A repeated thread
+/// digest must not force unrelated projects' requests into individual commits,
+/// each of which holds the publication fence during blob/tree/ref writes.
 fn coalescer_commit_batch(
     repo_root: &Path,
     requests: &[CoalescerCommitFields],
     stats: &Arc<Mutex<CommitQueueStats>>,
     batch_sizes: &Arc<Mutex<VecDeque<usize>>>,
 ) -> CoalescerCommitOutcome {
-    if requests.is_empty() {
-        return CoalescerCommitOutcome {
-            committed_requests: 0,
-            committed_commits: 0,
-            failed_requests: Vec::new(),
-        };
-    }
-
-    // Use the first request's author info
-    let author_name = &requests[0].git_author_name;
-    let author_email = &requests[0].git_author_email;
-    let config = Config {
-        git_author_name: author_name.clone(),
-        git_author_email: author_email.clone(),
-        ..Config::default()
-    };
-
-    // Check for path conflicts
-    let mut all_paths = HashSet::new();
-    let mut can_merge = true;
-    for req in requests {
-        for p in &req.rel_paths {
-            if !all_paths.insert(p.clone()) {
-                can_merge = false;
-                break;
+    let groups = coalescer_batch_groups::contiguous_ranges(
+        requests.iter().map(|request| {
+            (
+                request.git_author_name.as_str(),
+                request.git_author_email.as_str(),
+                request.rel_paths.as_slice(),
+            )
+        }),
+        configured_coalescer_batch_size(),
+    );
+    let mut committed_requests = 0;
+    let mut successful_sizes = Vec::with_capacity(groups.len());
+    let mut failed_commits = 0;
+    let mut failed_requests = Vec::new();
+    for range in groups {
+        let group = &requests[range];
+        match coalescer_commit_group(repo_root, group) {
+            Ok(()) => {
+                committed_requests += group.len();
+                successful_sizes.push(group.len());
             }
-        }
-        if !can_merge {
-            break;
-        }
-    }
-
-    // Keep batch commits bounded to avoid enormous commits under load.
-    let commit_result = if requests.len() == 1 {
-        // Single request - commit directly.
-        coalescer_commit_with_retry(
-            repo_root,
-            &config,
-            &requests[0].message,
-            &requests[0].rel_paths,
-        )
-        .map(|()| (1, 1))
-    } else if can_merge && requests.len() <= configured_coalescer_batch_size() {
-        // Merge all into a single commit
-        let merged_paths: Vec<String> = requests
-            .iter()
-            .flat_map(|r| r.rel_paths.iter().cloned())
-            .collect();
-
-        let summary_lines: Vec<String> = requests
-            .iter()
-            .map(|r| {
-                let first = r.message.lines().next().unwrap_or("");
-                format!("- {first}")
-            })
-            .collect();
-
-        let mut combined_msg = coalescer_batch_commit_message(requests);
-        if !summary_lines.is_empty() {
-            combined_msg.push_str("\n\n");
-            combined_msg.push_str(&summary_lines.join("\n"));
-        }
-
-        coalescer_commit_with_retry(repo_root, &config, &combined_msg, &merged_paths)
-            .map(|()| (1, requests.len()))
-    } else {
-        // Path conflicts — commit sequentially
-        let mut total = 0;
-        let mut failed_requests = Vec::new();
-        for req in requests {
-            let r_config = Config {
-                git_author_name: req.git_author_name.clone(),
-                git_author_email: req.git_author_email.clone(),
-                ..Config::default()
-            };
-            match coalescer_commit_with_retry(repo_root, &r_config, &req.message, &req.rel_paths) {
-                Ok(()) => total += 1,
-                Err(e) => {
-                    tracing::warn!(
-                        "[commit-coalescer] sequential request commit failed: paths={} err={e}",
-                        req.rel_paths.len()
-                    );
-                    failed_requests.push(req.clone());
-                }
-            }
-        }
-        if failed_requests.is_empty() {
-            Ok((total, total))
-        } else {
-            let committed = requests.len().saturating_sub(failed_requests.len());
-            tracing::warn!(
-                "[commit-coalescer] partial failure in sequential batch: committed={committed} failed={} total={}",
-                failed_requests.len(),
-                requests.len()
-            );
-            mcp_agent_mail_core::global_metrics()
-                .storage
-                .commit_errors_total
-                .add(u64::try_from(failed_requests.len()).unwrap_or(u64::MAX));
-            let mut s = stats
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.commits += total;
-            s.batched += total;
-            s.errors += failed_requests.len();
-
-            let mut sizes = batch_sizes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            record_batch_size_samples(&mut s, &mut sizes, 1, total);
-
-            return CoalescerCommitOutcome {
-                committed_requests: u64::try_from(committed).unwrap_or(u64::MAX),
-                committed_commits: u64::try_from(committed).unwrap_or(u64::MAX),
-                failed_requests,
-            };
-        }
-    };
-
-    // Update stats
-    match commit_result {
-        Ok((num_commits, batched_items)) => {
-            let mut s = stats
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.commits += num_commits;
-            s.batched += batched_items;
-
-            let mut sizes = batch_sizes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(mean_batch_size) = batched_items.checked_div(num_commits) {
-                record_batch_size_samples(&mut s, &mut sizes, mean_batch_size, num_commits);
-            }
-            CoalescerCommitOutcome {
-                committed_requests: u64::try_from(batched_items).unwrap_or(u64::MAX),
-                committed_commits: u64::try_from(num_commits).unwrap_or(u64::MAX),
-                failed_requests: Vec::new(),
-            }
-        }
-        Err(e) => {
-            tracing::warn!("[commit-coalescer] batch commit error: {e}");
-            mcp_agent_mail_core::global_metrics()
-                .storage
-                .commit_errors_total
-                .inc();
-            let mut s = stats
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.errors += 1;
-            CoalescerCommitOutcome {
-                committed_requests: 0,
-                committed_commits: 0,
-                failed_requests: requests.to_vec(),
+            Err(error) => {
+                tracing::warn!(
+                    requests = group.len(),
+                    error = %error,
+                    "[commit-coalescer] commit group failed; retaining requests for retry"
+                );
+                failed_commits += 1;
+                // Keep original enqueue instants and order. The worker owns
+                // requeueing and progress accounting, exactly as before.
+                failed_requests.extend_from_slice(group);
             }
         }
     }
+    if !requests.is_empty() {
+        mcp_agent_mail_core::global_metrics()
+            .storage
+            .commit_errors_total
+            .add(u64::try_from(failed_commits).unwrap_or(u64::MAX));
+        let mut stats = stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stats.commits += successful_sizes.len();
+        stats.batched += committed_requests;
+        stats.errors += failed_commits;
+        let mut sizes = batch_sizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Groups need not have equal sizes: record their actual samples,
+        // rather than an integer mean that loses partial-batch information.
+        for &size in &successful_sizes {
+            record_batch_size_samples(&mut stats, &mut sizes, size, 1);
+        }
+    }
+    CoalescerCommitOutcome {
+        committed_requests: u64::try_from(committed_requests).unwrap_or(u64::MAX),
+        committed_commits: u64::try_from(successful_sizes.len()).unwrap_or(u64::MAX),
+        failed_requests,
+    }
+}
+
+#[cfg(test)]
+type CoalescerBeforeCommitTestHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+std::thread_local! {
+    static COALESCER_BEFORE_COMMIT_TEST_HOOK:
+        std::cell::RefCell<Option<CoalescerBeforeCommitTestHook>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Commit with retry and jittered backoff for index.lock contention.
@@ -7056,6 +8231,12 @@ fn coalescer_commit_with_retry(
     rel_paths: &[String],
 ) -> Result<()> {
     const MAX_RETRIES: usize = 7;
+    #[cfg(test)]
+    COALESCER_BEFORE_COMMIT_TEST_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(repo_root);
+        }
+    });
     let sm = &mcp_agent_mail_core::global_metrics().storage;
     sm.commit_attempts_total.inc();
     sm.commit_batch_size_last.set(rel_paths.len() as u64);
@@ -7835,12 +9016,15 @@ fn quarantine_stale_ref_lock(repo: &Repository, refname: &str) -> bool {
             .join(format!("{}.lock", refname.replace('/', "-"))),
         "stale-ref-lock",
     );
+    let Ok(file) = mcp_agent_mail_core::disk::open_regular_file_no_follow(&lock_path) else {
+        return false;
+    };
     // The decision was made on this exact file; a replaced lock is left alone.
     if git_lock_identity(&lock_path).as_ref() != Some(&identity) {
         return false;
     }
-    match fs::rename(&lock_path, &quarantine) {
-        Ok(()) => {
+    match move_startup_artifact_noreplace(&lock_path, &quarantine, &file) {
+        Ok(true) => {
             tracing::warn!(
                 lock = %lock_path.display(),
                 quarantine = %quarantine.display(),
@@ -7849,6 +9033,7 @@ fn quarantine_stale_ref_lock(repo: &Repository, refname: &str) -> bool {
             );
             true
         }
+        Ok(false) => false,
         Err(error) => {
             tracing::warn!(
                 lock = %lock_path.display(),
@@ -8161,6 +9346,37 @@ pub fn commit_paths_with_retry(
 ///
 /// Should be called at application startup.
 pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
+    heal_archive_locks_with_checkpoint(config, &|| Ok(()))
+}
+
+/// Heal startup lock artifacts until shutdown is requested.
+///
+/// Completed quarantines are preserved, but an interrupted scan is never
+/// reported as a completed scan. The owner must join the caller before
+/// releasing authority.
+pub fn heal_archive_locks_cancellable(
+    config: &Config,
+    cancelled: &AtomicBool,
+) -> Result<HealResult> {
+    heal_archive_locks_with_checkpoint(config, &|| archive_scan_checkpoint(cancelled))
+}
+
+fn archive_scan_checkpoint(cancelled: &AtomicBool) -> std::io::Result<()> {
+    if cancelled.load(Ordering::Acquire) {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "startup archive scan cancelled",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn heal_archive_locks_with_checkpoint(
+    config: &Config,
+    checkpoint: &dyn Fn() -> std::io::Result<()>,
+) -> Result<HealResult> {
+    checkpoint()?;
     let root = archive_storage_root(config);
     if !root.exists() {
         return Ok(HealResult::default());
@@ -8193,9 +9409,14 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         }
     }
 
-    fn maybe_cleanup_lock(path: &Path, result: &mut HealResult) {
+    fn maybe_cleanup_lock(
+        path: &Path,
+        result: &mut HealResult,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        checkpoint()?;
         if path.extension().is_none_or(|e| e != "lock") {
-            return;
+            return Ok(());
         }
         // Never remove Git's existence-based locks via generic flock
         // heuristics. They can be active even when no advisory lock is held.
@@ -8217,41 +9438,41 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
                 .and_then(Path::file_name)
                 .is_some_and(|name| name == std::ffi::OsStr::new("objects"));
         if is_git_index_lock || is_git_maintenance_lock {
-            return;
+            return Ok(());
         }
 
         result.locks_scanned += 1;
 
         // Try to acquire exclusive lock. If successful, it means no one else
         // is holding it, so we can treat it as a stale artifact from a previous run.
-        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+        if let Ok(f) = mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(path) {
             use fs2::FileExt;
             if f.try_lock_exclusive().is_ok() {
-                let quarantine = next_startup_quarantine_path(path, "archive-lock-artifact");
-                let mut quarantined = false;
-                match fs::rename(path, &quarantine) {
-                    Ok(()) => quarantined = true,
-                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                        // Windows can require closing/unlocking first before renaming.
-                        let _ = f.unlock();
-                        drop(f);
-                        quarantined = fs::rename(path, &quarantine).is_ok();
-                    }
-                    Err(_) => {}
-                }
-
-                if quarantined {
+                checkpoint()?;
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let meta_path = path.with_file_name(format!("{name}.owner.json"));
+                let metadata_file =
+                    mcp_agent_mail_core::disk::open_regular_file_no_follow(&meta_path).ok();
+                if let Some(quarantine) = quarantine_startup_artifact_with_witness(
+                    path,
+                    "archive-lock-artifact",
+                    "stale archive lock",
+                    &f,
+                    None,
+                ) {
                     result
                         .locks_quarantined
                         .push(quarantine.display().to_string());
-                    // Try to quarantine corresponding metadata file.
-                    let name = path.file_name().unwrap_or_default().to_string_lossy();
-                    let meta_path = path.with_file_name(format!("{name}.owner.json"));
-                    if let Some(meta_quarantine) = quarantine_startup_artifact_if_exists(
-                        &meta_path,
-                        "archive-lock-artifact",
-                        "archive lock owner metadata",
-                    ) {
+                    checkpoint()?;
+                    if let Some(metadata_file) = metadata_file
+                        && let Some(meta_quarantine) = quarantine_startup_artifact_with_witness(
+                            &meta_path,
+                            "archive-lock-artifact",
+                            "archive lock owner metadata",
+                            &metadata_file,
+                            Some(path),
+                        )
+                    {
                         result
                             .metadata_quarantined
                             .push(meta_quarantine.display().to_string());
@@ -8259,17 +9480,21 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
                 }
             }
         }
+        Ok(())
     }
 
     fn walk_recursive(
         dir: &Path,
         result: &mut HealResult,
         metadata_candidates: &mut Vec<PathBuf>,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
     ) -> std::io::Result<()> {
+        checkpoint()?;
         if path_existing_prefix_has_symlink(dir)? || !path_is_nonsymlink_dir(dir) {
             return Ok(());
         }
         for entry in fs::read_dir(dir)? {
+            checkpoint()?;
             let entry = entry?;
             let Some(file_type) = entry_file_type(&entry)? else {
                 continue;
@@ -8280,9 +9505,9 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
             }
             let path = entry.path();
             if file_type.is_dir() {
-                walk_recursive(&path, result, metadata_candidates)?;
+                walk_recursive(&path, result, metadata_candidates, checkpoint)?;
             } else if file_type.is_file() {
-                maybe_cleanup_lock(&path, result);
+                maybe_cleanup_lock(&path, result, checkpoint)?;
                 maybe_collect_metadata(&path, metadata_candidates);
             }
         }
@@ -8293,11 +9518,14 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         dir: &Path,
         result: &mut HealResult,
         metadata_candidates: &mut Vec<PathBuf>,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
     ) -> std::io::Result<()> {
+        checkpoint()?;
         if path_existing_prefix_has_symlink(dir)? || !path_is_nonsymlink_dir(dir) {
             return Ok(());
         }
         for entry in fs::read_dir(dir)? {
+            checkpoint()?;
             let entry = entry?;
             let Some(file_type) = entry_file_type(&entry)? else {
                 continue;
@@ -8306,13 +9534,17 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
                 continue;
             }
             let path = entry.path();
-            maybe_cleanup_lock(&path, result);
+            maybe_cleanup_lock(&path, result, checkpoint)?;
             maybe_collect_metadata(&path, metadata_candidates);
         }
         Ok(())
     }
 
-    fn gather_lock_scan_dirs(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    fn gather_lock_scan_dirs(
+        root: &Path,
+        checkpoint: &dyn Fn() -> std::io::Result<()>,
+    ) -> std::io::Result<Vec<PathBuf>> {
+        checkpoint()?;
         let mut dirs = Vec::new();
         let mut seen: HashSet<PathBuf> = HashSet::new();
 
@@ -8329,6 +9561,7 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         push_dir(projects_dir.clone());
         if path_is_nonsymlink_dir(&projects_dir) {
             for entry in fs::read_dir(&projects_dir)? {
+                checkpoint()?;
                 let entry = entry?;
                 let Some(file_type) = entry_file_type(&entry)? else {
                     continue;
@@ -8343,15 +9576,16 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
     }
 
     if should_force_deep_scan() {
-        walk_recursive(&root, &mut result, &mut metadata_candidates)?;
+        walk_recursive(&root, &mut result, &mut metadata_candidates, checkpoint)?;
     } else {
-        for dir in gather_lock_scan_dirs(&root)? {
-            scan_dir_shallow(&dir, &mut result, &mut metadata_candidates)?;
+        for dir in gather_lock_scan_dirs(&root, checkpoint)? {
+            scan_dir_shallow(&dir, &mut result, &mut metadata_candidates, checkpoint)?;
         }
     }
 
     // Quarantine orphaned metadata files (no matching lock) without re-walking.
     for path in metadata_candidates {
+        checkpoint()?;
         if !path_is_occupied(&path) {
             continue;
         }
@@ -8363,11 +9597,13 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
             continue;
         };
         let lock_candidate = parent.join(lock_name);
+        checkpoint()?;
         if !path_is_occupied(&lock_candidate)
             && let Some(quarantine) = quarantine_startup_artifact_if_exists(
                 &path,
                 "archive-lock-artifact",
                 "orphan archive lock owner metadata",
+                &lock_candidate,
             )
         {
             result
@@ -8376,6 +9612,7 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         }
     }
 
+    checkpoint()?;
     Ok(result)
 }
 
@@ -8967,7 +10204,194 @@ pub fn write_agent_profile(archive: &ProjectArchive, agent: &serde_json::Value) 
     write_agent_profile_with_config(archive, &Config::get(), agent)
 }
 
+const MAX_AGENT_PROFILE_PUBLICATION_BYTES: u64 = 1024 * 1024;
+
+fn agent_profile_publication_conflict(message: &str) -> StorageError {
+    StorageError::InvalidPath(format!(
+        "agent profile publication refused: {message}; existing evidence retained"
+    ))
+}
+
+fn agent_profile_publication_inception(profile: &serde_json::Value) -> Result<Option<i64>> {
+    let mut inception = None;
+    for field in ["inception_ts", "registered_ts"] {
+        if let Some(value) = profile.get(field).filter(|value| !value.is_null()) {
+            let timestamp = archive_publication_timestamp(value).ok_or_else(|| {
+                agent_profile_publication_conflict("invalid agent inception timestamp")
+            })?;
+            if inception.is_some_and(|prior| prior != timestamp) {
+                return Err(agent_profile_publication_conflict(
+                    "agent inception timestamps disagree",
+                ));
+            }
+            inception = Some(timestamp);
+        }
+    }
+    Ok(inception)
+}
+
+fn agent_profile_publication_deregistration(profile: &serde_json::Value) -> Result<Option<i64>> {
+    if let Some(value) = profile
+        .get("deregistered_at")
+        .filter(|value| !value.is_null())
+    {
+        return archive_publication_timestamp(value)
+            .map(Some)
+            .ok_or_else(|| {
+                agent_profile_publication_conflict("invalid permanent deregistration timestamp")
+            });
+    }
+    // Reconstruction also recognizes this legacy permanent tombstone. A
+    // missing or null newer field must not turn its identity active again.
+    let legacy = profile
+        .get("task_description")
+        .and_then(serde_json::Value::as_str)
+        .filter(|description| {
+            mcp_agent_mail_db::models::task_description_uses_reserved_deregistered_prefix(
+                description,
+            )
+        })
+        .filter(|_| {
+            profile
+                .get("contact_policy")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|policy| policy.eq_ignore_ascii_case("block_all"))
+        });
+    legacy
+        .map(|description| {
+            mcp_agent_mail_db::models::deregistered_task_timestamp_micros(description).ok_or_else(
+                || {
+                    agent_profile_publication_conflict(
+                        "unverifiable legacy deregistration tombstone",
+                    )
+                },
+            )
+        })
+        .transpose()
+}
+
+/// Merge only evidence for the same identity. Ordinary queued writes carry a
+/// captured profile, not a lifecycle revision: archive lock order cannot prove
+/// they are newer than a surviving permanent tombstone. Refuse that conflict
+/// rather than silently making stale input appear authoritative. Retirement
+/// remains reversible; only deregistration is monotonic.
+fn merge_agent_profile_publication(
+    incoming: &serde_json::Value,
+    committed: Option<&serde_json::Value>,
+    working: Option<&serde_json::Value>,
+) -> Result<Vec<u8>> {
+    let fields = incoming.as_object().ok_or_else(|| {
+        agent_profile_publication_conflict("incoming profile must be a JSON object")
+    })?;
+    let name = incoming
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| agent_profile_publication_conflict("incoming profile lacks agent name"))?;
+    if incoming
+        .get("agent_name")
+        .filter(|value| !value.is_null())
+        .is_some_and(|value| value.as_str() != Some(name))
+    {
+        return Err(agent_profile_publication_conflict(
+            "incoming agent name aliases conflict",
+        ));
+    }
+    if fields.contains_key("registration_token") {
+        return Err(agent_profile_publication_conflict(
+            "registration credentials must not be archived",
+        ));
+    }
+    let inception = agent_profile_publication_inception(incoming)?;
+    let deregistered_at = agent_profile_publication_deregistration(incoming)?;
+    let mut merged = serde_json::Map::new();
+    for published in [committed, working].into_iter().flatten() {
+        let published_fields = published.as_object().ok_or_else(|| {
+            agent_profile_publication_conflict("archived profile must be a JSON object")
+        })?;
+        // Older archive profiles use agent_name. Every supplied identity
+        // spelling must agree before their extensions or lifecycle are merged.
+        let published_name = published
+            .get("name")
+            .filter(|value| !value.is_null())
+            .or_else(|| published.get("agent_name"));
+        if published_name.and_then(serde_json::Value::as_str) != Some(name)
+            || published
+                .get("agent_name")
+                .filter(|value| !value.is_null())
+                .is_some_and(|value| value.as_str() != Some(name))
+        {
+            return Err(agent_profile_publication_conflict(
+                "archived agent name conflicts with the incoming identity",
+            ));
+        }
+        let published_inception = agent_profile_publication_inception(published)?;
+        if published_inception.is_some() && published_inception != inception {
+            return Err(agent_profile_publication_conflict(
+                "archived agent inception conflicts with the incoming identity",
+            ));
+        }
+        let published_deregistration = agent_profile_publication_deregistration(published)?;
+        if published_deregistration.is_some() && published_deregistration != deregistered_at {
+            return Err(agent_profile_publication_conflict(
+                "permanent deregistration conflicts with the incoming profile",
+            ));
+        }
+        merged.extend(published_fields.clone());
+    }
+    // Working extensions supersede committed extensions; explicit incoming
+    // fields supersede both. Credentials are never carried into a new commit.
+    merged.extend(fields.clone());
+    merged.remove("registration_token");
+    let bytes = serde_json::to_vec_pretty(&merged)?;
+    if bytes.len() as u64 > MAX_AGENT_PROFILE_PUBLICATION_BYTES {
+        return Err(agent_profile_publication_conflict(
+            "merged profile exceeds the artifact byte bound",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn committed_agent_profile_publication(
+    repo_root: &Path,
+    relative: &str,
+) -> Result<Option<serde_json::Value>> {
+    let repo = Repository::open(repo_root)?;
+    let tree = match repo.head() {
+        Ok(head) => head.peel_to_tree()?,
+        Err(error) if matches!(error.code(), ErrorCode::UnbornBranch | ErrorCode::NotFound) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let entry = match tree.get_path(Path::new(relative)) {
+        Ok(entry) => entry,
+        Err(error) if error.code() == ErrorCode::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if entry.kind() != Some(git2::ObjectType::Blob)
+        || !matches!(entry.filemode(), 0o100644 | 0o100755)
+    {
+        return Err(agent_profile_publication_conflict(
+            "committed profile is not a regular file",
+        ));
+    }
+    let (size, kind) = repo.odb()?.read_header(entry.id())?;
+    if kind != git2::ObjectType::Blob || size as u64 > MAX_AGENT_PROFILE_PUBLICATION_BYTES {
+        return Err(agent_profile_publication_conflict(
+            "committed profile exceeds the artifact byte bound",
+        ));
+    }
+    let blob = repo.find_blob(entry.id())?;
+    serde_json::from_slice(blob.content())
+        .map(Some)
+        .map_err(StorageError::from)
+}
+
 /// Write an agent's profile.json using explicit config for author info.
+///
+/// Permanent lifecycle evidence in both the working file and Git HEAD is
+/// checked under the publication/project locks before replacement. A stale
+/// active write cannot erase a tombstone even when the working file is lost.
 pub fn write_agent_profile_with_config(
     archive: &ProjectArchive,
     config: &Config,
@@ -8976,7 +10400,7 @@ pub fn write_agent_profile_with_config(
     let name = agent
         .get("name")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
+        .ok_or_else(|| agent_profile_publication_conflict("incoming profile lacks agent name"))?;
     let name = validate_archive_component("agent name", name)?;
 
     let repo_root = archive_repo_root_checked(archive)?;
@@ -8987,11 +10411,26 @@ pub fn write_agent_profile_with_config(
     let rel = with_project_lock_inner(archive, true, false, || {
         let project_root = archive_project_root_checked(archive)?;
         let profile_dir = project_root.join("agents").join(name);
-        ensure_dir(&profile_dir)?;
-
         let profile_path = profile_dir.join("profile.json");
-        write_json(&profile_path, agent, true)?;
-        rel_path_cached(&archive.canonical_repo_root, &profile_path)
+        if path_existing_prefix_has_symlink(&profile_path)? {
+            return Err(agent_profile_publication_conflict(
+                "profile path contains a symlink",
+            ));
+        }
+        let relative = rel_path_cached(&archive.canonical_repo_root, &profile_path)?;
+        let committed = committed_agent_profile_publication(repo_root, &relative)?;
+        let working = match mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+            &profile_path,
+            MAX_AGENT_PROFILE_PUBLICATION_BYTES,
+        ) {
+            Ok(bytes) => Some(serde_json::from_slice(&bytes)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let bytes = merge_agent_profile_publication(agent, committed.as_ref(), working.as_ref())?;
+        ensure_dir(&profile_dir)?;
+        atomic_write_bytes(&profile_path, &bytes, true)?;
+        Ok(relative)
     })?;
     enqueue_async_commit(repo_root, config, &format!("agent: profile {name}"), &[rel]);
 
@@ -9104,7 +10543,7 @@ fn build_file_reservation_commit_message(entries: &[(String, String)]) -> String
     format!("{subject}\n\n{}", lines.join("\n"))
 }
 
-fn reservation_publication_timestamp(value: &serde_json::Value) -> Option<i64> {
+fn archive_publication_timestamp(value: &serde_json::Value) -> Option<i64> {
     value.as_i64().or_else(|| {
         value.as_str().and_then(|text| {
             let text = text.trim();
@@ -9199,8 +10638,8 @@ fn validate_reservation_publication_version(
     }
     if let (Some(before), Some(after)) = (published.get("created_ts"), incoming.get("created_ts")) {
         let same = match (
-            reservation_publication_timestamp(before),
-            reservation_publication_timestamp(after),
+            archive_publication_timestamp(before),
+            archive_publication_timestamp(after),
         ) {
             (Some(before), Some(after)) => before == after,
             _ => before == after || before.is_null() || after.is_null(),
@@ -9223,8 +10662,8 @@ fn validate_reservation_publication_version(
     // concurrent renewal. Only two ACTIVE versions are ordered by expiry.
     if !incoming_released
         && let (Some(before), Some(after)) = (
-            reservation_publication_timestamp(&published["expires_ts"]),
-            reservation_publication_timestamp(&incoming["expires_ts"]),
+            archive_publication_timestamp(&published["expires_ts"]),
+            archive_publication_timestamp(&incoming["expires_ts"]),
         )
         && after < before
     {
@@ -9290,6 +10729,21 @@ enum ReservationAdmission<'a> {
     },
 }
 
+impl ReservationAdmission<'_> {
+    fn check_cancelled(&mut self) -> Result<()> {
+        if let Self::Direct { cancelled, .. } = self
+            && cancelled()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "reservation publication cancelled",
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
 /// Pause before a direct reservation writer that found the project's archive
 /// lock busy checks it again. It holds no fence meanwhile.
 const DIRECT_RESERVATION_LOCK_BUSY_PAUSE: Duration = Duration::from_millis(2);
@@ -9306,6 +10760,11 @@ fn publish_reservation_writes(
     let root = archive_project_root_checked(archive)?;
     let process_lock = archive_process_lock(archive)?;
     loop {
+        // A prepared request can wait here without ever reaching fence
+        // admission. Observe cancellation even while the project stays busy,
+        // so an abandoned caller does not occupy a dispatch thread for the
+        // full five-second publication budget.
+        admission.check_cancelled()?;
         // A direct writer waits out a busy project without the fence. This
         // only peeks: the lock is released at once and taken again below, in
         // the fence-then-project order. Admitting just to find the project
@@ -9350,6 +10809,10 @@ fn publish_reservation_writes(
         match process.and_then(|process| lock.acquire().map(|()| process)) {
             Ok(_process) => {
                 validate_reservation_publications(checks)?;
+                // Cancellation during lock acquisition or validation must
+                // leave the private stages unpublished. Their owner cleans
+                // them up as the locks and mutation window unwind.
+                admission.check_cancelled()?;
                 let result = staged.publish();
                 lock.release()?;
                 return result;
@@ -14303,8 +15766,29 @@ fn mark_archive_index_pending(state: &mut ArchiveIndexSyncState, git_dir: &Path,
         });
 }
 
+/// Keep a failed attempt owed without treating its retry as a new commit.
+/// Commits arriving while the index was being synchronized retain their newer
+/// quiet-period deadline, while the original lag bound remains in force.
+fn restore_archive_index_pending(
+    state: &mut ArchiveIndexSyncState,
+    git_dir: &Path,
+    attempted: ArchiveIndexLag,
+) {
+    state
+        .pending
+        .entry(git_dir.to_path_buf())
+        .and_modify(|pending| {
+            pending.since = pending.since.min(attempted.since);
+            pending.last_commit = pending.last_commit.max(attempted.last_commit);
+        })
+        .or_insert(attempted);
+}
+
 static ARCHIVE_INDEX_SYNC: LazyLock<(Mutex<ArchiveIndexSyncState>, Condvar)> =
     LazyLock::new(|| (Mutex::new(ArchiveIndexSyncState::default()), Condvar::new()));
+
+#[cfg(test)]
+type ArchiveIndexSyncAfterLockTestHook = Box<dyn FnMut(&Path)>;
 
 #[cfg(test)]
 thread_local! {
@@ -14312,6 +15796,8 @@ thread_local! {
     /// fixtures always find a current `.git/index`. Tests of the background
     /// contract switch this off for their thread.
     static ARCHIVE_INDEX_SYNC_INLINE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static ARCHIVE_INDEX_SYNC_AFTER_LOCK_TEST_HOOK:
+        std::cell::RefCell<Option<ArchiveIndexSyncAfterLockTestHook>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Mark `git_dir`'s shared index as behind HEAD and wake the sync worker.
@@ -14403,7 +15889,7 @@ fn archive_index_sync_backoff(elapsed: Duration) -> Duration {
 fn archive_index_sync_worker() {
     let (state_lock, wake) = &*ARCHIVE_INDEX_SYNC;
     loop {
-        let git_dir = {
+        let (git_dir, attempted) = {
             let mut state = state_lock
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -14413,9 +15899,12 @@ fn archive_index_sync_worker() {
                 }
                 match next_archive_index_sync(&state, Instant::now()) {
                     Ok(git_dir) => {
-                        state.pending.remove(&git_dir);
+                        let attempted = state
+                            .pending
+                            .remove(&git_dir)
+                            .expect("selected archive index sync must be pending");
                         state.in_flight = true;
-                        break git_dir;
+                        break (git_dir, attempted);
                     }
                     Err(Some(wait)) => {
                         state = wake
@@ -14447,17 +15936,21 @@ fn archive_index_sync_worker() {
             git_dir.clone(),
             Instant::now() + archive_index_sync_backoff(started.elapsed()),
         );
+        // Only a settled sync discharges this attempt. Contention, ordinary
+        // I/O/Git failures, and caught panics all leave the index work owed.
+        // Reuse one pending entry and the normal rewrite backoff: recovery
+        // needs no further commit and cannot spin while a failure persists.
+        if !matches!(&result, Ok(ArchiveIndexSync::Settled)) {
+            restore_archive_index_pending(&mut state, &git_dir, attempted);
+        }
         match result {
             Ok(ArchiveIndexSync::Settled) => {
                 state.warned.remove(&git_dir);
             }
-            // Someone else holds the lock: this commit's sync is still owed.
-            Ok(ArchiveIndexSync::Locked) => {
-                mark_archive_index_pending(&mut state, &git_dir, Instant::now());
-            }
+            Ok(ArchiveIndexSync::Locked) => {}
             Err(error) if state.warned.insert(git_dir.clone()) => tracing::warn!(
                 git_dir = %git_dir.display(),
-                "could not bring the archive's .git/index up to HEAD: {error}; repeats are logged at debug level until it succeeds"
+                "could not bring the archive's .git/index up to HEAD: {error}; retaining for retry, repeats are logged at debug level until it succeeds"
             ),
             Err(error) => tracing::debug!(
                 git_dir = %git_dir.display(),
@@ -14571,9 +16064,201 @@ enum ArchiveIndexSync {
     Locked,
 }
 
-/// Age after which an `index.lock` whose owner is gone may be reclaimed: the
-/// rule commits apply on their first retry.
-const ARCHIVE_INDEX_SYNC_STALE_LOCK_SECS: f64 = 30.0;
+const INDEX_SYNC_LOCK_WITNESS_PREFIX: &str = "am-index-sync-lock-v1 ";
+const INDEX_SYNC_OWNER_MAX_BYTES: u64 = 1024;
+
+/// Bind a sync's ownership to its opened lock, including writes and metadata
+/// changes. An old advisory PID file cannot identify a later Git writer's lock.
+fn index_sync_lock_witness(file: &fs::File) -> std::io::Result<String> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(
+            "index sync lock is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(format!(
+            "unix:{}:{}:{}:{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        ))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        let (volume, index) = mcp_agent_mail_core::disk::windows_file_identity(file)?;
+        Ok(format!(
+            "windows:{volume}:{index}:{}:{}:{}",
+            metadata.len(),
+            metadata.creation_time(),
+            metadata.last_write_time(),
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "index sync cannot establish file identity on this platform",
+    ))
+}
+
+fn index_sync_lock_witness_at(path: &Path) -> std::io::Result<String> {
+    index_sync_lock_witness(&mcp_agent_mail_core::disk::open_regular_file_no_follow(
+        path,
+    )?)
+}
+
+/// Only positive process evidence authorizes automatic reclamation. Permission
+/// and I/O errors are inconclusive; portable explicit cleanup keeps its policy.
+fn index_sync_owner_is_gone(pid: u32, expected_ticks: u64) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        // Signal zero asks the kernel about ownership without signalling the
+        // process. Only ESRCH proves absence; EPERM and all other errors fail
+        // closed. Linux can additionally prove that a live PID was recycled.
+        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+            Err(nix::errno::Errno::ESRCH) => true,
+            Ok(()) => {
+                #[cfg(target_os = "linux")]
+                {
+                    expected_ticks > 0
+                        && process_start_ticks(pid as u32)
+                            .is_some_and(|actual| actual != expected_ticks)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = expected_ticks;
+                    false
+                }
+            }
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // No positive native ownership probe is available here. In particular,
+        // Windows must not infer abandonment from the age of an owner record.
+        let _ = (pid, expected_ticks);
+        false
+    }
+}
+
+/// Background housekeeping reclaims only a sync's exact witnessed lock whose
+/// recorded process is provably gone. Legacy owner files are advisory: ordinary
+/// commit attempts write them before acquiring a lock. They cannot authorize
+/// removal of a concurrent external Git writer's lock, however old it is.
+fn reclaim_abandoned_index_sync_lock(repo_root: &Path) -> bool {
+    let Some((_, owner_path)) = git_index_lock_paths_checked(repo_root) else {
+        return false;
+    };
+    let Ok(owner_file) = mcp_agent_mail_core::disk::open_regular_file_no_follow(&owner_path) else {
+        return false;
+    };
+    reclaim_index_sync_lock_with_owner(repo_root, owner_file)
+}
+
+fn reclaim_index_sync_lock_with_owner(repo_root: &Path, owner_file: fs::File) -> bool {
+    // Two automatic cleaners must not both approve the same abandoned pair,
+    // then let the later unlink hit a newly acquired lock. Claim its retained
+    // owner descriptor without waiting; keep that claim through removal.
+    if fs2::FileExt::try_lock_exclusive(&owner_file).is_err() {
+        return false;
+    }
+    let Some((lock_path, owner_path)) = git_index_lock_paths_checked(repo_root) else {
+        return false;
+    };
+    let Ok(owner_identity) = index_sync_lock_witness(&owner_file) else {
+        return false;
+    };
+    if index_sync_lock_witness_at(&owner_path).ok().as_ref() != Some(&owner_identity) {
+        // Another cleaner may have released this old descriptor's lock before
+        // we claimed it; it must still be the currently named owner file.
+        return false;
+    }
+    if !path_is_nonsymlink_file(&lock_path) {
+        return false;
+    }
+    let Some(identity) = git_lock_identity(&lock_path) else {
+        return false;
+    };
+    let mut owner = Vec::new();
+    if (&owner_file)
+        .take(INDEX_SYNC_OWNER_MAX_BYTES + 1)
+        .read_to_end(&mut owner)
+        .is_err()
+        || owner.len() as u64 > INDEX_SYNC_OWNER_MAX_BYTES
+    {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(&owner) else {
+        return false;
+    };
+    let mut lines = text.lines();
+    let Some(pid_text) = lines.next() else {
+        return false;
+    };
+    let Some(pid) = pid_text.trim().parse::<u32>().ok().filter(|pid| *pid > 0) else {
+        return false;
+    };
+    if lines
+        .next()
+        .and_then(|timestamp| timestamp.trim().parse::<u64>().ok())
+        .is_none()
+    {
+        return false;
+    }
+    let Some(expected_ticks) = lines
+        .next()
+        .and_then(|ticks| ticks.trim().parse::<u64>().ok())
+    else {
+        return false;
+    };
+    let Some(witness) = lines
+        .next()
+        .and_then(|line| line.strip_prefix(INDEX_SYNC_LOCK_WITNESS_PREFIX))
+    else {
+        return false;
+    };
+    if lines.next().is_some()
+        || index_sync_lock_witness_at(&lock_path).ok().as_deref() != Some(witness)
+        || !index_sync_owner_is_gone(pid, expected_ticks)
+    {
+        return false;
+    }
+    // Revalidate both complete pieces of evidence immediately before the
+    // existing conditional removal primitive's final PID/file identity checks.
+    if mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+        &owner_path,
+        INDEX_SYNC_OWNER_MAX_BYTES,
+    )
+    .ok()
+    .as_ref()
+        != Some(&owner)
+        || index_sync_lock_witness_at(&owner_path).ok().as_ref() != Some(&owner_identity)
+        || index_sync_lock_witness(&owner_file).ok().as_ref() != Some(&owner_identity)
+        || index_sync_lock_witness_at(&lock_path).ok().as_deref() != Some(witness)
+    {
+        return false;
+    }
+    remove_verified_stale_pair(
+        &lock_path,
+        &owner_path,
+        Some(&identity),
+        Some(pid_text.trim()),
+    )
+}
 
 fn create_index_lock(path: &Path) -> std::io::Result<fs::File> {
     fs::OpenOptions::new()
@@ -14582,13 +16267,90 @@ fn create_index_lock(path: &Path) -> std::io::Result<fs::File> {
         .open(path)
 }
 
-/// Removes this process's `index.lock.owner` record when dropped.
-struct IndexLockOwner<'a>(Option<&'a Path>);
+fn write_index_sync_lock_witness(
+    repo_root: &Path,
+    lock: &fs::File,
+    pid: u32,
+    start_ticks: u64,
+) -> std::io::Result<Vec<u8>> {
+    let (lock_path, owner_path) = git_index_lock_paths_checked(repo_root)
+        .ok_or_else(|| std::io::Error::other("unsafe index sync owner path"))?;
+    let witness = index_sync_lock_witness(lock)?;
+    if index_sync_lock_witness_at(&lock_path)? != witness {
+        return Err(std::io::Error::other(
+            "index sync no longer owns the lock path",
+        ));
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let bytes =
+        format!("{pid}\n{timestamp}\n{start_ticks}\n{INDEX_SYNC_LOCK_WITNESS_PREFIX}{witness}\n")
+            .into_bytes();
+    // This maintenance runs outside the archive fence. Publish a private owner
+    // candidate directly; the ordinary archive atomic writer takes that fence.
+    let mut staged = tempfile::NamedTempFile::new_in(owner_path.parent().unwrap())?;
+    staged.write_all(&bytes)?;
+    staged.as_file().sync_all()?;
+    if index_sync_lock_witness_at(&lock_path)? != witness
+        || path_existing_prefix_has_symlink(&owner_path).unwrap_or(true)
+    {
+        return Err(std::io::Error::other(
+            "index sync ownership changed before recording",
+        ));
+    }
+    staged.persist(&owner_path).map_err(|error| error.error)?;
+    Ok(bytes)
+}
 
-impl Drop for IndexLockOwner<'_> {
+/// Remove only the exact sync record we published, before releasing our lock.
+/// An ordinary commit may write an advisory owner while sync runs outside the
+/// fence; it is not this guard's record to remove.
+struct IndexSyncLockOwner<'a> {
+    root: Option<&'a Path>,
+    recorded: Option<Vec<u8>>,
+}
+
+impl<'a> IndexSyncLockOwner<'a> {
+    fn new(root: Option<&'a Path>, lock: &fs::File) -> Self {
+        let mut owner = Self {
+            root,
+            recorded: None,
+        };
+        owner.refresh(lock);
+        owner
+    }
+
+    fn refresh(&mut self, lock: &fs::File) {
+        let Some(root) = self.root else { return };
+        match write_index_sync_lock_witness(
+            root,
+            lock,
+            std::process::id(),
+            process_start_ticks(std::process::id()).unwrap_or(0),
+        ) {
+            Ok(bytes) => self.recorded = Some(bytes),
+            Err(error) => tracing::debug!(
+                "could not witness index sync ownership; abandoned lock will require explicit cleanup: {error}"
+            ),
+        }
+    }
+}
+
+impl Drop for IndexSyncLockOwner<'_> {
     fn drop(&mut self) {
-        if let Some(repo_root) = self.0 {
-            remove_lock_owner(repo_root);
+        if let (Some(root), Some(expected)) = (self.root, self.recorded.as_ref())
+            && let Some((_, owner_path)) = git_index_lock_paths_checked(root)
+            && mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+                &owner_path,
+                INDEX_SYNC_OWNER_MAX_BYTES,
+            )
+            .ok()
+            .as_ref()
+                == Some(expected)
+        {
+            let _ = fs::remove_file(owner_path);
         }
     }
 }
@@ -14626,9 +16388,9 @@ fn sync_archive_index_to_head(git_dir: &Path) -> Result<ArchiveIndexSync> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             // A process that exited mid-sync never releases its lock, which
             // would block every later sync and every archive read stamp.
-            let reclaimed = repo_root.as_deref().is_some_and(|root| {
-                try_clean_stale_git_lock(root, ARCHIVE_INDEX_SYNC_STALE_LOCK_SECS)
-            });
+            let reclaimed = repo_root
+                .as_deref()
+                .is_some_and(reclaim_abandoned_index_sync_lock);
             match reclaimed.then(|| create_index_lock(&lock_path)) {
                 Some(Ok(file)) => file,
                 Some(Err(error)) if error.kind() != std::io::ErrorKind::AlreadyExists => {
@@ -14648,10 +16410,13 @@ fn sync_archive_index_to_head(git_dir: &Path) -> Result<ArchiveIndexSync> {
     // Written only once the lock is ours and declared after it, so it is
     // removed before the lock is released on every path: it can never erase
     // the record of whoever takes the lock next.
-    if let Some(root) = repo_root.as_deref() {
-        write_lock_owner(root);
-    }
-    let owner = IndexLockOwner(repo_root.as_deref());
+    let mut owner = IndexSyncLockOwner::new(repo_root.as_deref(), lock.as_file());
+    #[cfg(test)]
+    ARCHIVE_INDEX_SYNC_AFTER_LOCK_TEST_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(git_dir);
+        }
+    });
     // HEAD is read under the lock, so a slow sync cannot publish a tree older
     // than one another writer synced while this one waited.
     let Some(head_oid) = resolve_head_commit_oid(&repo)? else {
@@ -14749,6 +16514,9 @@ fn sync_archive_index_to_head(git_dir: &Path) -> Result<ArchiveIndexSync> {
     )?;
     lock.write_all(&bytes)?;
     lock.as_file().sync_all()?;
+    // A crash during a partial write changes the witness and is left for
+    // explicit cleanup. Only the fully written/synced lock gets fresh proof.
+    owner.refresh(lock.as_file());
     // A rename keeps inode, length and mtime, so this is the identity the
     // published index will have.
     let written = archive_index_file_identity(&lock.as_file().metadata()?);
@@ -15457,23 +17225,63 @@ fn archive_project_root_checked(archive: &ProjectArchive) -> Result<PathBuf> {
 fn archive_project_root_canonical_checked(archive: &ProjectArchive) -> Result<PathBuf> {
     let project_root = archive_project_root_checked(archive)?;
     canonicalize_with_existing_prefix(&project_root).map_err(|err| {
-        StorageError::InvalidPath(format!(
-            "project archive root is not accessible: {} ({err})",
-            project_root.display()
-        ))
+        recovery::contextual_io_error(
+            format!(
+                "project archive root is not accessible: {} ({err})",
+                project_root.display()
+            ),
+            err,
+        )
+        .into()
     })
 }
 
 fn path_existing_prefix_has_symlink(path: &Path) -> std::io::Result<bool> {
+    // Retain the precise component and native cause: the caller's full path
+    // alone cannot identify a failing intermediate Windows volume/root probe.
+    #[derive(Debug)]
+    struct ComponentMetadataError {
+        path: PathBuf,
+        source: std::io::Error,
+    }
+
+    impl std::fmt::Display for ComponentMetadataError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "symlink_metadata({:?}): {}",
+                self.path, self.source
+            )
+        }
+    }
+
+    impl std::error::Error for ComponentMetadataError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.source)
+        }
+    }
+
     let mut current = if path.is_absolute() {
         PathBuf::new()
     } else {
         std::env::current_dir()?
     };
 
-    for component in path.components() {
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
         match component {
-            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::Prefix(prefix) => {
+                current.push(prefix.as_os_str());
+                // A canonical Windows drive prefix (\\?\C:) alone names a
+                // volume, not its root directory. symlink_metadata on that
+                // intermediate path can fail with ERROR_INVALID_FUNCTION. Query
+                // the complete root, then every real descendant as before.
+                // Bare and drive-relative prefixes retain their usual checks.
+                if matches!(components.peek(), Some(Component::RootDir)) {
+                    current.push(Path::new(std::path::MAIN_SEPARATOR_STR));
+                    components.next();
+                }
+            }
             Component::RootDir => current.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
             Component::CurDir => continue,
             Component::ParentDir => current.push(".."),
@@ -15484,11 +17292,205 @@ fn path_existing_prefix_has_symlink(path: &Path) -> std::io::Result<bool> {
             Ok(meta) if meta.file_type().is_symlink() => return Ok(true),
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err),
+            Err(err) => {
+                return Err(std::io::Error::new(
+                    err.kind(),
+                    ComponentMetadataError {
+                        path: current,
+                        source: err,
+                    },
+                ));
+            }
         }
     }
 
     Ok(false)
+}
+
+#[cfg(test)]
+mod path_prefix_tests {
+    use super::path_existing_prefix_has_symlink;
+    use std::fs;
+
+    #[test]
+    fn canonical_paths_validate_existing_and_missing_sidecars() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        #[cfg(windows)]
+        assert!(matches!(
+            root.components().next(),
+            Some(std::path::Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+        ));
+        let existing = root.join("checkpoint.json");
+        fs::write(&existing, b"checkpoint").unwrap();
+        for path in [
+            root,
+            existing,
+            temp.path().join("missing-checkpoint.json"),
+            fs::canonicalize(temp.path())
+                .unwrap()
+                .join("missing-parent/checkpoint.json"),
+        ] {
+            assert!(
+                !path_existing_prefix_has_symlink(&path).unwrap(),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_roots_validate_in_dos_and_verbatim_spelling() {
+        use std::path::{Component, PathBuf, Prefix};
+
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = fs::canonicalize(temp.path()).unwrap();
+        let Some(Component::Prefix(prefix)) = canonical.components().next() else {
+            panic!("canonical Windows fixture has no prefix: {canonical:?}");
+        };
+        let Prefix::VerbatimDisk(drive) = prefix.kind() else {
+            panic!("drive-root regression requires a local drive fixture: {canonical:?}");
+        };
+        for root in [
+            PathBuf::from(format!("{}:\\", char::from(drive))),
+            PathBuf::from(format!("\\\\?\\{}:\\", char::from(drive))),
+        ] {
+            assert!(fs::symlink_metadata(&root).unwrap().is_dir());
+            assert!(
+                !path_existing_prefix_has_symlink(&root).unwrap(),
+                "the complete root must be inspected without probing its bare drive prefix: {root:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_long_verbatim_paths_keep_symlink_checks() {
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let mut directory = root.clone();
+        for index in 0..6 {
+            directory.push(format!("checkpoint-component-{index}-{}", "x".repeat(32)));
+            fs::create_dir(&directory).unwrap();
+        }
+        assert!(directory.as_os_str().encode_wide().count() > 260);
+        let evidence = directory.join("checkpoint.json");
+        fs::write(&evidence, b"unchanged checkpoint evidence").unwrap();
+        for path in [
+            directory.clone(),
+            evidence.clone(),
+            directory.join("missing-checkpoint.json"),
+            directory.join("missing-parent").join("checkpoint.json"),
+        ] {
+            assert!(
+                !path_existing_prefix_has_symlink(&path).unwrap(),
+                "a long canonical path must remain usable: {path:?}"
+            );
+        }
+
+        let parent = directory.join("linked-parent");
+        let leaf = directory.join("linked-leaf");
+        let dangling = directory.join("dangling-leaf");
+        symlink_dir(&root, &parent).unwrap();
+        symlink_file(&evidence, &leaf).unwrap();
+        symlink_file(directory.join("missing-target"), &dangling).unwrap();
+        for path in [
+            parent.join("missing").join("checkpoint.json"),
+            leaf,
+            dangling,
+        ] {
+            assert!(
+                path_existing_prefix_has_symlink(&path).unwrap(),
+                "extended-length support must not bypass symlink refusal: {path:?}"
+            );
+        }
+        assert_eq!(
+            fs::read(evidence).unwrap(),
+            b"unchanged checkpoint evidence"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn canonical_prefix_does_not_hide_symlinked_ancestors_or_leaves() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let real = root.join("real");
+        fs::create_dir(&real).unwrap();
+        let evidence = real.join("evidence");
+        fs::write(&evidence, b"unchanged").unwrap();
+        let parent = root.join("linked-parent");
+        let leaf = root.join("linked-leaf");
+        let dangling = root.join("dangling-leaf");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real, &parent).unwrap();
+            std::os::unix::fs::symlink(&evidence, &leaf).unwrap();
+            std::os::unix::fs::symlink(root.join("missing-target"), &dangling).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(&real, &parent).unwrap();
+            std::os::windows::fs::symlink_file(&evidence, &leaf).unwrap();
+            std::os::windows::fs::symlink_file(root.join("missing-target"), &dangling).unwrap();
+        }
+        for link in [&parent, &leaf, &dangling] {
+            assert!(
+                fs::symlink_metadata(link).unwrap().file_type().is_symlink(),
+                "the native symlink fixture must exist: {}",
+                link.display()
+            );
+        }
+        // PathBuf::push normalizes .. on Windows verbatim paths. Preserve the
+        // actual linked-parent/.. spelling so the walker must inspect the
+        // linked ancestor before it processes the parent component.
+        let mut through_parent = parent.as_os_str().to_os_string();
+        through_parent.push(std::path::MAIN_SEPARATOR_STR);
+        through_parent.push("..");
+        through_parent.push(std::path::MAIN_SEPARATOR_STR);
+        through_parent.push("real");
+        through_parent.push(std::path::MAIN_SEPARATOR_STR);
+        through_parent.push("evidence");
+        for path in [
+            parent.join("evidence"),
+            parent.join("missing/checkpoint.json"),
+            through_parent.into(),
+            leaf,
+            dangling,
+        ] {
+            assert!(
+                path_existing_prefix_has_symlink(&path).unwrap(),
+                "{}",
+                path.display()
+            );
+        }
+        assert_eq!(fs::read(evidence).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn invalid_metadata_is_not_treated_as_an_absent_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let component = root.join("invalid\0name");
+        let expected = fs::symlink_metadata(&component).unwrap_err();
+        let error = path_existing_prefix_has_symlink(&component.join("checkpoint.json"))
+            .expect_err("metadata errors must fail closed");
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(error.kind(), expected.kind());
+        assert!(error.to_string().contains("symlink_metadata"));
+        assert!(error.to_string().contains(&format!("{component:?}")));
+        assert!(!error.to_string().contains("checkpoint.json"));
+        let source = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .expect("the native metadata error must remain in the source chain");
+        assert_eq!(source.kind(), expected.kind());
+        assert_eq!(source.raw_os_error(), expected.raw_os_error());
+    }
 }
 
 /// ISO 8601 timestamp for the current time.
@@ -15517,11 +17519,34 @@ pub fn check_archive_consistency(
     storage_root: &Path,
     messages: &[ConsistencyMessageRef],
 ) -> ConsistencyReport {
+    check_archive_consistency_with_checkpoint(storage_root, messages, &|| Ok(()))
+        .expect("an uncancellable archive consistency scan cannot be interrupted")
+}
+
+/// Check archive references until startup shutdown is requested. Interrupted
+/// scans return an error instead of publishing a partial missing-file metric.
+pub fn check_archive_consistency_cancellable(
+    storage_root: &Path,
+    messages: &[ConsistencyMessageRef],
+    cancelled: &AtomicBool,
+) -> std::io::Result<ConsistencyReport> {
+    check_archive_consistency_with_checkpoint(storage_root, messages, &|| {
+        archive_scan_checkpoint(cancelled)
+    })
+}
+
+fn check_archive_consistency_with_checkpoint(
+    storage_root: &Path,
+    messages: &[ConsistencyMessageRef],
+    checkpoint: &dyn Fn() -> std::io::Result<()>,
+) -> std::io::Result<ConsistencyReport> {
+    checkpoint()?;
     let mut found = 0usize;
     let mut missing = 0usize;
     let mut missing_ids: Vec<i64> = Vec::new();
 
     for msg in messages {
+        checkpoint()?;
         let project_slug = if let Ok(project_slug) =
             validate_archive_component("project slug", &msg.project_slug)
         {
@@ -15554,10 +17579,14 @@ pub fn check_archive_consistency(
         let fallback_subject_marker = format!("__{subject_slug}");
 
         let messages_dir = project_dir.join("messages").join(&year).join(&month);
+        // Native writers use second-resolution UTC filenames. Probe that
+        // exact path first: enumerating a populated month for every recent
+        // message turns a 100-row startup sample into 100 directory walks.
+        let canonical_name = format!("{iso_prefix}Z__{subject_slug}__{}.md", msg.message_id);
 
         // Look for a file matching the pattern: {iso}__{slug}__{id}.md
-        // We check both the computed path and do a directory scan fallback
-        // because the archive ID suffix can vary.
+        // Other timestamp spellings and archive ID suffixes retain the
+        // directory scan fallback.
         //
         // After `doctor reconstruct`, DB IDs may have been remapped from
         // canonical frontmatter IDs, so the `__{id}.md` suffix in the
@@ -15568,31 +17597,45 @@ pub fn check_archive_consistency(
         // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/10
         let found_file = if path_existing_prefix_has_symlink(&messages_dir).unwrap_or(true) {
             false
+        } else if validate_archive_component("message filename", &canonical_name).is_ok()
+            && path_is_nonsymlink_file(&messages_dir.join(&canonical_name))
+        {
+            true
         } else if path_is_nonsymlink_dir(&messages_dir) {
             let id_suffix = format!("__{}.md", msg.message_id);
             match std::fs::read_dir(&messages_dir) {
-                Ok(entries) => entries.flatten().any(|entry| {
-                    let Ok(file_type) = entry.file_type() else {
-                        return false;
-                    };
-                    if file_type.is_symlink() || !file_type.is_file() {
-                        return false;
+                Ok(entries) => {
+                    let mut found_file = false;
+                    for entry in entries.flatten() {
+                        checkpoint()?;
+                        let Ok(file_type) = entry.file_type() else {
+                            continue;
+                        };
+                        if file_type.is_symlink() || !file_type.is_file() {
+                            continue;
+                        }
+                        let path = entry.path();
+                        let name = entry.file_name();
+                        let name_str = name.to_string_lossy();
+                        // Primary match: timestamp prefix + exact DB ID suffix
+                        if name_str.starts_with(&iso_prefix) && name_str.ends_with(&id_suffix) {
+                            found_file = true;
+                            break;
+                        }
+                        checkpoint()?;
+                        if archive_fallback_matches_message_ref(
+                            &path,
+                            &name_str,
+                            msg,
+                            &iso_prefix,
+                            &fallback_subject_marker,
+                        ) {
+                            found_file = true;
+                            break;
+                        }
                     }
-                    let path = entry.path();
-                    let name = entry.file_name();
-                    let name_str = name.to_string_lossy();
-                    // Primary match: timestamp prefix + exact DB ID suffix
-                    if name_str.starts_with(&iso_prefix) && name_str.ends_with(&id_suffix) {
-                        return true;
-                    }
-                    archive_fallback_matches_message_ref(
-                        &path,
-                        &name_str,
-                        msg,
-                        &iso_prefix,
-                        &fallback_subject_marker,
-                    )
-                }),
+                    found_file
+                }
                 Err(_) => false,
             }
         } else {
@@ -15609,18 +17652,19 @@ pub fn check_archive_consistency(
         }
     }
 
-    // Update global metrics
+    checkpoint()?;
+    // Only a complete scan may update the missing-file metric.
     mcp_agent_mail_core::global_metrics()
         .storage
         .needs_reindex_total
         .store(missing as u64);
 
-    ConsistencyReport {
+    Ok(ConsistencyReport {
         sampled: messages.len(),
         found,
         missing,
         missing_ids,
-    }
+    })
 }
 
 fn archive_filename_timestamp_prefix(iso: &str) -> String {
@@ -16661,6 +18705,270 @@ mod tests {
 
         let profile_path = archive.root.join("agents/TestAgent/profile.json");
         assert!(profile_path.exists());
+    }
+
+    fn publication_agent_profile() -> serde_json::Value {
+        serde_json::json!({
+            "name": "BlueLake",
+            "program": "test",
+            "model": "test-model",
+            "task_description": "preserve this identity's history",
+            "inception_ts": "2026-01-01T00:00:00Z",
+            "last_active_ts": "2026-01-02T00:00:00Z",
+            "attachments_policy": "auto",
+            "contact_policy": "auto",
+            "reaper_exempt": false,
+            "retired_at": null,
+            "deregistered_at": null,
+        })
+    }
+
+    fn publication_deregistered_profile() -> serde_json::Value {
+        let mut profile = publication_agent_profile();
+        profile["deregistered_at"] = serde_json::json!("2026-01-03T00:00:00Z");
+        profile["contact_policy"] = serde_json::json!("block_all");
+        profile["task_description"] =
+            serde_json::json!("[DEREGISTERED 2026-01-03T00:00:00Z] preserve history");
+        profile
+    }
+
+    fn committed_publication_profile(archive: &ProjectArchive) -> Vec<u8> {
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let relative = format!("projects/{}/agents/BlueLake/profile.json", archive.slug);
+        let entry = tree.get_path(Path::new(&relative)).unwrap();
+        repo.find_blob(entry.id()).unwrap().content().to_vec()
+    }
+
+    #[test]
+    fn agent_profile_publication_rejects_delayed_active_write_before_reconstruction() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp.path().join("archive"));
+        let archive = ensure_archive(&config, "profile-publication").unwrap();
+        write_project_metadata_with_config(&archive, &config, "/profile-publication").unwrap();
+
+        // Capture the actual mutable WBQ operation before deregistration. Its
+        // producer can be delayed after committing SQLite but before enqueue,
+        // so acquisition order of the archive locks is not lifecycle order.
+        let delayed = WriteOp::AgentProfile {
+            project_slug: archive.slug.clone(),
+            config: config.clone(),
+            agent_json: publication_agent_profile(),
+        };
+        wbq_execute_op(&delayed, "profile publication regression").unwrap();
+        let deregistered = publication_deregistered_profile();
+        write_agent_profile_with_config(&archive, &config, &deregistered).unwrap();
+        flush_async_commits();
+        let path = archive.root.join("agents/BlueLake/profile.json");
+        let before = fs::read(&path).unwrap();
+        assert_eq!(committed_publication_profile(&archive), before);
+
+        let result = wbq_execute_op(&delayed, "delayed profile publication regression");
+        assert!(
+            result.is_err(),
+            "an old active write must refuse to erase durable deregistration"
+        );
+        flush_async_commits();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(committed_publication_profile(&archive), before);
+
+        // Recovery has no live DB or queued lifecycle write to repair from.
+        // The retained artifact alone must prevent resurrection.
+        let recovered = tmp.path().join("reconstructed.sqlite3");
+        let stats = mcp_agent_mail_db::reconstruct::reconstruct_from_archive(
+            &recovered,
+            &config.storage_root,
+        )
+        .unwrap();
+        assert_eq!(stats.agents, 1);
+        let conn = mcp_agent_mail_db::guard_db_conn(
+            mcp_agent_mail_db::DbConn::open_file(recovered.to_string_lossy()).unwrap(),
+            "agent publication reconstruction regression",
+        );
+        let rows = conn
+            .query_sync(
+                "SELECT a.name, d.deregistered_at FROM agents a \
+                 JOIN agent_deregistrations d ON d.agent_id = a.id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<String>("name").unwrap(), "BlueLake");
+        assert_eq!(
+            rows[0].get_named::<i64>("deregistered_at").unwrap(),
+            mcp_agent_mail_core::iso_to_micros("2026-01-03T00:00:00Z").unwrap()
+        );
+    }
+
+    #[test]
+    fn agent_profile_publication_preserves_committed_tombstones_when_working_copy_regresses() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        for regressed in [false, true] {
+            let slug = if regressed { "regressed" } else { "missing" };
+            let archive = ensure_archive(&config, slug).unwrap();
+            write_agent_profile_with_config(&archive, &config, &publication_deregistered_profile())
+                .unwrap();
+            flush_async_commits();
+            let path = archive.root.join("agents/BlueLake/profile.json");
+            let committed = committed_publication_profile(&archive);
+            fs::rename(&path, path.with_file_name("retained-profile.json")).unwrap();
+            let working = regressed.then(|| {
+                let bytes = serde_json::to_vec(&publication_agent_profile()).unwrap();
+                fs::write(&path, &bytes).unwrap();
+                bytes
+            });
+
+            assert!(
+                write_agent_profile_with_config(&archive, &config, &publication_agent_profile())
+                    .is_err(),
+                "committed evidence survives a {slug} working profile"
+            );
+            flush_async_commits();
+            match working {
+                Some(bytes) => assert_eq!(fs::read(&path).unwrap(), bytes),
+                None => assert!(!path.exists()),
+            }
+            assert_eq!(committed_publication_profile(&archive), committed);
+        }
+        // A tombstone in another project is never authority over this one.
+        let separate = ensure_archive(&config, "separate").unwrap();
+        write_agent_profile_with_config(&separate, &config, &publication_agent_profile()).unwrap();
+        assert_eq!(
+            read_agent_profile(&separate, "BlueLake").unwrap(),
+            Some(publication_agent_profile())
+        );
+    }
+
+    #[test]
+    fn agent_profile_publication_upgrades_legacy_name_without_merging_alias_conflicts() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        for null_name in [false, true] {
+            let slug = if null_name {
+                "legacy-null-name"
+            } else {
+                "legacy-name"
+            };
+            let archive = ensure_archive(&config, slug).unwrap();
+            let canonical = publication_deregistered_profile();
+            let mut legacy = canonical.clone();
+            let fields = legacy.as_object_mut().unwrap();
+            let inception = fields.remove("inception_ts").unwrap();
+            fields.remove("name");
+            fields.remove("deregistered_at");
+            fields.insert("agent_name".to_string(), serde_json::json!("BlueLake"));
+            fields.insert("registered_ts".to_string(), inception);
+            fields.insert(
+                "extension".to_string(),
+                serde_json::json!({"note": "retain"}),
+            );
+            if null_name {
+                fields.insert("name".to_string(), serde_json::Value::Null);
+            }
+            let path = archive.root.join("agents/BlueLake/profile.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+            fs::write(&path, &legacy_bytes).unwrap();
+            let relative = format!("projects/{slug}/agents/BlueLake/profile.json");
+            enqueue_async_commit(
+                &archive.repo_root,
+                &config,
+                "legacy profile fixture",
+                &[relative],
+            );
+            flush_async_commits();
+            assert_eq!(committed_publication_profile(&archive), legacy_bytes);
+
+            let error =
+                write_agent_profile_with_config(&archive, &config, &publication_agent_profile())
+                    .unwrap_err();
+            assert!(error.to_string().contains("permanent deregistration"));
+            assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
+            assert_eq!(committed_publication_profile(&archive), legacy_bytes);
+
+            write_agent_profile_with_config(&archive, &config, &canonical).unwrap();
+            flush_async_commits();
+            let before = fs::read(&path).unwrap();
+            let stored: serde_json::Value = serde_json::from_slice(&before).unwrap();
+            assert_eq!(stored["name"], "BlueLake");
+            assert_eq!(stored["agent_name"], "BlueLake");
+            assert_eq!(stored["registered_ts"], legacy["registered_ts"]);
+            assert_eq!(stored["extension"], legacy["extension"]);
+            assert_eq!(stored["deregistered_at"], canonical["deregistered_at"]);
+            assert_eq!(committed_publication_profile(&archive), before);
+
+            for alias in [serde_json::json!("RedStone"), serde_json::json!(false)] {
+                let mut incoming = canonical.clone();
+                incoming["agent_name"] = alias;
+                assert!(write_agent_profile_with_config(&archive, &config, &incoming).is_err());
+                assert_eq!(fs::read(&path).unwrap(), before);
+                assert_eq!(committed_publication_profile(&archive), before);
+            }
+            for alias in [serde_json::json!("RedStone"), serde_json::json!(false)] {
+                let mut foreign = stored.clone();
+                foreign["agent_name"] = alias;
+                let foreign_bytes = serde_json::to_vec_pretty(&foreign).unwrap();
+                fs::write(&path, &foreign_bytes).unwrap();
+                assert!(write_agent_profile_with_config(&archive, &config, &canonical).is_err());
+                assert_eq!(fs::read(&path).unwrap(), foreign_bytes);
+                assert_eq!(committed_publication_profile(&archive), before);
+            }
+        }
+    }
+
+    #[test]
+    fn agent_profile_publication_preserves_extensions_and_allows_reversible_retirement() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "profile-updates").unwrap();
+        let mut original = publication_agent_profile();
+        original["extension"] = serde_json::json!({"operator_note": "retain", "values": [1, 2]});
+        write_agent_profile_with_config(&archive, &config, &original).unwrap();
+        flush_async_commits();
+
+        let mut update = publication_agent_profile();
+        update["inception_ts"] = serde_json::json!(
+            mcp_agent_mail_core::iso_to_micros("2026-01-01T00:00:00Z")
+                .unwrap()
+                .to_string()
+        );
+        update["program"] = serde_json::json!("updated-client");
+        update["retired_at"] = serde_json::json!("2026-01-03T00:00:00Z");
+        for retired_at in [update["retired_at"].clone(), serde_json::Value::Null] {
+            update["retired_at"] = retired_at.clone();
+            write_agent_profile_with_config(&archive, &config, &update).unwrap();
+            flush_async_commits();
+            let stored = read_agent_profile(&archive, "BlueLake").unwrap().unwrap();
+            assert_eq!(stored["retired_at"], retired_at);
+            assert_eq!(stored["program"], "updated-client");
+            assert_eq!(stored["extension"], original["extension"]);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&committed_publication_profile(
+                    &archive
+                ))
+                .unwrap(),
+                stored
+            );
+        }
+
+        let deregistered = publication_deregistered_profile();
+        write_agent_profile_with_config(&archive, &config, &deregistered).unwrap();
+        flush_async_commits();
+        let mut equivalent = deregistered.clone();
+        equivalent["deregistered_at"] =
+            serde_json::json!(mcp_agent_mail_core::iso_to_micros("2026-01-03T00:00:00Z").unwrap());
+        equivalent["reaper_exempt"] = serde_json::Value::Bool(true);
+        write_agent_profile_with_config(&archive, &config, &equivalent).unwrap();
+        flush_async_commits();
+        let stored = read_agent_profile(&archive, "BlueLake").unwrap().unwrap();
+        assert_eq!(stored["reaper_exempt"], true);
+        assert_eq!(stored["extension"], original["extension"]);
+        assert_eq!(stored["deregistered_at"], equivalent["deregistered_at"]);
     }
 
     #[test]
@@ -17734,6 +20042,131 @@ mod tests {
         assert!(matches!(result, DirectArchiveWrite::Written), "{result:?}");
         assert!(reservation_dir.join("id-8.json").exists());
         assert!(staged_temp_files(&reservation_dir).is_empty());
+    }
+
+    #[test]
+    fn direct_reservation_cancellation_ends_the_project_lock_wait() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "cancelled-project-wait").unwrap();
+        let reservation_dir = archive.root.join("file_reservations");
+        ensure_dir(&reservation_dir).unwrap();
+        let process_lock = archive_process_lock(&archive).unwrap();
+        let owner = process_lock.lock().unwrap();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancellation = Arc::clone(&cancelled);
+        let op = WriteOp::FileReservation {
+            project_slug: "cancelled-project-wait".to_string(),
+            config,
+            reservations: vec![serde_json::json!({
+                "id": 9,
+                "agent": "GreenCastle",
+                "path_pattern": "src/**",
+                "exclusive": true,
+            })],
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let outcome =
+                write_op_sync_direct_with_cancel(&op, || cancellation.load(Ordering::Acquire));
+            done_tx.send(outcome).unwrap();
+            op
+        });
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut staged = staged_temp_files(&reservation_dir);
+        while staged.len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            staged = staged_temp_files(&reservation_dir);
+        }
+        cancelled.store(true, Ordering::Release);
+        let started = Instant::now();
+        let outcome = done_rx.recv_timeout(Duration::from_secs(2));
+        let cancellation_latency = started.elapsed();
+        let owner_preserved = matches!(
+            process_lock.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        let unpublished = !reservation_dir.join("id-9.json").exists();
+        // Join the writer even when the baseline waits out the observation
+        // deadline instead of noticing cancellation behind the real owner.
+        drop(owner);
+        let op = writer.join().unwrap();
+        assert_eq!(staged.len(), 2, "the request must reach staged publication");
+        assert!(
+            matches!(&outcome, Ok(DirectArchiveWrite::Failed(StorageError::Io(error)))
+                if error.kind() == std::io::ErrorKind::Interrupted),
+            "cancelled request did not leave the held project lock: {outcome:?}; elapsed={cancellation_latency:?}"
+        );
+        assert!(
+            owner_preserved,
+            "cancellation must not release another owner"
+        );
+        assert!(unpublished, "cancelled stages must not become reservations");
+        assert!(staged_temp_files(&reservation_dir).is_empty());
+        let key = format!("{}::cancelled-project-wait", tmp.path().display());
+        assert!(
+            wbq_circuit_breaker_snapshot()
+                .iter()
+                .all(|entry| entry.archive_key != key),
+            "request cancellation must not classify a healthy archive as failed"
+        );
+        assert!(
+            matches!(write_op_sync_direct(&op), DirectArchiveWrite::Written),
+            "a fresh request must publish once the real owner releases the lock"
+        );
+        let published: serde_json::Value =
+            serde_json::from_slice(&fs::read(reservation_dir.join("id-9.json")).unwrap()).unwrap();
+        assert_eq!(published["agent"], "GreenCastle");
+    }
+
+    #[test]
+    fn direct_reservation_cancellation_after_admission_preserves_existing_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "cancelled-before-rename").unwrap();
+        let reservation_dir = archive.root.join("file_reservations");
+        ensure_dir(&reservation_dir).unwrap();
+        let artifact = reservation_dir.join("id-10.json");
+        let before = b"{\"id\":10,\"agent\":\"GreenCastle\"}";
+        fs::write(&artifact, before).unwrap();
+        let staged = StagedArchiveWrites::stage(vec![(
+            artifact.clone(),
+            b"{\"id\":10,\"agent\":\"BlueLake\"}".to_vec(),
+        )])
+        .unwrap();
+        let mut saw_owned_locks = false;
+        let process_lock = archive_process_lock(&archive).unwrap();
+        let mut cancelled = || {
+            // Cancel only after the real publication fence and project mutex
+            // are both held, without relying on a count of internal callbacks.
+            let owned = ARCHIVE_MUTATION_DEPTH.with(|depth| depth.get() > 0)
+                && matches!(
+                    process_lock.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                );
+            saw_owned_locks |= owned;
+            owned
+        };
+        let result = publish_reservation_writes(
+            &archive,
+            staged,
+            &[],
+            &mut ReservationAdmission::Direct {
+                deadline: Instant::now() + DIRECT_FENCE_ADMISSION_BUDGET,
+                cancelled: &mut cancelled,
+            },
+        );
+        assert!(
+            matches!(&result, Err(StorageError::Io(error))
+            if error.kind() == std::io::ErrorKind::Interrupted),
+            "{result:?}"
+        );
+        assert!(saw_owned_locks);
+        assert_eq!(fs::read(&artifact).unwrap(), before);
+        assert!(staged_temp_files(&reservation_dir).is_empty());
+        assert!(process_lock.try_lock().is_ok());
+        assert_eq!(ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get), 0);
     }
 
     /// br-9bwnb: a staged temp file is no archive state. The overload
@@ -20727,7 +23160,19 @@ mod tests {
                 std::env::var_os("AM_STORAGE_PERMISSION_TEST_CHILD").is_none(),
                 "permission child must actually drop root privileges"
             );
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            // Keep the exact ELF reachable after dropping privileges even when
+            // the build target has root-private ancestors. Linux resolves this
+            // retained descriptor before closing it on exec.
+            #[cfg(target_os = "linux")]
+            let executable = fs::File::open(std::env::current_exe().unwrap()).unwrap();
+            #[cfg(target_os = "linux")]
+            let executable_path = {
+                use std::os::fd::AsRawFd as _;
+                format!("/proc/self/fd/{}", executable.as_raw_fd())
+            };
+            #[cfg(not(target_os = "linux"))]
+            let executable_path = std::env::current_exe().unwrap();
+            let output = std::process::Command::new(executable_path) // ubs:ignore -- retained current_exe descriptor, no external program input; child drops uid/gid.
                 .args([
                     "--exact",
                     "tests::test_file_lock_stale_cleanup_permission_denied_returns_false",
@@ -20740,6 +23185,8 @@ mod tests {
                 .current_dir("/tmp")
                 .output()
                 .expect("run stale-lock denial without root DAC bypass");
+            #[cfg(target_os = "linux")]
+            drop(executable);
             assert!(
                 output.status.success(),
                 "unprivileged permission test failed: {}\n{}",
@@ -21145,6 +23592,163 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn startup_quarantine_preserves_destination_created_after_allocation() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("stale.lock");
+        fs::write(&path, "source evidence").unwrap();
+        let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(&path).unwrap();
+        let occupied = next_startup_quarantine_path(&path, "lock");
+        // A competing publisher wins after the allocation's occupancy check.
+        fs::write(&occupied, "competing evidence").unwrap();
+        let error = move_startup_artifact_noreplace(&path, &occupied, &file).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "source evidence");
+        assert_eq!(fs::read_to_string(&occupied).unwrap(), "competing evidence");
+
+        let published =
+            quarantine_startup_artifact_with_witness(&path, "lock", "test evidence", &file, None)
+                .unwrap();
+        assert_ne!(published, occupied);
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(&published).unwrap(), "source evidence");
+        assert_eq!(fs::read_to_string(&occupied).unwrap(), "competing evidence");
+    }
+
+    #[test]
+    fn startup_quarantine_preserves_moved_evidence_on_parent_sync_failure() {
+        for error_kind in [
+            std::io::ErrorKind::Other,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::AlreadyExists,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let source_parent = tmp.path().join("refs/heads");
+            fs::create_dir_all(&source_parent).unwrap();
+            let source = source_parent.join("main.lock");
+            let quarantine = tmp.path().join("retained-ref-lock");
+            fs::write(&source, "ref lock evidence").unwrap();
+            let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(&source).unwrap();
+            let sync_attempted = std::cell::Cell::new(false);
+            let error = move_startup_artifact_noreplace_with_parent_sync(
+                &source,
+                &quarantine,
+                &file,
+                |from, to| {
+                    assert_eq!(from, source);
+                    assert_eq!(to, quarantine);
+                    assert!(!source.exists(), "sync follows the actual move");
+                    assert_eq!(
+                        fs::read_to_string(&quarantine).unwrap(),
+                        "ref lock evidence"
+                    );
+                    sync_attempted.set(true);
+                    Err(std::io::Error::new(
+                        error_kind,
+                        "injected directory sync failure",
+                    ))
+                },
+            )
+            .unwrap_err();
+            assert!(sync_attempted.get());
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert!(error.to_string().contains("parent directory sync failed"));
+            assert!(!source.exists());
+            assert_eq!(
+                fs::read_to_string(&quarantine).unwrap(),
+                "ref lock evidence"
+            );
+            assert!(startup_artifact_matches_file(&quarantine, &file).unwrap());
+            // A later durability retry can sync both real parent directories
+            // without moving or replacing the preserved evidence again.
+            sync_startup_artifact_move_parents(&source, &quarantine).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_quarantine_refuses_replaced_inode_and_rebound_owner_metadata() {
+        use fs2::FileExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("stale.lock");
+        fs::write(&path, "equal bytes").unwrap();
+        let file =
+            mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(&path).unwrap();
+        file.try_lock_exclusive().unwrap();
+        let retained = path.with_file_name("retained-old-lock");
+        fs::rename(&path, &retained).unwrap();
+        fs::write(&path, "equal bytes").unwrap();
+        let owner =
+            mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(&path).unwrap();
+        owner.try_lock_exclusive().unwrap();
+        let destination = next_startup_quarantine_path(&path, "lock");
+        assert!(!move_startup_artifact_noreplace(&path, &destination, &file).unwrap());
+        assert!(!destination.exists());
+        assert!(startup_artifact_matches_file(&path, &owner).unwrap());
+        assert!(startup_artifact_matches_file(&retained, &file).unwrap());
+
+        let metadata = path.with_extension("lock.owner.json");
+        fs::write(&metadata, "new owner metadata").unwrap();
+        assert!(
+            quarantine_startup_artifact_if_exists(
+                &metadata,
+                "metadata",
+                "new owner metadata",
+                &path,
+            )
+            .is_none()
+        );
+        assert_eq!(fs::read_to_string(&metadata).unwrap(), "new owner metadata");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "equal bytes");
+        assert_eq!(fs::read_to_string(&retained).unwrap(), "equal bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_lock_healer_preserves_replacement_while_old_inode_is_locked() {
+        use fs2::FileExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let project = tmp.path().join("projects/raced-heal");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join(".archive.lock");
+        let metadata = project.join(".archive.lock.owner.json");
+        let retained = project.join("retained-old-lock");
+        fs::write(&path, "old lock evidence").unwrap();
+        fs::write(&metadata, "old owner metadata").unwrap();
+        let replacement = std::cell::RefCell::new(None);
+        let report = heal_archive_locks_with_checkpoint(&config, &|| {
+            if replacement.borrow().is_none() {
+                let probe =
+                    mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(&path)?;
+                // Synchronize with the real exclusive lock, rather than
+                // assuming a directory order or replacing any I/O operation.
+                if probe.try_lock_exclusive().is_err() {
+                    fs::rename(&path, &retained)?;
+                    fs::write(&path, "new lock evidence")?;
+                    fs::write(&metadata, "new owner metadata")?;
+                    let owner =
+                        mcp_agent_mail_core::disk::open_regular_file_read_write_no_follow(&path)?;
+                    owner.try_lock_exclusive()?;
+                    *replacement.borrow_mut() = Some(owner);
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            replacement.borrow().is_some(),
+            "the locked-inode race must run"
+        );
+        assert!(report.locks_quarantined.is_empty());
+        assert!(report.metadata_quarantined.is_empty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new lock evidence");
+        assert_eq!(fs::read_to_string(&metadata).unwrap(), "new owner metadata");
+        assert_eq!(fs::read_to_string(&retained).unwrap(), "old lock evidence");
+    }
+
+    #[test]
     fn test_heal_archive_locks_empty() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -21184,6 +23788,59 @@ mod tests {
             "unexpected metadata quarantine path: {}",
             quarantined.display()
         );
+    }
+
+    #[test]
+    fn cancelled_archive_lock_healing_preserves_quarantine_and_retries() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let project = tmp.path().join("projects/cancelled-heal");
+        fs::create_dir_all(&project).unwrap();
+        let locks = [project.join("first.lock"), project.join("second.lock")];
+        for (index, lock) in locks.iter().enumerate() {
+            fs::write(lock, format!("lock-{index}")).unwrap();
+            fs::write(
+                lock.with_extension("lock.owner.json"),
+                format!("owner-{index}"),
+            )
+            .unwrap();
+        }
+        let cancelled = AtomicBool::new(false);
+        let result = heal_archive_locks_with_checkpoint(&config, &|| {
+            // Stop after the real first rename, before its metadata rename or
+            // the next file. Do not replace any filesystem operation.
+            if locks.iter().any(|lock| !lock.exists()) {
+                cancelled.store(true, Ordering::Release);
+            }
+            archive_scan_checkpoint(&cancelled)
+        });
+        assert!(
+            matches!(result, Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted)
+        );
+        assert_eq!(locks.iter().filter(|lock| lock.exists()).count(), 1);
+        let quarantine: Vec<_> = fs::read_dir(&project)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".startup-quarantine-")
+            })
+            .collect();
+        assert_eq!(quarantine.len(), 1, "completed rename remains preserved");
+        let content = fs::read_to_string(&quarantine[0]).unwrap();
+        assert!(content == "lock-0" || content == "lock-1");
+        assert!(heal_archive_locks_cancellable(&config, &cancelled).is_err());
+        assert_eq!(locks.iter().filter(|lock| lock.exists()).count(), 1);
+
+        cancelled.store(false, Ordering::Release);
+        let resumed = heal_archive_locks_cancellable(&config, &cancelled).unwrap();
+        assert_eq!(resumed.locks_quarantined.len(), 1);
+        assert_eq!(resumed.metadata_quarantined.len(), 2);
+        assert!(locks.iter().all(|lock| !lock.exists()));
+        assert_eq!(fs::read_to_string(&quarantine[0]).unwrap(), content);
     }
 
     #[test]
@@ -22967,6 +25624,13 @@ mod tests {
             "overall lag must include the blocked WBQ batch: {stuck:?}"
         );
 
+        let backlog = ARCHIVE_BACKLOG.queue.lock().unwrap();
+        let unavailable = try_archive_lag_snapshot().unwrap_err();
+        assert_eq!(unavailable.unavailable_lock, "archive_backlog.queue");
+        assert!(unavailable.lower_bound.wbq_inflight_execution_us >= 1_000_000);
+        assert!(unavailable.lower_bound.oldest_unmaterialized_us >= 1_000_000);
+        drop(backlog);
+
         drop(fence);
         assert_eq!(
             wbq_flush_status(),
@@ -23195,6 +25859,292 @@ mod tests {
         let archive = ensure_archive(&config, project_slug).unwrap();
         let commits = get_recent_commits(&archive, 3, None).unwrap();
         assert_eq!(commits[0].summary, "batch: 2 message bundles");
+    }
+
+    #[test]
+    fn wbq_message_batch_bounds_preserve_complete_bundles_and_group_identity() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let envelope = |id| WbqOpEnvelope {
+            enqueued_at: Instant::now(),
+            op: Box::new(backlog_test_message_op(&config, "bounded", id)),
+        };
+        // Three message copies and one thread append per bundle: sixteen
+        // complete bundles exactly fill the 64-path publication target.
+        let batch: Vec<_> = (1..=33).map(envelope).collect();
+        assert_eq!(wbq_message_bundle_batch_end(&batch, 0), 16);
+        assert_eq!(wbq_message_bundle_batch_end(&batch, 16), 32);
+        assert_eq!(wbq_message_bundle_batch_end(&batch, 32), 33);
+
+        for boundary in ["project", "root", "author", "email", "other-op"] {
+            let mut batch: Vec<_> = (1..=3).map(envelope).collect();
+            let WriteOp::MessageBundle {
+                project_slug,
+                config,
+                ..
+            } = batch[1].op.as_mut()
+            else {
+                unreachable!();
+            };
+            match boundary {
+                "project" => project_slug.push_str("-other"),
+                "root" => config.storage_root.push("other"),
+                "author" => config.git_author_name.push_str(" other"),
+                "email" => config.git_author_email.push_str(".other"),
+                "other-op" => *batch[1].op = wbq_test_clear_signal_op("bounded"),
+                _ => unreachable!(),
+            }
+            assert_eq!(wbq_message_bundle_batch_end(&batch, 0), 1, "{boundary}");
+            assert_eq!(wbq_message_bundle_batch_end(&batch, 1), 2, "{boundary}");
+        }
+
+        for oversized in [false, true] {
+            let mut batch: Vec<_> = (1..=3).map(envelope).collect();
+            let WriteOp::MessageBundle { extra_paths, .. } = batch[1].op.as_mut() else {
+                unreachable!();
+            };
+            *extra_paths = vec!["attachments/proven.webp".into(); if oversized { 70 } else { 60 }];
+            assert_eq!(wbq_message_bundle_batch_end(&batch, 0), 1);
+            assert_eq!(wbq_message_bundle_batch_end(&batch, 1), 2);
+            assert_eq!(wbq_message_bundle_batch_end(&batch, 2), 3);
+        }
+    }
+
+    #[test]
+    fn wbq_message_batch_bytes_include_fanout_escaping_and_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut op = backlog_test_message_op(&config, "byte-bound", 1);
+        let WriteOp::MessageBundle {
+            message_json,
+            body_md,
+            recipients,
+            ..
+        } = &mut op
+        else {
+            unreachable!();
+        };
+        *body_md = "Unicode 🦀 and a literal newline\n".into();
+        message_json["subject"] = serde_json::json!("Quotes \" and newline\n and slash \\");
+        message_json["bcc"] = serde_json::json!(["HiddenAgent"]);
+        recipients.push("HiddenAgent".into());
+        let full = render_message_bundle_content(message_json, body_md).unwrap();
+        let redacted =
+            render_message_bundle_content(&redact_message_bcc_for_inbox(message_json), body_md)
+                .unwrap();
+        let (files, bytes) = message_bundle_batch_cost(&op);
+        assert_eq!(files, 5, "four message copies and one thread append");
+        assert_eq!(bytes, 4 * full.len());
+        assert!(bytes >= 2 * full.len() + 2 * redacted.len());
+
+        for large_metadata in [false, true] {
+            let mut op = backlog_test_message_op(&config, "byte-bound", 2);
+            let WriteOp::MessageBundle {
+                message_json,
+                body_md,
+                ..
+            } = &mut op
+            else {
+                unreachable!();
+            };
+            if large_metadata {
+                // JSON doubles these newline bytes before fanout. A body-only
+                // budget or compact-string-length estimate misses this case.
+                message_json["extension"] =
+                    serde_json::Value::String("\n".repeat(WBQ_MESSAGE_BATCH_MAX_BYTES / 8));
+            } else {
+                *body_md = "x".repeat(WBQ_MESSAGE_BATCH_MAX_BYTES / 4);
+            }
+            let cost = message_bundle_batch_cost(&op).1;
+            assert!(cost <= WBQ_MESSAGE_BATCH_MAX_BYTES);
+            assert!(cost * 2 > WBQ_MESSAGE_BATCH_MAX_BYTES);
+            let batch: Vec<_> = [op.clone(), op]
+                .into_iter()
+                .map(|op| WbqOpEnvelope {
+                    enqueued_at: Instant::now(),
+                    op: Box::new(op),
+                })
+                .collect();
+            assert_eq!(wbq_message_bundle_batch_end(&batch, 0), 1);
+            assert_eq!(wbq_message_bundle_batch_end(&batch, 1), 2);
+        }
+
+        let mut count = WbqMessageByteCount(usize::MAX - 1);
+        assert!(count.write(b"overflow").is_err());
+        assert_eq!(
+            count.0,
+            usize::MAX,
+            "size overflow cannot wrap into admission"
+        );
+    }
+
+    #[test]
+    fn wbq_drain_releases_publication_between_bounded_message_groups() {
+        if !isolated_coalescer_regression(
+            "tests::wbq_drain_releases_publication_between_bounded_message_groups",
+        ) {
+            return;
+        }
+
+        for oversized in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(tmp.path());
+            let project = "bounded-publication";
+            let archive = ensure_archive(&config, project).unwrap();
+            let count = if oversized { 3 } else { 35 };
+            let mut ops: Vec<_> = (1..=count)
+                .map(|id| backlog_test_message_op(&config, project, id))
+                .collect();
+            if oversized {
+                let WriteOp::MessageBundle {
+                    message_json,
+                    recipients,
+                    ..
+                } = &mut ops[1]
+                else {
+                    unreachable!();
+                };
+                *recipients = (0..70).map(|i| format!("Recipient{i}")).collect();
+                message_json["to"] = serde_json::json!(recipients);
+            }
+
+            let expected_boundaries = if oversized { vec![1, 2] } else { vec![16, 32] };
+            let observed = Arc::new(AtomicUsize::new(0));
+            let observed_hook = Arc::clone(&observed);
+            let observed_archive = archive.clone();
+            let reservation_config = config.clone();
+            WBQ_BETWEEN_GROUPS_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let index = observed_hook.fetch_add(1, Ordering::Relaxed);
+                    let expected = *expected_boundaries
+                        .get(index)
+                        .expect("unexpected extra window");
+                    assert_eq!(ARCHIVE_MUTATION_DEPTH.with(std::cell::Cell::get), 0);
+                    let threads = observed_archive.root.join("messages/threads");
+                    let canonical_count =
+                        list_message_files(&observed_archive.root.join("messages"))
+                            .unwrap()
+                            .into_iter()
+                            .filter(|path| !path.starts_with(&threads))
+                            .count();
+                    assert_eq!(
+                        canonical_count, expected,
+                        "the next window has not published"
+                    );
+
+                    // A different thread cannot borrow a nested guard. This
+                    // actual same-project reservation needs BOTH the global
+                    // fence and the project lock released between windows.
+                    let reservation = publication_test_reservation(
+                        200 + i64::try_from(index).unwrap(),
+                        "aabbccdd",
+                    );
+                    let op = WriteOp::FileReservation {
+                        project_slug: project.into(),
+                        config: reservation_config.clone(),
+                        reservations: vec![reservation.clone()],
+                    };
+                    let result = std::thread::spawn(move || write_op_sync_direct(&op))
+                        .join()
+                        .unwrap();
+                    assert!(matches!(result, DirectArchiveWrite::Written), "{result:?}");
+                    flush_async_commits();
+                    for path in [
+                        publication_test_paths(&observed_archive, &reservation).0,
+                        publication_test_paths(&observed_archive, &reservation).1,
+                    ] {
+                        let published: serde_json::Value =
+                            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                        assert_eq!(published, reservation);
+                    }
+                }));
+            });
+
+            let capacity = ops.len() + 1;
+            let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
+            let depth = Arc::new(AtomicU64::new(0));
+            let before = wbq_stats();
+            for op in &ops {
+                assert_eq!(
+                    wbq_enqueue_with_sender(&tx, &depth, op.clone()),
+                    WbqEnqueueResult::Enqueued,
+                );
+            }
+            tx.send(WbqMsg::Shutdown).unwrap();
+            let synced_before = archive_group_syncs();
+            wbq_drain_loop(
+                Arc::new(Mutex::new(Some(rx))),
+                Arc::clone(&depth),
+                capacity,
+                capacity,
+            );
+            WBQ_BETWEEN_GROUPS_TEST_HOOK.with(|slot| slot.borrow_mut().take());
+            let synced = archive_group_syncs() - synced_before;
+            assert_eq!(synced, if oversized { 78 } else { 105 });
+            assert_eq!(observed.load(Ordering::Relaxed), 2);
+            assert_eq!(depth.load(Ordering::Relaxed), 0);
+            let after = wbq_stats();
+            assert_eq!(
+                after.enqueued - before.enqueued,
+                u64::try_from(count).unwrap()
+            );
+            assert_eq!(
+                after.drained - before.drained,
+                u64::try_from(count).unwrap()
+            );
+            assert_eq!(after.errors, before.errors);
+            assert_eq!(after.unrecoverable_errors, before.unrecoverable_errors);
+            flush_async_commits();
+
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            for op in &ops {
+                let WriteOp::MessageBundle {
+                    message_json,
+                    body_md,
+                    sender,
+                    recipients,
+                    ..
+                } = op
+                else {
+                    unreachable!();
+                };
+                let paths = message_paths_for_bundle(&archive, message_json, sender, recipients)
+                    .unwrap()
+                    .0;
+                for path in [&paths.canonical, &paths.outbox]
+                    .into_iter()
+                    .chain(&paths.inbox)
+                {
+                    let (message, body) = read_message_file(path).unwrap();
+                    assert_eq!(&message, message_json);
+                    assert_eq!(body.trim(), body_md);
+                    let entry = tree
+                        .get_path(path.strip_prefix(&archive.repo_root).unwrap())
+                        .unwrap();
+                    assert_eq!(
+                        repo.find_blob(entry.id()).unwrap().content(),
+                        fs::read(path).unwrap()
+                    );
+                }
+            }
+            let digest =
+                fs::read_to_string(archive.root.join("messages/threads/ack-fast.md")).unwrap();
+            let mut previous = None;
+            for id in 1..=count {
+                let marker = format!("### ack-fast backlog {id}\n");
+                let offset = digest
+                    .find(&marker)
+                    .expect("every message reached its thread");
+                assert_eq!(digest.matches(&marker).count(), 1, "no duplicated message");
+                assert!(
+                    previous.is_none_or(|previous| previous < offset),
+                    "no reorder"
+                );
+                previous = Some(offset);
+            }
+            assert!(temp_files_under(&archive.root).is_empty());
+        }
     }
 
     #[test]
@@ -23837,14 +26787,22 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let op = backlog_test_message_op(&config, "journal-proj", 9);
-        let path = archive_backlog_journal_write(&op).expect("journal write");
+        let journal = archive_backlog_journal_write(&op, None).expect("journal write");
+        assert!(journal.durable);
+        let path = journal.path;
         assert!(path.exists());
-        assert!(path.starts_with(config.storage_root.join(".archive_backlog")));
+        assert!(
+            path.starts_with(
+                fs::canonicalize(&config.storage_root)
+                    .unwrap()
+                    .join(".archive_backlog")
+            )
+        );
         let bytes = std::fs::read(&path).unwrap();
         let parsed: PersistedWriteOp = serde_json::from_slice(&bytes).unwrap();
         assert!(matches!(parsed, PersistedWriteOp::MessageBundle { .. }));
         // RULE 1: resolve moves the journal into `resolved/` rather than deleting.
-        archive_backlog_journal_resolve(&path);
+        archive_backlog_journal_resolve(&path).unwrap();
         assert!(!path.exists(), "original journal path no longer present");
         let resolved = path
             .parent()
@@ -23855,6 +26813,990 @@ mod tests {
             resolved.exists(),
             "journal preserved under resolved/ (not deleted)"
         );
+    }
+
+    #[cfg(unix)]
+    struct ArchiveBacklogDirectorySyncTestGuard;
+
+    #[cfg(unix)]
+    impl Drop for ArchiveBacklogDirectorySyncTestGuard {
+        fn drop(&mut self) {
+            ARCHIVE_BACKLOG_DIRECTORY_SYNC_TEST_HOOK.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    fn install_archive_backlog_directory_sync_test_hook(
+        hook: impl FnMut(&Path) -> std::io::Result<()> + 'static,
+    ) -> ArchiveBacklogDirectorySyncTestGuard {
+        ARCHIVE_BACKLOG_DIRECTORY_SYNC_TEST_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(hook));
+        });
+        ArchiveBacklogDirectorySyncTestGuard
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_backlog_journal_syncs_full_ancestry_with_concurrent_creator() {
+        // A relative storage root through a symlink must still sync the real
+        // directory chain all the way to the filesystem root.
+        let tmp = tempfile::Builder::new()
+            .prefix("backlog-ancestry-")
+            .tempdir_in(".")
+            .unwrap();
+        let physical = fs::canonicalize(tmp.path()).unwrap().join("physical");
+        fs::create_dir(&physical).unwrap();
+        std::os::unix::fs::symlink(&physical, tmp.path().join("alias")).unwrap();
+        let relative =
+            PathBuf::from(tmp.path().file_name().unwrap()).join("alias/new/parent/storage");
+        assert!(relative.is_relative());
+        let config = test_config(&relative);
+        let backlog = Arc::new(ArchiveRetryBacklog::new());
+        let (created_tx, created_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let first_backlog = Arc::clone(&backlog);
+        let first_op = backlog_test_message_op(&config, "directory-race", 1);
+        let first = std::thread::spawn(move || {
+            let mut first_sync = true;
+            let _hook = install_archive_backlog_directory_sync_test_hook(move |_| {
+                if first_sync {
+                    first_sync = false;
+                    created_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("resume the pusher that created the directory tree");
+                }
+                Ok(())
+            });
+            first_backlog.push(first_op, 8)
+        });
+        created_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first pusher must create directories and publish before directory sync");
+
+        // The second pusher sees an existing tree whose parent links have not
+        // been synced by its creator. It must establish durability itself,
+        // rather than stop at whichever ancestor happens to exist already.
+        let canonical = fs::canonicalize(archive_backlog_journal_dir_for(&config)).unwrap();
+        let expected: Vec<PathBuf> = canonical.ancestors().map(Path::to_path_buf).collect();
+        assert_eq!(expected.last().unwrap(), Path::new("/"));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_syncs = Arc::clone(&observed);
+        let hook = install_archive_backlog_directory_sync_test_hook(move |directory| {
+            observed_syncs.lock().unwrap().push(directory.to_path_buf());
+            Ok(())
+        });
+        let second = backlog.push(backlog_test_message_op(&config, "directory-race", 2), 8);
+        drop(hook);
+        assert_eq!(second, ArchiveBacklogPush::Queued);
+        assert_eq!(*observed.lock().unwrap(), expected);
+        assert!(!first.is_finished(), "the original creator is still paused");
+        resume_tx.send(()).unwrap();
+        assert_eq!(first.join().unwrap(), ArchiveBacklogPush::Queued);
+        assert_eq!(backlog.backlog_state().0, 2);
+        assert_eq!(backlog.reserved.load(Ordering::Relaxed), 0);
+        assert_eq!(backlog.ephemeral_total.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_backlog_directory_sync_failure_preserves_and_retires_candidate() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_directory_sync_failure_preserves_and_retires_candidate",
+        ) {
+            return;
+        }
+        for fail_at_leaf in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let root = fs::canonicalize(tmp.path()).unwrap().join("new/storage");
+            let mut config = test_config(&root);
+            config.notifications_enabled = true;
+            config.notifications_signals_dir = root.join("signals");
+            let fail_at = if fail_at_leaf {
+                root.join(".archive_backlog")
+            } else {
+                root.parent().unwrap().to_path_buf()
+            };
+            let op = WriteOp::NotificationSignal {
+                config: config.clone(),
+                project_slug: "directory-failure".to_string(),
+                agent_name: "RetainedSignal".to_string(),
+                metadata: None,
+            };
+            let expected = serde_json::to_vec(&PersistedWriteOp::from_op(&op)).unwrap();
+            let hook = install_archive_backlog_directory_sync_test_hook(move |directory| {
+                if directory == fail_at {
+                    return Err(std::io::Error::other("injected directory sync failure"));
+                }
+                Ok(())
+            });
+            let backlog = ArchiveRetryBacklog::new();
+            assert_eq!(backlog.push(op, 8), ArchiveBacklogPush::QueuedEphemeral);
+            drop(hook);
+            assert_eq!(backlog.backlog_state().0, 1);
+            assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 1);
+            assert_eq!(backlog.ephemeral_total.load(Ordering::Relaxed), 1);
+            assert_eq!(backlog.reserved.load(Ordering::Relaxed), 0);
+            let path = backlog
+                .queue
+                .lock()
+                .unwrap()
+                .front()
+                .unwrap()
+                .journal_path
+                .clone()
+                .expect("a complete candidate must remain tracked after directory sync failure");
+            assert_eq!(path.parent().unwrap(), root.join(".archive_backlog"));
+            assert_eq!(fs::read(&path).unwrap(), expected);
+            assert!(!root.join(".archive_backlog/failed").exists());
+
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::Materialized
+            ));
+            assert_eq!(backlog.backlog_state().0, 0);
+            assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+            assert!(
+                config
+                    .notifications_signals_dir
+                    .join("projects/directory-failure/agents/RetainedSignal.signal")
+                    .is_file()
+            );
+            assert!(
+                !path.exists(),
+                "materialization must retire the tracked candidate"
+            );
+            let resolved = path
+                .parent()
+                .unwrap()
+                .join("resolved")
+                .join(path.file_name().unwrap());
+            assert_eq!(fs::read(resolved).unwrap(), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_backlog_recovers_candidate_after_directory_sync_failure() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_recovers_candidate_after_directory_sync_failure",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let op = WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "directory-recovery".to_string(),
+            agent_name: "RecoveredSignal".to_string(),
+            metadata: None,
+        };
+        let hook = install_archive_backlog_directory_sync_test_hook(|_| {
+            Err(std::io::Error::other("injected directory sync failure"))
+        });
+        let abandoned = ArchiveRetryBacklog::new();
+        assert_eq!(abandoned.push(op, 8), ArchiveBacklogPush::QueuedEphemeral);
+        drop(hook);
+        let path = abandoned
+            .queue
+            .lock()
+            .unwrap()
+            .front()
+            .unwrap()
+            .journal_path
+            .clone()
+            .unwrap();
+        let candidate = fs::read(&path).unwrap();
+        drop(abandoned);
+
+        // Simulate loss of the original in-memory queue. The real recovery
+        // scanner and background writer must still find and retire the valid
+        // candidate; a failed durability receipt must not quarantine it away.
+        archive_backlog_recover(&config);
+        assert!(archive_backlog_flush_blocking(Duration::from_secs(10)));
+        assert!(
+            config
+                .notifications_signals_dir
+                .join("projects/directory-recovery/agents/RecoveredSignal.signal")
+                .is_file()
+        );
+        // The worker pops the materialized entry immediately before moving
+        // its journal. Wait for that real retirement, not just queue depth.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "recovery must retire its journal"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let resolved = path
+            .parent()
+            .unwrap()
+            .join("resolved")
+            .join(path.file_name().unwrap());
+        assert_eq!(fs::read(resolved).unwrap(), candidate);
+    }
+
+    #[test]
+    fn archive_backlog_recovery_keeps_large_payloads_lazy_across_retry_and_retirement() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_recovery_keeps_large_payloads_lazy_across_retry_and_retirement",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_include_metadata = true;
+        config.notifications_debounce_ms = 0;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        fs::write(&config.notifications_signals_dir, b"signal write blocker").unwrap();
+        let mut journals = Vec::new();
+        for id in 0..24 {
+            let op = WriteOp::NotificationSignal {
+                config: config.clone(),
+                project_slug: "lazy-recovery".into(),
+                agent_name: format!("Agent{id}"),
+                metadata: Some(NotificationMessage {
+                    id: Some(id),
+                    from: None,
+                    subject: Some("large historical payload ".repeat(5_000)),
+                    importance: None,
+                }),
+            };
+            journals.push(archive_backlog_journal_write(&op, None).unwrap().path);
+        }
+        journals.sort();
+        let backlog = ArchiveRetryBacklog::new();
+        assert_eq!(backlog.push_recovered(&config, journals.clone()), 24);
+        {
+            let queue = backlog.queue.lock().unwrap();
+            let ArchiveBacklogPayload::Journal(shared_config) = &queue[0].payload else {
+                panic!("recovery must not decode a journal during admission");
+            };
+            for (entry, path) in queue.iter().zip(&journals) {
+                let ArchiveBacklogPayload::Journal(config) = &entry.payload else {
+                    panic!("historical payloads must remain on disk");
+                };
+                assert!(Arc::ptr_eq(config, shared_config));
+                assert_eq!(entry.journal_path.as_ref(), Some(path));
+            }
+        }
+        assert_eq!(backlog.push_recovered(&config, journals.clone()), 0);
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::RetryLater(1)
+        ));
+        let decoded = {
+            let queue = backlog.queue.lock().unwrap();
+            let ArchiveBacklogPayload::Ready(op) = &queue[0].payload else {
+                panic!("only the front journal should be decoded");
+            };
+            assert!(
+                queue
+                    .iter()
+                    .skip(1)
+                    .all(|entry| matches!(&entry.payload, ArchiveBacklogPayload::Journal(_)))
+            );
+            Arc::downgrade(op)
+        };
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::RetryLater(2)
+        ));
+        {
+            let queue = backlog.queue.lock().unwrap();
+            let ArchiveBacklogPayload::Ready(op) = &queue[0].payload else {
+                panic!("retry must retain the decoded front");
+            };
+            assert!(Arc::ptr_eq(&decoded.upgrade().unwrap(), op));
+        }
+
+        fs::rename(
+            &config.notifications_signals_dir,
+            tmp.path().join("signal-blocker-preserved"),
+        )
+        .unwrap();
+        let journal_dir = journals[0].parent().unwrap();
+        fs::write(journal_dir.join("resolved"), b"retirement blocker").unwrap();
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::RetirementDeferred
+        ));
+        assert!(
+            decoded.upgrade().is_none(),
+            "retirement must release the body"
+        );
+        {
+            let queue = backlog.queue.lock().unwrap();
+            assert!(matches!(
+                queue.back().unwrap().payload,
+                ArchiveBacklogPayload::Released
+            ));
+            assert!(
+                queue
+                    .iter()
+                    .take(23)
+                    .all(|entry| matches!(&entry.payload, ArchiveBacklogPayload::Journal(_)))
+            );
+        }
+        assert_eq!(backlog.backlog_state().0, 24);
+        assert_eq!(backlog.depth.load(Ordering::Relaxed), 24);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 0);
+        assert_eq!(backlog.owned_journals.lock().unwrap().len(), 24);
+        assert_eq!(backlog.push_recovered(&config, journals.clone()), 0);
+
+        // A retired mutation must never overwrite a later value when its move
+        // finally succeeds, even after rotation behind many unhydrated entries.
+        let first_signal = config
+            .notifications_signals_dir
+            .join("projects/lazy-recovery/agents/Agent0.signal");
+        fs::write(&first_signal, b"newer archive state").unwrap();
+        fs::rename(
+            journal_dir.join("resolved"),
+            journal_dir.join("resolved-blocker-preserved"),
+        )
+        .unwrap();
+        for _ in 0..24 {
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::Materialized
+            ));
+        }
+        assert_eq!(fs::read(first_signal).unwrap(), b"newer archive state");
+        assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 24);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 24);
+        assert_eq!(backlog.backlog_state().0, 0);
+        assert!(backlog.owned_journals.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_backlog_recovery_preserves_mutable_fifo_and_alias_ownership() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_recovery_preserves_mutable_fifo_and_alias_ownership",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp.path().join("storage"));
+        config.notifications_enabled = true;
+        config.notifications_include_metadata = true;
+        config.notifications_debounce_ms = 0;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let signal_op = |id| WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "recovery-fifo".into(),
+            agent_name: "OrderedSignal".into(),
+            metadata: Some(NotificationMessage {
+                id: Some(id),
+                from: None,
+                subject: None,
+                importance: None,
+            }),
+        };
+        let mut journals: Vec<_> = (1..=3)
+            .map(|id| {
+                archive_backlog_journal_write(&signal_op(id), None)
+                    .unwrap()
+                    .path
+            })
+            .collect();
+        journals.sort();
+        let backlog = ArchiveRetryBacklog::new();
+        assert_eq!(backlog.push_recovered(&config, journals.clone()), 3);
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&config.storage_root, &alias).unwrap();
+        let mut aliased = config.clone();
+        aliased.storage_root = alias;
+        let aliased_journals: Vec<_> = journals
+            .iter()
+            .map(|path| archive_backlog_journal_dir_for(&aliased).join(path.file_name().unwrap()))
+            .collect();
+        assert_eq!(
+            backlog.push_recovered(&aliased, aliased_journals.clone()),
+            0
+        );
+        assert_eq!(backlog.push(signal_op(4), 8), ArchiveBacklogPush::Queued);
+        let signal = config
+            .notifications_signals_dir
+            .join("projects/recovery-fifo/agents/OrderedSignal.signal");
+        for expected in 1..=4 {
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::Materialized
+            ));
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&signal).unwrap()).unwrap();
+            assert_eq!(value["message"]["id"], expected);
+            assert_eq!(backlog.push_recovered(&config, journals.clone()), 0);
+            assert_eq!(
+                backlog.push_recovered(&aliased, aliased_journals.clone()),
+                0
+            );
+        }
+        assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 4);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 4);
+        assert_eq!(backlog.depth.load(Ordering::Relaxed), 0);
+        assert!(backlog.owned_journals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn archive_backlog_recovery_corrupt_front_keeps_evidence_and_allows_progress() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_recovery_corrupt_front_keeps_evidence_and_allows_progress",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_debounce_ms = 0;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let healthy_op = WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "corrupt-recovery".into(),
+            agent_name: "HealthySignal".into(),
+            metadata: None,
+        };
+        let healthy = archive_backlog_journal_write(&healthy_op, None)
+            .unwrap()
+            .path;
+        let corrupt = healthy.parent().unwrap().join("000-corrupt.json");
+        let bytes = b"{invalid private body must not enter diagnostics";
+        fs::write(&corrupt, bytes).unwrap();
+        let destination = corrupt.with_extension("corrupt");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("evidence"), b"retirement blocker").unwrap();
+        let journals = vec![corrupt.clone(), healthy.clone()];
+        let backlog = ArchiveRetryBacklog::new();
+        assert_eq!(backlog.push_recovered(&config, journals.clone()), 2);
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::RetirementDeferred
+        ));
+        assert!(backlog.owns_journal(&corrupt));
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 0);
+        assert_eq!(backlog.backlog_state().0, 2);
+        let ledger_path = config.storage_root.join("doctor/backlog_dead_letter.jsonl");
+        let ledger = fs::read(&ledger_path).unwrap();
+        let record: serde_json::Value = serde_json::from_slice(&ledger).unwrap();
+        assert_eq!(record["attempts"], 1);
+        assert!(record["op"].is_null());
+        assert_eq!(record["journal_path"], corrupt.display().to_string());
+        assert!(!record["error"].as_str().unwrap().contains("private body"));
+        assert_eq!(backlog.push_recovered(&config, journals.clone()), 0);
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::Materialized
+        ));
+        assert!(
+            config
+                .notifications_signals_dir
+                .join("projects/corrupt-recovery/agents/HealthySignal.signal")
+                .is_file()
+        );
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::RetryLater(_)
+        ));
+        assert_eq!(fs::read(&ledger_path).unwrap(), ledger);
+        assert_eq!(fs::read(&corrupt).unwrap(), bytes);
+        fs::rename(
+            &destination,
+            destination.with_extension("blocker-preserved"),
+        )
+        .unwrap();
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::DeadLettered
+        ));
+        assert_eq!(fs::read(&destination).unwrap(), bytes);
+        assert_eq!(fs::read(&ledger_path).unwrap(), ledger);
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.depth.load(Ordering::Relaxed), 0);
+        assert!(backlog.owned_journals.lock().unwrap().is_empty());
+        assert_eq!(
+            ArchiveRetryBacklog::new().push_recovered(&config, journals),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_backlog_recovery_rejects_late_symlinks_with_bounded_read_retries() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_recovery_rejects_late_symlinks_with_bounded_read_retries",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_debounce_ms = 0;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let signal_op = |agent: &str| WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "unreadable-recovery".into(),
+            agent_name: agent.into(),
+            metadata: None,
+        };
+        let first = archive_backlog_journal_write(&signal_op("Original"), None)
+            .unwrap()
+            .path;
+        let second = archive_backlog_journal_write(&signal_op("Healthy"), None)
+            .unwrap()
+            .path;
+        let journals = vec![first.clone(), second];
+        let backlog = ArchiveRetryBacklog::new();
+        assert_eq!(backlog.push_recovered(&config, journals.clone()), 2);
+        let preserved = first.with_extension("preserved");
+        fs::rename(&first, &preserved).unwrap();
+        let outside = tmp.path().join("outside.json");
+        let outside_bytes =
+            serde_json::to_vec(&PersistedWriteOp::from_op(&signal_op("Untrusted"))).unwrap();
+        fs::write(&outside, &outside_bytes).unwrap();
+        std::os::unix::fs::symlink(&outside, &first).unwrap();
+        for attempt in 1..ARCHIVE_BACKLOG_MAX_ATTEMPTS {
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::RetryLater(actual) if actual == attempt
+            ));
+            assert!(backlog.owns_journal(&first));
+            assert_eq!(backlog.push_recovered(&config, journals.clone()), 0);
+        }
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::DeadLettered
+        ));
+        assert!(!backlog.owns_journal(&first));
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::Materialized
+        ));
+        let signal_dir = config
+            .notifications_signals_dir
+            .join("projects/unreadable-recovery/agents");
+        assert!(!signal_dir.join("Untrusted.signal").exists());
+        assert!(!signal_dir.join("Original.signal").exists());
+        assert!(signal_dir.join("Healthy.signal").is_file());
+        assert_eq!(fs::read(&outside).unwrap(), outside_bytes);
+        assert!(preserved.is_file());
+        assert_eq!(
+            fs::read_link(
+                first
+                    .parent()
+                    .unwrap()
+                    .join("failed")
+                    .join(first.file_name().unwrap())
+            )
+            .unwrap(),
+            outside
+        );
+        let ledger: serde_json::Value = serde_json::from_slice(
+            &fs::read(config.storage_root.join("doctor/backlog_dead_letter.jsonl")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ledger["attempts"], ARCHIVE_BACKLOG_MAX_ATTEMPTS);
+        assert!(ledger["op"].is_null());
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.depth.load(Ordering::Relaxed), 0);
+        assert!(backlog.owned_journals.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_backlog_recovery_cannot_duplicate_a_live_publisher() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_recovery_cannot_duplicate_a_live_publisher",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp.path().join("storage"));
+        config.notifications_enabled = true;
+        config.notifications_debounce_ms = 0;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let op = WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "owned-journal".to_string(),
+            agent_name: "OwnedSignal".to_string(),
+            metadata: None,
+        };
+        let backlog = &*ARCHIVE_BACKLOG;
+        let (published_tx, published_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let publisher = std::thread::spawn(move || {
+            let mut paused = false;
+            let _hook = install_archive_backlog_directory_sync_test_hook(move |_| {
+                if !paused {
+                    paused = true;
+                    published_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("release live journal publisher");
+                }
+                Ok(())
+            });
+            backlog.push(op, 8)
+        });
+        published_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("journal must be visible before the publisher queues its op");
+        assert_eq!(backlog.reserved.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.backlog_state().0, 0);
+        let journal = backlog
+            .owned_journals
+            .lock()
+            .unwrap()
+            .first()
+            .unwrap()
+            .clone();
+        // The actual recovery entrypoint must ignore both the in-flight
+        // publisher and an alias spelling of its configured directory.
+        archive_backlog_recover(&config);
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&config.storage_root, &alias).unwrap();
+        let mut aliased = config.clone();
+        aliased.storage_root = alias;
+        archive_backlog_recover(&aliased);
+        assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 0);
+        assert_eq!(backlog.backlog_state().0, 0);
+        assert_eq!(backlog.owned_journals.lock().unwrap().len(), 1);
+        assert!(backlog.drain_handle.lock().unwrap().is_none());
+        resume_tx.send(()).unwrap();
+        assert_eq!(publisher.join().unwrap(), ArchiveBacklogPush::Queued);
+
+        archive_backlog_recover(&config);
+        archive_backlog_recover(&aliased);
+        assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.backlog_state().0, 1);
+        assert_eq!(backlog.owned_journals.lock().unwrap().len(), 1);
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::Materialized
+        ));
+        assert!(
+            config
+                .notifications_signals_dir
+                .join("projects/owned-journal/agents/OwnedSignal.signal")
+                .is_file()
+        );
+        assert!(backlog.owned_journals.lock().unwrap().is_empty());
+        // This scan observation predates retirement. Once the old owner
+        // releases its key, it still must not become a new queued mutation.
+        assert_eq!(backlog.push_recovered(&config, vec![journal]), 0);
+        assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.backlog_state().0, 0);
+        assert!(backlog.owned_journals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn archive_backlog_failed_retirement_keeps_ownership_without_reapplying() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_failed_retirement_keeps_ownership_without_reapplying",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_debounce_ms = 0;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let signal_op = |agent: &str| WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "retirement-retry".to_string(),
+            agent_name: agent.to_string(),
+            metadata: None,
+        };
+        let signal_path = |agent: &str| {
+            config
+                .notifications_signals_dir
+                .join(format!("projects/retirement-retry/agents/{agent}.signal"))
+        };
+        let backlog = ArchiveRetryBacklog::new();
+        assert_eq!(
+            backlog.push(signal_op("OldSignal"), 8),
+            ArchiveBacklogPush::Queued
+        );
+        let (journal, oldest) = {
+            let queue = backlog.queue.lock().unwrap();
+            let entry = queue.front().unwrap();
+            (entry.journal_path.clone().unwrap(), entry.first_enqueued_at)
+        };
+        let journal_bytes = fs::read(&journal).unwrap();
+        let dir = journal.parent().unwrap();
+        fs::write(dir.join("resolved"), b"retirement blocker").unwrap();
+        assert_eq!(
+            backlog.push(signal_op("HealthySignal"), 8),
+            ArchiveBacklogPush::Queued
+        );
+
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::RetirementDeferred
+        ));
+        assert!(signal_path("OldSignal").is_file());
+        assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
+        assert!(backlog.owns_journal(&journal));
+        assert_eq!(backlog.push_recovered(&config, vec![journal.clone()]), 0);
+        assert_eq!(backlog.push_recovered(&config, vec![journal.clone()]), 0);
+        assert_eq!(backlog.enqueued_total.load(Ordering::Relaxed), 2);
+        assert_eq!(backlog.backlog_state().0, 2);
+        let old_age = duration_as_micros_u64(oldest.elapsed());
+        assert!(backlog.backlog_state().1 >= old_age);
+
+        // Later archive state must survive every retirement retry. A retained
+        // entry no longer executes its original mutation after materialization.
+        fs::write(signal_path("OldSignal"), b"newer archive state").unwrap();
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::RetryLater(_)
+        ));
+        assert!(signal_path("HealthySignal").is_file());
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::RetryLater(_)
+        ));
+        assert_eq!(
+            fs::read(signal_path("OldSignal")).unwrap(),
+            b"newer archive state"
+        );
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 0);
+        assert_eq!(backlog.owned_journals.lock().unwrap().len(), 2);
+
+        // Preserve the obstruction as evidence, then let both retained
+        // candidates finish normal retirement without re-running either op.
+        fs::rename(dir.join("resolved"), dir.join("resolved-blocker-preserved")).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::Materialized
+            ));
+        }
+        assert_eq!(
+            fs::read(signal_path("OldSignal")).unwrap(),
+            b"newer archive state"
+        );
+        assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 2);
+        assert_eq!(backlog.backlog_state().0, 0);
+        assert!(backlog.owned_journals.lock().unwrap().is_empty());
+        assert_eq!(
+            fs::read(dir.join("resolved").join(journal.file_name().unwrap())).unwrap(),
+            journal_bytes
+        );
+
+        // A journal that is already absent needs no destination directory.
+        fs::write(dir.join("blocked-destination"), b"preserved").unwrap();
+        assert!(
+            archive_backlog_quarantine_file(&dir.join("absent.json"), "blocked-destination")
+                .is_ok()
+        );
+        assert_eq!(
+            fs::read(dir.join("blocked-destination")).unwrap(),
+            b"preserved"
+        );
+    }
+
+    #[test]
+    fn archive_backlog_failed_dead_letter_retirement_does_not_repeat_the_ledger() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_failed_dead_letter_retirement_does_not_repeat_the_ledger",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_debounce_ms = 0;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        fs::write(&config.notifications_signals_dir, b"signal write blocker").unwrap();
+        let op = WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "dead-letter-retirement".to_string(),
+            agent_name: "FailedSignal".to_string(),
+            metadata: None,
+        };
+        let backlog = ArchiveRetryBacklog::new();
+        assert_eq!(backlog.push(op, 8), ArchiveBacklogPush::Queued);
+        let journal = backlog
+            .queue
+            .lock()
+            .unwrap()
+            .front()
+            .unwrap()
+            .journal_path
+            .clone()
+            .unwrap();
+        let dir = journal.parent().unwrap();
+        fs::write(dir.join("failed"), b"dead-letter retirement blocker").unwrap();
+        for _ in 0..ARCHIVE_BACKLOG_MAX_ATTEMPTS {
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::RetryLater(_)
+            ));
+        }
+        let ledger_path = config.storage_root.join("doctor/backlog_dead_letter.jsonl");
+        let ledger = fs::read(&ledger_path).unwrap();
+        assert_eq!(
+            String::from_utf8(ledger.clone()).unwrap().lines().count(),
+            1
+        );
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 0);
+        assert!(backlog.owns_journal(&journal));
+        fs::rename(
+            &config.notifications_signals_dir,
+            tmp.path().join("signal-blocker-preserved"),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                backlog.drain_step(),
+                ArchiveBacklogDrainStep::RetryLater(_)
+            ));
+            assert_eq!(fs::read(&ledger_path).unwrap(), ledger);
+            assert!(!config.notifications_signals_dir.exists());
+        }
+        fs::rename(dir.join("failed"), dir.join("failed-blocker-preserved")).unwrap();
+        assert!(matches!(
+            backlog.drain_step(),
+            ArchiveBacklogDrainStep::DeadLettered
+        ));
+        assert_eq!(fs::read(&ledger_path).unwrap(), ledger);
+        assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 1);
+        assert_eq!(backlog.backlog_state().0, 0);
+        assert!(!config.notifications_signals_dir.exists());
+        assert!(backlog.owned_journals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn archive_backlog_retirement_preserves_occupied_evidence_for_every_outcome() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_retirement_preserves_occupied_evidence_for_every_outcome",
+        ) {
+            return;
+        }
+        for retirement in [
+            ArchiveBacklogRetirement::Resolved,
+            ArchiveBacklogRetirement::Failed,
+            ArchiveBacklogRetirement::Corrupt,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let mut config = test_config(tmp.path());
+            config.notifications_enabled = true;
+            config.notifications_debounce_ms = 0;
+            config.notifications_signals_dir = tmp.path().join("signals");
+            let op = WriteOp::NotificationSignal {
+                config: config.clone(),
+                project_slug: "occupied-retirement".into(),
+                agent_name: "PreservedSignal".into(),
+                metadata: None,
+            };
+            let journal_dir = archive_backlog_journal_dir_for(&config);
+            fs::create_dir_all(&journal_dir).unwrap();
+            let journal = journal_dir.join("occupied.json");
+            let journal_bytes = if matches!(retirement, ArchiveBacklogRetirement::Corrupt) {
+                b"{invalid historical journal".to_vec()
+            } else {
+                serde_json::to_vec(&PersistedWriteOp::from_op(&op)).unwrap()
+            };
+            fs::write(&journal, &journal_bytes).unwrap();
+            let destination = match retirement {
+                ArchiveBacklogRetirement::Resolved => journal_dir.join("resolved/occupied.json"),
+                ArchiveBacklogRetirement::Failed => journal_dir.join("failed/occupied.json"),
+                ArchiveBacklogRetirement::Corrupt => journal.with_extension("corrupt"),
+            };
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            let existing_evidence = b"previously quarantined evidence";
+            fs::write(&destination, existing_evidence).unwrap();
+            let attempts = if matches!(retirement, ArchiveBacklogRetirement::Failed) {
+                fs::write(&config.notifications_signals_dir, b"write blocker").unwrap();
+                ARCHIVE_BACKLOG_MAX_ATTEMPTS
+            } else {
+                1
+            };
+            let backlog = ArchiveRetryBacklog::new();
+            assert_eq!(backlog.push_recovered(&config, vec![journal.clone()]), 1);
+            for _ in 0..attempts {
+                assert!(matches!(
+                    backlog.drain_step(),
+                    ArchiveBacklogDrainStep::RetryLater(_)
+                ));
+            }
+            assert!(matches!(
+                backlog.queue.lock().unwrap().front().unwrap().payload,
+                ArchiveBacklogPayload::Released
+            ));
+            assert_eq!(backlog.backlog_state().0, 1);
+            assert!(backlog.owns_journal(&journal));
+            assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 0);
+            assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 0);
+            let ledger_path = config.storage_root.join("doctor/backlog_dead_letter.jsonl");
+            let ledger = if matches!(retirement, ArchiveBacklogRetirement::Resolved) {
+                assert!(!ledger_path.exists());
+                None
+            } else {
+                let bytes = fs::read(&ledger_path).unwrap();
+                assert_eq!(String::from_utf8_lossy(&bytes).lines().count(), 1);
+                Some(bytes)
+            };
+            if matches!(retirement, ArchiveBacklogRetirement::Failed) {
+                fs::rename(
+                    &config.notifications_signals_dir,
+                    tmp.path().join("write-blocker-preserved"),
+                )
+                .unwrap();
+            }
+            let signal = config
+                .notifications_signals_dir
+                .join("projects/occupied-retirement/agents/PreservedSignal.signal");
+            fs::create_dir_all(signal.parent().unwrap()).unwrap();
+            fs::write(&signal, b"newer archive state").unwrap();
+            for _ in 0..2 {
+                assert!(matches!(
+                    backlog.drain_step(),
+                    ArchiveBacklogDrainStep::RetryLater(_)
+                ));
+                assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
+                assert_eq!(fs::read(&destination).unwrap(), existing_evidence);
+                assert_eq!(fs::read(&signal).unwrap(), b"newer archive state");
+                assert_eq!(fs::read(&ledger_path).ok(), ledger);
+                assert!(backlog.owns_journal(&journal));
+                assert_eq!(backlog.push_recovered(&config, vec![journal.clone()]), 0);
+            }
+
+            let preserved_evidence = destination.with_extension("evidence-preserved");
+            fs::rename(&destination, &preserved_evidence).unwrap();
+            let outcome = backlog.drain_step();
+            match retirement {
+                ArchiveBacklogRetirement::Resolved => {
+                    assert!(matches!(outcome, ArchiveBacklogDrainStep::Materialized));
+                    assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 1);
+                    assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 0);
+                }
+                ArchiveBacklogRetirement::Failed | ArchiveBacklogRetirement::Corrupt => {
+                    assert!(matches!(outcome, ArchiveBacklogDrainStep::DeadLettered));
+                    assert_eq!(backlog.drained_total.load(Ordering::Relaxed), 0);
+                    assert_eq!(backlog.dead_lettered_total.load(Ordering::Relaxed), 1);
+                }
+            }
+            assert!(!journal.exists());
+            assert_eq!(fs::read(&destination).unwrap(), journal_bytes);
+            assert_eq!(fs::read(preserved_evidence).unwrap(), existing_evidence);
+            assert_eq!(fs::read(signal).unwrap(), b"newer archive state");
+            assert_eq!(fs::read(&ledger_path).ok(), ledger);
+            assert_eq!(backlog.depth.load(Ordering::Relaxed), 0);
+            assert!(backlog.owned_journals.lock().unwrap().is_empty());
+        }
     }
 
     #[test]
@@ -24295,7 +28237,9 @@ mod tests {
 
         // Simulate the crash gap: journal exists, archive bundle does not.
         let op = backlog_test_message_op(&config, project_slug, 4242);
-        let journal_path = archive_backlog_journal_write(&op).expect("journal write");
+        let journal = archive_backlog_journal_write(&op, None).expect("journal write");
+        assert!(journal.durable);
+        let journal_path = journal.path;
         assert!(journal_path.exists(), "journaled op present pre-recovery");
 
         // Restart path replays and drains.
@@ -24430,9 +28374,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         let op = backlog_test_message_op(&config, "resolved-proj", 11);
-        let journal_path = archive_backlog_journal_write(&op).expect("journal write");
+        let journal = archive_backlog_journal_write(&op, None).expect("journal write");
+        assert!(journal.durable);
+        let journal_path = journal.path;
 
-        archive_backlog_journal_resolve(&journal_path);
+        archive_backlog_journal_resolve(&journal_path).unwrap();
         assert!(
             !journal_path.exists(),
             "moved out of the top-level journal dir"
@@ -24465,6 +28411,54 @@ mod tests {
             "recover did not resurrect the resolved journal into the active dir"
         );
         assert!(resolved.exists(), "resolved entry untouched by recover");
+    }
+
+    #[test]
+    fn archive_lag_nonblocking_sample_names_real_held_queue_mutexes() {
+        if !isolated_coalescer_regression(
+            "tests::archive_lag_nonblocking_sample_names_real_held_queue_mutexes",
+        ) {
+            return;
+        }
+        let coalescer = get_commit_coalescer();
+        let root = TempDir::new().unwrap();
+        let rq = coalescer.get_or_create_repo(&normalize_repo_root_key(root.path()));
+        assert!(try_archive_lag_snapshot().is_ok());
+
+        // These are the actual global queues used by production sampling,
+        // not independent fixture mutexes. A blocking regression deadlocks
+        // against this same-thread holder and is terminated by nextest.
+        let backlog = ARCHIVE_BACKLOG.queue.lock().unwrap();
+        assert_eq!(
+            try_archive_lag_snapshot().unwrap_err().unavailable_lock,
+            "archive_backlog.queue"
+        );
+        drop(backlog);
+        let repos = coalescer.repos.lock().unwrap();
+        assert_eq!(
+            try_archive_lag_snapshot().unwrap_err().unavailable_lock,
+            "commit_coalescer.repos"
+        );
+        drop(repos);
+        let queue = rq.queue.lock().unwrap();
+        assert_eq!(
+            try_archive_lag_snapshot().unwrap_err().unavailable_lock,
+            "commit_coalescer.queue"
+        );
+        drop(queue);
+        let spill = rq.spill.lock().unwrap();
+        assert_eq!(
+            try_archive_lag_snapshot().unwrap_err().unavailable_lock,
+            "commit_coalescer.spill"
+        );
+        drop(spill);
+        let progress = rq.progress.lock().unwrap();
+        assert_eq!(
+            try_archive_lag_snapshot().unwrap_err().unavailable_lock,
+            "commit_coalescer.progress"
+        );
+        drop(progress);
+        assert_eq!(try_archive_lag_snapshot().unwrap(), archive_lag_snapshot());
     }
 
     #[test]
@@ -24513,6 +28507,23 @@ mod tests {
                 repo.head().is_err(),
                 "the blocked request must not be committed yet"
             );
+
+            // An unrelated busy backlog must not hide this independently
+            // observable in-flight commit. The sample remains incomplete,
+            // but its confirmed coalescer age/progress bounds must survive.
+            let backlog = ARCHIVE_BACKLOG.queue.lock().unwrap();
+            let unavailable = try_archive_lag_snapshot().unwrap_err();
+            assert_eq!(unavailable.unavailable_lock, "archive_backlog.queue");
+            let lower_bound = unavailable.lower_bound;
+            assert_eq!(lower_bound.coalescer_pending, 1);
+            assert!(lower_bound.coalescer_oldest_age_us >= stuck.coalescer_oldest_age_us);
+            assert!(lower_bound.coalescer_since_progress_us >= stuck.coalescer_since_progress_us);
+            assert!(lower_bound.oldest_unmaterialized_us >= lower_bound.coalescer_oldest_age_us);
+            assert!(
+                repo.head().is_err(),
+                "sampling cannot publish the blocked commit"
+            );
+            drop(backlog);
 
             drop(fence);
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -24618,6 +28629,174 @@ mod tests {
     }
 
     #[test]
+    fn coalescer_worker_survives_commit_panic_and_recovers_queue_and_spill() {
+        if !isolated_coalescer_regression(
+            "tests::coalescer_worker_survives_commit_panic_and_recovers_queue_and_spill",
+        ) {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let failing_root = tmp.path().join("panicking");
+        let healthy_root = tmp.path().join("healthy");
+        let failing_repo = Repository::init(&failing_root).unwrap();
+        let healthy_repo = Repository::init(&healthy_root).unwrap();
+        let failing = Arc::new(RepoQueue::default());
+        let healthy = Arc::new(RepoQueue::default());
+        for name in ["queued.txt", "spill-a.txt", "spill-b.txt"] {
+            fs::write(failing_root.join(name), format!("retained {name}\n")).unwrap();
+            let request = coalescer_group_test_request(name.to_string(), vec![name.to_string()]);
+            if name == "queued.txt" {
+                coalescer_requeue_requests(&failing, vec![request]);
+            } else {
+                CommitCoalescer::spill_to_repo(&failing, request);
+            }
+        }
+        fs::write(
+            healthy_root.join("healthy.txt"),
+            b"independent repository\n",
+        )
+        .unwrap();
+        coalescer_requeue_requests(
+            &healthy,
+            vec![coalescer_group_test_request(
+                "healthy".to_string(),
+                vec!["healthy.txt".to_string()],
+            )],
+        );
+        // The only worker must hit the panic before it can service its peer.
+        healthy.last_serviced_us.store(1, Ordering::Relaxed);
+        let repos = Arc::new(Mutex::new(HashMap::from([
+            (failing_root.clone(), Arc::clone(&failing)),
+            (healthy_root, Arc::clone(&healthy)),
+        ])));
+        let work_cv = Arc::new((Mutex::new(1), std::sync::Condvar::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let pending = Arc::new(AtomicU64::new(4));
+        let stats = Arc::new(Mutex::new(CommitQueueStats::default()));
+        let allow_recovery = Arc::new(AtomicBool::new(false));
+        let panic_count = Arc::new(AtomicU64::new(0));
+        let worker_cv = Arc::clone(&work_cv);
+        let worker_shutdown = Arc::clone(&shutdown);
+        let worker_pending = Arc::clone(&pending);
+        let worker_stats = Arc::clone(&stats);
+        let worker_allow_recovery = Arc::clone(&allow_recovery);
+        let worker_panic_count = Arc::clone(&panic_count);
+        let worker = std::thread::Builder::new()
+            .name("coalescer-panic-recovery-regression".to_string())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
+            .spawn(move || {
+                let _alive = CoalescerAliveGuard::new(&COMMIT_COALESCER_WORKERS_ALIVE);
+                // The hook belongs to this worker and this repository only.
+                // Keep failing until the test observes independent progress.
+                COALESCER_BEFORE_COMMIT_TEST_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move |repo_root| {
+                        if repo_root == failing_root
+                            && !worker_allow_recovery.load(Ordering::Acquire)
+                        {
+                            worker_panic_count.fetch_add(1, Ordering::Relaxed);
+                            panic!("injected repository commit panic"); // ubs:ignore -- Test-only fault injection exercises real worker unwind recovery.
+                        }
+                    }));
+                });
+                coalescer_pool_worker(
+                    repos,
+                    worker_cv,
+                    worker_shutdown,
+                    Arc::new(AtomicBool::new(true)),
+                    worker_stats,
+                    Arc::new(Mutex::new(VecDeque::new())),
+                    worker_pending,
+                    Duration::from_millis(10),
+                    1,
+                );
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (healthy.metrics.drained_total.load(Ordering::Relaxed) == 0
+            || failing.metrics.errors_total.load(Ordering::Relaxed) == 0
+            || healthy.processing.load(Ordering::Acquire))
+            && !worker.is_finished()
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let peer_progressed = healthy.metrics.drained_total.load(Ordering::Relaxed) == 1;
+        let pending_after_panic = pending.load(Ordering::Relaxed);
+        let alive_after_panic = COMMIT_COALESCER_WORKERS_ALIVE.load(Ordering::Relaxed);
+        let failed_repo_uncommitted = failing_repo.head().is_err();
+
+        // No enqueue, flush, or replacement worker: the restored work must
+        // retry itself after its ordinary per-repository backoff expires.
+        allow_recovery.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(35);
+        while (pending.load(Ordering::Relaxed) != 0
+            || failing.processing.load(Ordering::Acquire)
+            || healthy.processing.load(Ordering::Acquire))
+            && !worker.is_finished()
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let survived = !worker.is_finished();
+        {
+            let _guard = work_cv.0.lock().unwrap();
+            shutdown.store(true, Ordering::Release);
+            work_cv.1.notify_all();
+        }
+        let joined = worker.join();
+
+        assert!(
+            joined.is_ok(),
+            "a commit panic must not kill the pool worker"
+        );
+        assert!(survived, "the same worker must remain alive until shutdown");
+        assert!(
+            peer_progressed,
+            "a failing repository must not starve its peer"
+        );
+        assert!(failed_repo_uncommitted);
+        assert_eq!(
+            pending_after_panic, 3,
+            "all failed queue and spill work remains owed"
+        );
+        assert_eq!(
+            alive_after_panic, 1,
+            "recoverable panics must not reduce worker capacity"
+        );
+        assert_eq!(COMMIT_COALESCER_WORKERS_ALIVE.load(Ordering::Relaxed), 0);
+        assert_eq!(pending.load(Ordering::Relaxed), 0);
+        assert_eq!(failing.depth.load(Ordering::Relaxed), 0);
+        assert_eq!(failing.metrics.drained_total.load(Ordering::Relaxed), 3);
+        assert_eq!(failing.failure_streak.load(Ordering::Relaxed), 0);
+        let panics = panic_count.load(Ordering::Relaxed);
+        assert!(panics > 0, "the failure path must actually execute");
+        assert_eq!(failing.metrics.errors_total.load(Ordering::Relaxed), panics);
+        assert_eq!(
+            failing.metrics.retries_total.load(Ordering::Relaxed),
+            panics
+        );
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.batched, 4);
+        assert_eq!(stats.errors as u64, panics);
+        let tree = failing_repo.head().unwrap().peel_to_tree().unwrap();
+        for name in ["queued.txt", "spill-a.txt", "spill-b.txt"] {
+            let entry = tree.get_path(Path::new(name)).unwrap();
+            assert_eq!(
+                failing_repo.find_blob(entry.id()).unwrap().content(),
+                format!("retained {name}\n").as_bytes(),
+            );
+        }
+        let tree = healthy_repo.head().unwrap().peel_to_tree().unwrap();
+        let entry = tree.get_path(Path::new("healthy.txt")).unwrap();
+        assert_eq!(
+            healthy_repo.find_blob(entry.id()).unwrap().content(),
+            b"independent repository\n",
+        );
+    }
+
+    #[test]
     fn coalescer_failed_commit_retains_lag_and_recovers_without_enqueue() {
         if !isolated_coalescer_regression(
             "tests::coalescer_failed_commit_retains_lag_and_recovers_without_enqueue",
@@ -24709,6 +28888,57 @@ mod tests {
     }
 
     #[test]
+    fn coalescer_partial_sample_keeps_other_repositories_confirmed_progress() {
+        // Seed diagnostic ownership state without waking a worker. The real
+        // fenced Git regression above separately exercises in-flight commits.
+        let coalescer = CommitCoalescer::new(Duration::from_secs(3_600));
+        let root = TempDir::new().unwrap();
+        let first = coalescer.get_or_create_repo(&root.path().join("first"));
+        let second = coalescer.get_or_create_repo(&root.path().join("second"));
+        let oldest = Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .unwrap();
+        for rq in [&first, &second] {
+            rq.progress.lock().unwrap().inflight_oldest = Some(oldest);
+        }
+        let minimum_age = duration_as_micros_u64(Duration::from_secs(120));
+        // Exercise both iteration orders without depending on HashMap order:
+        // holding whichever repository is visited first must still sample the
+        // other one. All three actual ownership mutexes are checked in turn.
+        for rq in [&first, &second] {
+            let queue = rq.queue.lock().unwrap();
+            let (site, lag) = coalescer
+                .sample_lag_state(ArchiveLagLockPolicy::Try)
+                .unwrap_err();
+            assert_eq!(site, "commit_coalescer.queue");
+            assert!(lag.oldest_age_us >= minimum_age);
+            assert!(lag.since_progress_us >= minimum_age);
+            drop(queue);
+            let spill = rq.spill.lock().unwrap();
+            let (site, lag) = coalescer
+                .sample_lag_state(ArchiveLagLockPolicy::Try)
+                .unwrap_err();
+            assert_eq!(site, "commit_coalescer.spill");
+            assert!(lag.oldest_age_us >= minimum_age);
+            assert!(lag.since_progress_us >= minimum_age);
+            drop(spill);
+            let progress = rq.progress.lock().unwrap();
+            let (site, lag) = coalescer
+                .sample_lag_state(ArchiveLagLockPolicy::Try)
+                .unwrap_err();
+            assert_eq!(site, "commit_coalescer.progress");
+            assert!(lag.oldest_age_us >= minimum_age);
+            assert!(lag.since_progress_us >= minimum_age);
+            drop(progress);
+        }
+        assert!(
+            coalescer
+                .sample_lag_state(ArchiveLagLockPolicy::Try)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn commit_coalescer_oldest_pending_age_tracks_enqueue() {
         // Long flush interval so the worker cannot drain during the test window.
         let coalescer = CommitCoalescer::new(Duration::from_secs(3_600));
@@ -24719,6 +28949,7 @@ mod tests {
         let config = test_config(tmp.path());
         let repo_root = config.storage_root.join("projects").join("cproj");
         std::fs::create_dir_all(&repo_root).unwrap();
+        let rq = coalescer.get_or_create_repo(&normalize_repo_root_key(&repo_root));
         coalescer.enqueue(
             repo_root,
             &config,
@@ -24734,6 +28965,25 @@ mod tests {
         assert!(
             coalescer.oldest_pending_age_us() > 0,
             "oldest uncommitted request reports commit-lag age"
+        );
+        let spill = rq.spill.lock().unwrap();
+        let (site, lower_bound) = coalescer
+            .sample_lag_state(ArchiveLagLockPolicy::Try)
+            .unwrap_err();
+        assert_eq!(site, "commit_coalescer.spill");
+        assert!(lower_bound.oldest_age_us > 0);
+        drop(spill);
+        let progress = rq.progress.lock().unwrap();
+        let (site, lower_bound) = coalescer
+            .sample_lag_state(ArchiveLagLockPolicy::Try)
+            .unwrap_err();
+        assert_eq!(site, "commit_coalescer.progress");
+        assert!(lower_bound.oldest_age_us > 0);
+        drop(progress);
+        assert!(
+            coalescer
+                .sample_lag_state(ArchiveLagLockPolicy::Try)
+                .is_ok()
         );
     }
 
@@ -24875,6 +29125,219 @@ mod tests {
         }
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn wbq_spawn_failure_retains_staged_work_until_retry() {
+        if !isolated_coalescer_regression(
+            "tests::wbq_spawn_failure_retains_staged_work_until_retry",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let signal = config
+            .notifications_signals_dir
+            .join("projects/spawn-retry/agents/Retained.signal");
+        let wbq = new_write_behind_queue();
+        let (old_tx, old_rx) = std::sync::mpsc::sync_channel(1);
+        old_tx
+            .try_send(WbqMsg::Op(WbqOpEnvelope {
+                enqueued_at: Instant::now(),
+                op: Box::new(WriteOp::NotificationSignal {
+                    config,
+                    project_slug: "spawn-retry".to_string(),
+                    agent_name: "Retained".to_string(),
+                    metadata: None,
+                }),
+            }))
+            .unwrap();
+        *wbq.receiver_slot.lock().unwrap() = Some(old_rx);
+        wbq.op_depth.store(1, Ordering::Relaxed);
+
+        let progress_before = WBQ_LAST_PROGRESS_US.load(Ordering::Relaxed);
+        STORAGE_WORKER_FAIL_AFTER.with(|remaining| remaining.set(Some(0)));
+        wbq_start_inner(&wbq);
+        STORAGE_WORKER_FAIL_AFTER.with(|remaining| assert_eq!(remaining.get(), None));
+        assert!(wbq_sender_clone(&wbq).is_none());
+        assert!(wbq.drain_handle.lock().is_none());
+        assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 1);
+        assert!(wbq.receiver_slot.lock().unwrap().is_some());
+        assert!(!signal.exists());
+        assert_eq!(
+            WBQ_LAST_PROGRESS_US.load(Ordering::Relaxed),
+            progress_before
+        );
+
+        wbq_start_inner(&wbq);
+        let sender = wbq_sender_clone(&wbq).expect("retry publishes a working sender");
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        sender.send(WbqMsg::Flush(done_tx)).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 0);
+        assert!(signal.is_file(), "retained operation must actually execute");
+        assert!(WBQ_LAST_PROGRESS_US.load(Ordering::Relaxed) > progress_before);
+        wbq_shutdown_inner(&wbq, Duration::from_secs(10), Duration::from_secs(5));
+        assert!(wbq.drain_handle.lock().is_none());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn archive_backlog_spawn_failure_retains_journal_and_claim_until_retry() {
+        if !isolated_coalescer_regression(
+            "tests::archive_backlog_spawn_failure_retains_journal_and_claim_until_retry",
+        ) {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let project = "spawn-retry";
+        let archive = ensure_archive(&config, project).unwrap();
+        let op = backlog_test_message_op(&config, project, 97);
+        let expected = serde_json::to_vec(&PersistedWriteOp::from_op(&op)).unwrap();
+        STORAGE_WORKER_FAIL_AFTER.with(|remaining| remaining.set(Some(0)));
+        assert_eq!(archive_backlog_push(op), ArchiveBacklogPush::Queued);
+        STORAGE_WORKER_FAIL_AFTER.with(|remaining| assert_eq!(remaining.get(), None));
+        let backlog = &*ARCHIVE_BACKLOG;
+        assert!(backlog.drain_handle.lock().unwrap().is_none());
+        assert_eq!(archive_backlog_depth(), 1);
+        let journal = backlog
+            .queue
+            .lock()
+            .unwrap()
+            .front()
+            .unwrap()
+            .journal_path
+            .clone()
+            .unwrap();
+        assert_eq!(fs::read(&journal).unwrap(), expected);
+        assert!(backlog.owned_journals.lock().unwrap().contains(&journal));
+
+        // Retirement empties the queue before releasing its claim. Hold that
+        // real mutex to expose this window deterministically: an immediate
+        // post-flush claim-absent assertion would fail despite a healthy drain.
+        let owned = backlog.owned_journals.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert!(archive_backlog_flush_blocking(
+            deadline.saturating_duration_since(Instant::now())
+        ));
+        assert!(owned.contains(&journal));
+        drop(owned);
+        while backlog.owned_journals.lock().unwrap().contains(&journal) {
+            assert!(
+                Instant::now() < deadline,
+                "journal claim must retire after draining"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(archive_backlog_depth(), 0);
+        assert_eq!(
+            fs::read(
+                journal
+                    .parent()
+                    .unwrap()
+                    .join("resolved")
+                    .join(journal.file_name().unwrap())
+            )
+            .unwrap(),
+            expected
+        );
+        let WriteOp::MessageBundle {
+            message_json,
+            sender,
+            recipients,
+            body_md,
+            ..
+        } = backlog_test_message_op(&config, project, 97)
+        else {
+            unreachable!();
+        };
+        let (paths, _, _) =
+            message_paths_for_bundle(&archive, &message_json, &sender, &recipients).unwrap();
+        for path in [&paths.canonical, &paths.outbox, &paths.inbox[0]] {
+            let (actual, body) = read_message_file(path).unwrap();
+            assert_eq!(actual["id"], 97);
+            assert_eq!(body.trim(), body_md);
+        }
+        flush_async_commits();
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn coalescer_spawn_failure_joins_already_started_workers() {
+        if !isolated_coalescer_regression(
+            "tests::coalescer_spawn_failure_joins_already_started_workers",
+        ) {
+            return;
+        }
+        assert_eq!(coalescer_worker_count(), 2);
+        assert_eq!(COMMIT_COALESCER_WORKERS_ALIVE.load(Ordering::Relaxed), 0);
+        COALESCER_AFTER_SPAWN_TEST_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|index| {
+                assert_eq!(index, 0);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while COMMIT_COALESCER_WORKERS_ALIVE.load(Ordering::Relaxed) != 1 {
+                    assert!(
+                        Instant::now() < deadline,
+                        "first worker must actually start"
+                    );
+                    std::thread::yield_now();
+                }
+            }));
+        });
+        STORAGE_WORKER_FAIL_AFTER.with(|remaining| remaining.set(Some(1)));
+        let result = std::panic::catch_unwind(|| CommitCoalescer::new(Duration::from_secs(60)));
+        COALESCER_AFTER_SPAWN_TEST_HOOK.with(|slot| {
+            slot.borrow_mut().take();
+        });
+        STORAGE_WORKER_FAIL_AFTER.with(|remaining| assert_eq!(remaining.get(), None));
+        let Err(error) = result else {
+            panic!("unavailable pool must refuse construction");
+        };
+        let message = error
+            .downcast_ref::<String>()
+            .expect("formatted spawn error");
+        assert!(
+            message.starts_with("failed to spawn commit-coalescer-1 thread: "),
+            "{message}"
+        );
+        assert_eq!(
+            COMMIT_COALESCER_WORKERS_ALIVE.load(Ordering::Relaxed),
+            0,
+            "earlier worker must be joined before constructor refusal returns"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let repo = Repository::init(tmp.path()).unwrap();
+        fs::write(
+            tmp.path().join("retry.txt"),
+            b"real commit after spawn refusal\n",
+        )
+        .unwrap();
+        let coalescer = CommitCoalescer::new(Duration::from_millis(10));
+        coalescer.enqueue(
+            tmp.path().to_path_buf(),
+            &config,
+            "retry".to_string(),
+            vec!["retry.txt".to_string()],
+        );
+        coalescer.flush_sync();
+        let tree = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .tree()
+            .unwrap();
+        let entry = tree.get_path(Path::new("retry.txt")).unwrap();
+        assert_eq!(
+            repo.find_blob(entry.id()).unwrap().content(),
+            b"real commit after spawn refusal\n"
+        );
+    }
+
     #[test]
     fn wbq_restart_admission_is_atomic_with_salvage() {
         const CHILD: &str = "AM_TEST_WBQ_RESTART_ADMISSION";
@@ -24964,7 +29427,7 @@ mod tests {
                 &producer_sender,
                 producer_wbq.op_depth.as_ref(),
                 admitted_op,
-                Some(&producer_wbq.lifecycle),
+                Some(&producer_wbq),
             )
         });
         reserved_rx
@@ -25003,7 +29466,7 @@ mod tests {
                 &old_sender,
                 wbq.op_depth.as_ref(),
                 signal_op("BronzeHare"),
-                Some(&wbq.lifecycle),
+                Some(&wbq),
             ),
             WbqEnqueueResult::Enqueued
         );
@@ -25038,7 +29501,7 @@ mod tests {
                 &old_sender,
                 wbq.op_depth.as_ref(),
                 signal_op("CobaltRobin"),
-                Some(&wbq.lifecycle),
+                Some(&wbq),
             ),
             WbqEnqueueResult::QueueUnavailable,
             "an old sender cannot publish behind the completed salvage pass"
@@ -25063,7 +29526,7 @@ mod tests {
                 &old_sender,
                 wbq.op_depth.as_ref(),
                 signal_op("SilverFox"),
-                Some(&wbq.lifecycle),
+                Some(&wbq),
             ),
             WbqEnqueueResult::QueueUnavailable
         );
@@ -25079,6 +29542,348 @@ mod tests {
         let metrics = mcp_agent_mail_core::global_metrics();
         assert_eq!(metrics.storage.wbq_respawn_salvaged_total.load(), 2);
         assert_eq!(metrics.storage.wbq_respawn_lost_total.load(), 0);
+        println!("{COMPLETED}");
+    }
+
+    #[test]
+    fn wbq_public_enqueue_does_not_wait_for_lifecycle_owner() {
+        const CHILD: &str = "AM_TEST_WBQ_ENQUEUE_LIFECYCLE";
+        const COMPLETED: &str = "WBQ public enqueue lifecycle bound verified";
+        if std::env::var_os(CHILD).is_none() {
+            let isolated = TempDir::new().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::wbq_public_enqueue_does_not_wait_for_lifecycle_owner",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("STORAGE_ROOT", isolated.path())
+                .env("AM_WBQ_ENQUEUE_TIMEOUT_MS", "10")
+                .output()
+                .expect("isolated public WBQ admission");
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETED));
+            return;
+        }
+
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(15));
+            eprintln!("WBQ public enqueue lifecycle watchdog expired");
+            std::process::exit(1);
+        });
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let signal_op = |agent: &str| WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "enqueue-lifecycle".to_string(),
+            agent_name: agent.to_string(),
+            metadata: None,
+        };
+        let signal_path = |agent: &str| {
+            config
+                .notifications_signals_dir
+                .join(format!("projects/enqueue-lifecycle/agents/{agent}.signal"))
+        };
+        let wbq = WBQ.get_or_init(new_write_behind_queue);
+
+        for (rejected, accepted, prior_enqueued) in [
+            ("ColdRejected", "ColdAccepted", 0),
+            ("LiveRejected", "LiveAccepted", 1),
+        ] {
+            // Exercise the actual public entrypoint both before first startup
+            // and with a healthy worker. The producer must finish while the
+            // lifecycle owner still holds its guard, not after its release.
+            let lifecycle = wbq.lifecycle.lock().unwrap();
+            let op = signal_op(rejected);
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            let producer = std::thread::spawn(move || done_tx.send(wbq_enqueue(op)));
+            let result = done_rx.recv_timeout(Duration::from_secs(1));
+
+            // Critical pressure must still select the explicit disk guard,
+            // even while startup is unavailable. QueueUnavailable would send
+            // this operation to the durable backlog instead of skipping it.
+            let pressure = &mcp_agent_mail_core::global_metrics()
+                .system
+                .disk_pressure_level;
+            pressure.set(mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64());
+            let critical_agent = format!("{rejected}Critical");
+            let critical_op = signal_op(&critical_agent);
+            let (critical_tx, critical_rx) = std::sync::mpsc::sync_channel(1);
+            let critical_producer =
+                std::thread::spawn(move || critical_tx.send(wbq_enqueue(critical_op)));
+            let critical_result = critical_rx.recv_timeout(Duration::from_secs(1));
+            pressure.set(0);
+            drop(lifecycle);
+            producer
+                .join()
+                .expect("public enqueue producer")
+                .expect("publish enqueue result");
+            critical_producer
+                .join()
+                .expect("public enqueue critical-pressure producer")
+                .expect("publish critical-pressure enqueue result");
+            assert_eq!(
+                result,
+                Ok(WbqEnqueueResult::QueueUnavailable),
+                "lifecycle contention must reach fallback before the owner releases its lock"
+            );
+            assert_eq!(
+                critical_result,
+                Ok(WbqEnqueueResult::SkippedDiskCritical),
+                "critical disk pressure must skip archive work even when startup is contended"
+            );
+            assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 0);
+            assert_eq!(archive_lag_snapshot().wbq_depth, 0);
+            assert_eq!(wbq_stats().enqueued, prior_enqueued);
+            assert!(!signal_path(rejected).exists());
+            assert!(!signal_path(&critical_agent).exists());
+            if prior_enqueued == 0 {
+                assert!(wbq.drain_handle.lock().is_none());
+                assert!(wbq_sender_clone(wbq).is_none());
+            }
+
+            // Contention must not poison startup or a running queue. Accepted
+            // work still reaches the real archive writer after the gate opens.
+            assert_eq!(wbq_enqueue(signal_op(accepted)), WbqEnqueueResult::Enqueued);
+            assert_eq!(wbq_flush_status(), WbqFlushOutcome::Drained);
+            assert!(signal_path(accepted).is_file());
+            assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 0);
+            assert_eq!(archive_lag_snapshot().wbq_depth, 0);
+            assert_eq!(wbq_stats().enqueued, prior_enqueued + 1);
+            assert_eq!(wbq_stats().drained, prior_enqueued + 1);
+        }
+        wbq_shutdown();
+        println!("{COMPLETED}");
+    }
+
+    #[test]
+    fn wbq_timed_out_shutdown_retains_worker_until_restart_is_safe() {
+        const CHILD: &str = "AM_TEST_WBQ_RETIRED_WORKER";
+        const COMPLETED: &str = "WBQ retired worker ownership verified";
+        let Ok(scenario) = std::env::var(CHILD) else {
+            for scenario in ["flush_timeout", "delivery_timeout"] {
+                let isolated = TempDir::new().unwrap();
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::wbq_timed_out_shutdown_retains_worker_until_restart_is_safe",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, scenario)
+                    .env("STORAGE_ROOT", isolated.path())
+                    .env("AM_WBQ_ENQUEUE_TIMEOUT_MS", "10")
+                    .output()
+                    .expect("isolated WBQ worker retirement");
+                assert!(
+                    output.status.success(),
+                    "{scenario}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains(COMPLETED));
+            }
+            return;
+        };
+
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(20));
+            eprintln!("WBQ worker retirement watchdog expired");
+            std::process::exit(1);
+        });
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        let signal_op = |agent: &str| WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "worker-retirement".to_string(),
+            agent_name: agent.to_string(),
+            metadata: None,
+        };
+        let signal_path = |agent: &str| {
+            config
+                .notifications_signals_dir
+                .join(format!("projects/worker-retirement/agents/{agent}.signal"))
+        };
+        let wbq = WBQ.get_or_init(new_write_behind_queue);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+        *wbq.sender.lock().unwrap() = Some(sender.clone());
+        *wbq.receiver_slot.lock().unwrap() = Some(receiver);
+        assert_eq!(
+            wbq_enqueue_with_sender_admission(
+                &sender,
+                wbq.op_depth.as_ref(),
+                signal_op("OldInFlight"),
+                Some(wbq),
+            ),
+            WbqEnqueueResult::Enqueued,
+        );
+
+        // Install the existing execution hook on the actual worker thread,
+        // after dequeue/accounting but before the real notification write.
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let worker_slot = Arc::clone(&wbq.receiver_slot);
+        let worker_depth = Arc::clone(&wbq.op_depth);
+        let worker = std::thread::spawn(move || {
+            WBQ_BEFORE_EXECUTE_TEST_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("release retired archive worker");
+                }));
+            });
+            wbq_drain_loop(worker_slot, worker_depth, 4, 1);
+        });
+        let old_worker_id = worker.thread().id();
+        *wbq.drain_handle.lock() = Some(worker);
+        paused_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("old worker must be executing its first accepted operation");
+
+        let delivery_timeout = scenario == "delivery_timeout";
+        let buffered: u64 = if delivery_timeout { 4 } else { 1 };
+        for index in 0..buffered {
+            assert_eq!(
+                wbq_enqueue(signal_op(&format!("OldBuffered{index}"))),
+                WbqEnqueueResult::Enqueued,
+            );
+        }
+        let mut captured_sender = Some(wbq_sender_for_enqueue(wbq).unwrap());
+        drop(sender);
+        let inflight_since = WBQ_INFLIGHT_SINCE_US.load(Ordering::Relaxed);
+        let inflight_oldest = WBQ_INFLIGHT_OLDEST_ENQUEUED_US.load(Ordering::Relaxed);
+        let last_progress = WBQ_LAST_PROGRESS_US.load(Ordering::Relaxed);
+        assert!(inflight_since > 0);
+        let metrics = mcp_agent_mail_core::global_metrics();
+        let salvaged_before = metrics.storage.wbq_respawn_salvaged_total.load();
+        let lost_before = metrics.storage.wbq_respawn_lost_total.load();
+        let budget = Duration::from_millis(10);
+
+        // Exercise the real shutdown path with short budgets, both when Flush
+        // is delivered but cannot be acknowledged and when both controls find
+        // a full channel. Neither outcome grants ownership to a replacement.
+        let started = Instant::now();
+        wbq_shutdown_inner(wbq, budget, budget);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(wbq_sender_clone(wbq).is_none());
+        {
+            let handle = wbq.drain_handle.lock();
+            let worker = handle.as_ref().expect("unfinished worker must stay owned");
+            assert_eq!(worker.thread().id(), old_worker_id);
+            assert!(!worker.is_finished());
+        }
+
+        // A repeated shutdown must not infer termination from sender=None.
+        let started = Instant::now();
+        wbq_shutdown_inner(wbq, budget, budget);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            wbq_enqueue(signal_op("NewRejected")),
+            WbqEnqueueResult::QueueUnavailable,
+        );
+        assert_eq!(
+            wbq_enqueue_with_sender_admission(
+                captured_sender.as_ref().unwrap(),
+                wbq.op_depth.as_ref(),
+                signal_op("CapturedRejected"),
+                Some(wbq),
+            ),
+            WbqEnqueueResult::QueueUnavailable,
+            "a producer captured before shutdown must not publish after admission closes",
+        );
+        wbq_start_inner(wbq);
+        assert!(wbq_sender_clone(wbq).is_none());
+        assert_eq!(
+            wbq.drain_handle.lock().as_ref().unwrap().thread().id(),
+            old_worker_id,
+        );
+        assert_eq!(wbq.op_depth.load(Ordering::Relaxed), buffered);
+        assert_eq!(archive_lag_snapshot().wbq_depth, buffered);
+        assert_eq!(
+            WBQ_INFLIGHT_SINCE_US.load(Ordering::Relaxed),
+            inflight_since
+        );
+        assert_eq!(
+            WBQ_INFLIGHT_OLDEST_ENQUEUED_US.load(Ordering::Relaxed),
+            inflight_oldest,
+        );
+        assert_eq!(WBQ_LAST_PROGRESS_US.load(Ordering::Relaxed), last_progress);
+        assert_eq!(
+            metrics.storage.wbq_respawn_salvaged_total.load(),
+            salvaged_before,
+        );
+        assert_eq!(metrics.storage.wbq_respawn_lost_total.load(), lost_before);
+        assert_eq!(wbq_stats().enqueued, buffered + 1);
+        assert_eq!(wbq_stats().drained, 0);
+        assert!(!signal_path("OldInFlight").exists());
+        for index in 0..buffered {
+            assert!(!signal_path(&format!("OldBuffered{index}")).exists());
+        }
+
+        // If neither control fit, releasing the last captured sender supplies
+        // the normal disconnect exit path. Otherwise keep it to prove restart
+        // eventually disconnects this exact retired channel.
+        if delivery_timeout {
+            drop(captured_sender.take());
+        }
+        resume_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if wbq.drain_handle.lock().as_ref().unwrap().is_finished() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "old drain must finish its own work"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(signal_path("OldInFlight").is_file());
+        for index in 0..buffered {
+            assert!(signal_path(&format!("OldBuffered{index}")).is_file());
+        }
+        assert!(!signal_path("NewRejected").exists());
+        assert!(!signal_path("CapturedRejected").exists());
+        assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 0);
+        assert_eq!(archive_lag_snapshot().wbq_depth, 0);
+        assert_eq!(WBQ_INFLIGHT_SINCE_US.load(Ordering::Relaxed), 0);
+        assert_eq!(wbq_stats().enqueued, buffered + 1);
+        assert_eq!(wbq_stats().drained, buffered + 1);
+        assert_eq!(wbq_stats().errors, 0);
+
+        wbq_start_inner(wbq);
+        assert_ne!(
+            wbq.drain_handle.lock().as_ref().unwrap().thread().id(),
+            old_worker_id,
+        );
+        if let Some(sender) = captured_sender {
+            assert!(matches!(
+                sender.try_send(WbqMsg::Shutdown),
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)),
+            ));
+        }
+        assert_eq!(
+            wbq_enqueue(signal_op("FreshAccepted")),
+            WbqEnqueueResult::Enqueued
+        );
+        assert_eq!(wbq_flush_status(), WbqFlushOutcome::Drained);
+        assert!(signal_path("FreshAccepted").is_file());
+        assert_eq!(wbq.op_depth.load(Ordering::Relaxed), 0);
+        assert_eq!(archive_lag_snapshot().wbq_depth, 0);
+        assert_eq!(wbq_stats().enqueued, buffered + 2);
+        assert_eq!(wbq_stats().drained, buffered + 2);
+        wbq_shutdown();
+        assert!(wbq.drain_handle.lock().is_none());
         println!("{COMPLETED}");
     }
 
@@ -25616,6 +30421,72 @@ mod tests {
     }
 
     #[test]
+    fn non_reservation_interrupted_io_still_feeds_the_archive_breaker() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let op = direct_clear_signal_op(&tmp, "direct-interrupted-io");
+        let result = write_archive_sync_direct_with_cancel(
+            &op,
+            || false,
+            || {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "archive filesystem operation interrupted",
+                )
+                .into())
+            },
+        );
+
+        assert!(
+            matches!(&result, DirectArchiveWrite::Failed(StorageError::Io(error))
+                if error.kind() == std::io::ErrorKind::Interrupted),
+            "{result:?}"
+        );
+        let key = format!("{}::direct-interrupted-io", tmp.path().display());
+        assert!(
+            wbq_circuit_breaker_snapshot()
+                .iter()
+                .any(|entry| entry.archive_key == key && entry.consecutive_failures == 1),
+            "an interrupted filesystem operation is not request cancellation"
+        );
+    }
+
+    #[test]
+    fn reservation_interrupted_io_without_cancellation_feeds_the_archive_breaker() {
+        let _pressure = DiskPressureReset::set(0);
+        let tmp = TempDir::new().unwrap();
+        let op = WriteOp::FileReservation {
+            project_slug: "reservation-interrupted-io".to_string(),
+            config: test_config(tmp.path()),
+            reservations: Vec::new(),
+        };
+        let result = write_archive_sync_direct_with_cancel(
+            &op,
+            || false,
+            || {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "reservation filesystem operation interrupted",
+                )
+                .into())
+            },
+        );
+
+        assert!(
+            matches!(&result, DirectArchiveWrite::Failed(StorageError::Io(error))
+                if error.kind() == std::io::ErrorKind::Interrupted),
+            "{result:?}"
+        );
+        let key = format!("{}::reservation-interrupted-io", tmp.path().display());
+        assert!(
+            wbq_circuit_breaker_snapshot()
+                .iter()
+                .any(|entry| entry.archive_key == key && entry.consecutive_failures == 1),
+            "a reservation filesystem failure is not request cancellation"
+        );
+    }
+
+    #[test]
     fn write_op_sync_direct_disk_critical_skip_is_counted_without_breaker_feed() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -26115,6 +30986,75 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn cancelled_archive_consistency_scan_does_not_publish_partial_metrics() {
+        const CHILD: &str = "AM_TEST_CANCELLED_ARCHIVE_CONSISTENCY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::cancelled_archive_consistency_scan_does_not_publish_partial_metrics",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let month = dir.path().join("projects/test-project/messages/2026/02");
+        fs::create_dir_all(&month).unwrap();
+        for index in 0..32 {
+            fs::write(
+                month.join(format!("unrelated-{index}.md")),
+                "retained archive body",
+            )
+            .unwrap();
+        }
+        let refs = [ConsistencyMessageRef {
+            project_slug: "test-project".into(),
+            message_id: 42,
+            sender_name: "BlueLake".into(),
+            subject: "hello world".into(),
+            created_ts_iso: "2026-02-08T03:29:30+00:00".into(),
+        }];
+        let metric = &mcp_agent_mail_core::global_metrics()
+            .storage
+            .needs_reindex_total;
+        metric.store(71);
+        let cancelled = AtomicBool::new(false);
+        let checkpoints = std::cell::Cell::new(0);
+        let result = check_archive_consistency_with_checkpoint(dir.path(), &refs, &|| {
+            checkpoints.set(checkpoints.get() + 1);
+            // The scan has entered a real month directory and processed
+            // entries before stopping inside that same message's fallback.
+            if checkpoints.get() == 8 {
+                cancelled.store(true, Ordering::Release);
+            }
+            archive_scan_checkpoint(&cancelled)
+        });
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(checkpoints.get(), 8);
+        assert_eq!(
+            metric.load(),
+            71,
+            "partial scan must not replace the last complete result"
+        );
+        assert!(check_archive_consistency_cancellable(dir.path(), &refs, &cancelled).is_err());
+        cancelled.store(false, Ordering::Release);
+        let resumed = check_archive_consistency_cancellable(dir.path(), &refs, &cancelled).unwrap();
+        assert_eq!(resumed.sampled, 1);
+        assert_eq!(resumed.missing_ids, [42]);
+        assert_eq!(metric.load(), 1);
+        assert_eq!(fs::read_dir(&month).unwrap().count(), 32);
+    }
+
+    #[test]
     fn consistency_empty_messages_returns_zero() {
         let dir = tempfile::tempdir().unwrap();
         let report = check_archive_consistency(dir.path(), &[]);
@@ -26173,6 +31113,94 @@ mod tests {
         assert_eq!(report.found, 1);
         assert_eq!(report.missing, 0);
         assert!(report.missing_ids.is_empty());
+    }
+
+    #[test]
+    fn consistency_canonical_probes_do_not_walk_populated_month() {
+        let dir = tempfile::tempdir().unwrap();
+        let month = dir.path().join("projects/test-project/messages/2026/02");
+        fs::create_dir_all(&month).unwrap();
+        for index in 0..4096 {
+            fs::write(
+                month.join(format!("unrelated-{index}.md")),
+                "retained history",
+            )
+            .unwrap();
+        }
+        let refs: Vec<_> = (1..=100)
+            .map(|id| {
+                fs::write(
+                    month.join(format!("2026-02-08T03-29-30Z__hello-world__{id}.md")),
+                    "canonical archive message",
+                )
+                .unwrap();
+                ConsistencyMessageRef {
+                    project_slug: "test-project".into(),
+                    message_id: id,
+                    sender_name: "BlueLake".into(),
+                    subject: "hello world".into(),
+                    created_ts_iso: "2026-02-08T03:29:30.123456Z".into(),
+                }
+            })
+            .collect();
+        let checkpoints = std::cell::Cell::new(0);
+        let report = check_archive_consistency_with_checkpoint(dir.path(), &refs, &|| {
+            checkpoints.set(checkpoints.get() + 1);
+            if checkpoints.get() > refs.len() + 2 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "canonical archive probes must not enumerate month entries",
+                ));
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(report.sampled, refs.len());
+        assert_eq!(report.found, refs.len());
+        assert_eq!(report.missing, 0);
+        assert!(report.missing_ids.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn consistency_canonical_probe_rejects_symlinks_directories_and_timestamp_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let month = dir.path().join("projects/test-project/messages/2026/02");
+        fs::create_dir_all(month.join("2026-02")).unwrap();
+        let outside = dir.path().join("outside.md");
+        fs::write(&outside, "outside evidence").unwrap();
+        std::os::unix::fs::symlink(
+            &outside,
+            month.join("2026-02-08T03-29-30Z__hello-world__1.md"),
+        )
+        .unwrap();
+        fs::create_dir(month.join("2026-02-08T03-29-30Z__hello-world__2.md")).unwrap();
+        // This would be the fast probe's target if an untrusted timestamp
+        // were joined without validating the complete filename component.
+        let escaped = month.parent().unwrap().join("escapZ__hello-world__3.md");
+        fs::write(&escaped, "foreign month evidence").unwrap();
+        let refs: Vec<_> = (1..=3)
+            .map(|id| ConsistencyMessageRef {
+                project_slug: "test-project".into(),
+                message_id: id,
+                sender_name: "BlueLake".into(),
+                subject: "hello world".into(),
+                created_ts_iso: if id == 3 {
+                    "2026-02/../../escape".into()
+                } else {
+                    "2026-02-08T03:29:30Z".into()
+                },
+            })
+            .collect();
+        let report = check_archive_consistency(dir.path(), &refs);
+        assert_eq!(report.sampled, 3);
+        assert_eq!(report.found, 0);
+        assert_eq!(report.missing_ids, [1, 2, 3]);
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside evidence");
+        assert_eq!(
+            fs::read_to_string(&escaped).unwrap(),
+            "foreign month evidence"
+        );
     }
 
     #[test]
@@ -27081,6 +32109,269 @@ mod tests {
         assert_eq!(stats.errors, 1);
     }
 
+    fn coalescer_group_test_request(
+        message: String,
+        rel_paths: Vec<String>,
+    ) -> CoalescerCommitFields {
+        CoalescerCommitFields {
+            enqueued_at: Instant::now(),
+            enqueued_wall: Utc::now(),
+            git_author_name: "Test".to_string(),
+            git_author_email: "test@example.com".to_string(),
+            message,
+            rel_paths,
+        }
+    }
+
+    #[test]
+    fn coalescer_sparse_thread_conflict_commits_two_ordered_git_groups() {
+        config::with_process_env_overrides_for_test(&[("AM_ARCHIVE_BATCH_EVENTS", "32")], || {
+            let tmp = TempDir::new().unwrap();
+            let repo = Repository::init(tmp.path()).expect("init repository");
+            let shared = "projects/p0/threads/shared.md";
+            fs::create_dir_all(tmp.path().join("projects/p0/threads")).unwrap();
+            fs::write(tmp.path().join(shared), "thread digest\n").unwrap();
+            let requests = (0..32)
+                .map(|index| {
+                    let path = format!("projects/p{}/message-{index}.md", index % 3);
+                    let target = tmp.path().join(&path);
+                    fs::create_dir_all(target.parent().unwrap()).unwrap();
+                    fs::write(&target, format!("message {index}\n")).unwrap();
+                    let mut paths = vec![path];
+                    if index == 0 || index == 16 {
+                        paths.push(shared.to_string());
+                    }
+                    coalescer_group_test_request(format!("request {index}"), paths)
+                })
+                .collect::<Vec<_>>();
+            let stats = Arc::new(Mutex::new(CommitQueueStats::default()));
+            let batch_sizes = Arc::new(Mutex::new(VecDeque::new()));
+
+            let outcome = coalescer_commit_batch(tmp.path(), &requests, &stats, &batch_sizes);
+
+            assert_eq!(outcome.committed_requests, 32);
+            assert_eq!(outcome.committed_commits, 2);
+            assert!(outcome.failed_requests.is_empty());
+            let newest = repo.head().unwrap().peel_to_commit().unwrap();
+            let first = newest.parent(0).expect("second group follows first");
+            assert_eq!(newest.parent_count(), 1);
+            assert_eq!(first.parent_count(), 0, "exactly two Git commits");
+            assert_eq!(newest.author().name(), Ok("Test"));
+            assert_eq!(first.author().email(), Ok("test@example.com"));
+            let first_tree = first.tree().unwrap();
+            let final_tree = newest.tree().unwrap();
+            for (index, request) in requests.iter().enumerate() {
+                let path = Path::new(&request.rel_paths[0]);
+                assert_eq!(first_tree.get_path(path).is_ok(), index < 16);
+                let blob = repo
+                    .find_blob(final_tree.get_path(path).unwrap().id())
+                    .unwrap();
+                assert_eq!(blob.content(), format!("message {index}\n").as_bytes());
+                let summary = format!("- request {index}");
+                assert_eq!(
+                    first.message().unwrap().lines().any(|line| line == summary),
+                    index < 16
+                );
+                assert_eq!(
+                    newest
+                        .message()
+                        .unwrap()
+                        .lines()
+                        .any(|line| line == summary),
+                    index >= 16
+                );
+            }
+            assert!(first_tree.get_path(Path::new(shared)).is_ok());
+            assert!(final_tree.get_path(Path::new(shared)).is_ok());
+            let stats = stats.lock().unwrap();
+            assert_eq!(stats.commits, 2);
+            assert_eq!(stats.batched, 32);
+            assert_eq!(stats.errors, 0);
+            assert_eq!(stats.batch_size_histogram, BTreeMap::from([(16, 2)]));
+            assert_eq!(stats.avg_batch_size, 16.0);
+        });
+    }
+
+    #[test]
+    fn coalescer_repeated_path_preserves_each_git_commit_boundary() {
+        config::with_process_env_overrides_for_test(&[("AM_ARCHIVE_BATCH_EVENTS", "32")], || {
+            let tmp = TempDir::new().unwrap();
+            let repo = Repository::init(tmp.path()).unwrap();
+            fs::write(tmp.path().join("shared.md"), "latest shared contents\n").unwrap();
+            let requests = (0..4)
+                .map(|index| {
+                    let path = format!("message-{index}.md");
+                    fs::write(tmp.path().join(&path), format!("message {index}\n")).unwrap();
+                    coalescer_group_test_request(
+                        format!("request {index}"),
+                        vec!["shared.md".to_string(), path],
+                    )
+                })
+                .collect::<Vec<_>>();
+            let stats = Arc::new(Mutex::new(CommitQueueStats::default()));
+            let batch_sizes = Arc::new(Mutex::new(VecDeque::new()));
+
+            let outcome = coalescer_commit_batch(tmp.path(), &requests, &stats, &batch_sizes);
+
+            assert_eq!(outcome.committed_requests, 4);
+            assert_eq!(outcome.committed_commits, 4);
+            assert!(outcome.failed_requests.is_empty());
+            let mut commit = repo.head().unwrap().peel_to_commit().unwrap();
+            for index in (0..4).rev() {
+                assert_eq!(
+                    commit.summary(),
+                    Ok(Some(format!("request {index}").as_str()))
+                );
+                let tree = commit.tree().unwrap();
+                for message in 0..4 {
+                    assert_eq!(
+                        tree.get_path(Path::new(&format!("message-{message}.md")))
+                            .is_ok(),
+                        message <= index,
+                    );
+                }
+                if index == 0 {
+                    assert_eq!(commit.parent_count(), 0);
+                } else {
+                    commit = commit.parent(0).unwrap();
+                }
+            }
+            assert_eq!(
+                stats.lock().unwrap().batch_size_histogram,
+                BTreeMap::from([(1, 4)])
+            );
+        });
+    }
+
+    #[test]
+    fn coalescer_group_failure_retains_exact_requests_and_queue_age() {
+        config::with_process_env_overrides_for_test(&[("AM_ARCHIVE_BATCH_EVENTS", "32")], || {
+            let tmp = TempDir::new().unwrap();
+            let repo = Repository::init(tmp.path()).unwrap();
+            for path in ["shared.md", "a.md", "b.md", "c.md", "d.md", "e.md"] {
+                fs::write(tmp.path().join(path), format!("{path}\n")).unwrap();
+            }
+            let request_paths = [
+                vec!["shared.md", "a.md"],
+                vec!["b.md"],
+                vec!["shared.md", "../invalid.md"],
+                vec!["c.md"],
+                vec!["shared.md", "d.md"],
+                vec!["e.md"],
+            ];
+            let requests = request_paths
+                .into_iter()
+                .enumerate()
+                .map(|(index, paths)| {
+                    coalescer_group_test_request(
+                        format!("request {index}"),
+                        paths.into_iter().map(str::to_string).collect(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let stats = Arc::new(Mutex::new(CommitQueueStats::default()));
+            let batch_sizes = Arc::new(Mutex::new(VecDeque::new()));
+
+            let outcome = coalescer_commit_batch(tmp.path(), &requests, &stats, &batch_sizes);
+
+            assert_eq!(outcome.committed_requests, 4);
+            assert_eq!(outcome.committed_commits, 2);
+            assert_eq!(outcome.failed_requests.len(), 2);
+            for (failed, original) in outcome.failed_requests.iter().zip(&requests[2..4]) {
+                assert_eq!(failed.message, original.message);
+                assert_eq!(failed.rel_paths, original.rel_paths);
+                assert_eq!(failed.enqueued_at, original.enqueued_at);
+                assert_eq!(failed.enqueued_wall, original.enqueued_wall);
+            }
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            for path in ["shared.md", "a.md", "b.md", "d.md", "e.md"] {
+                assert!(tree.get_path(Path::new(path)).is_ok());
+            }
+            assert!(tree.get_path(Path::new("c.md")).is_err());
+            let rq = RepoQueue::default();
+            coalescer_requeue_requests(&rq, outcome.failed_requests);
+            assert_eq!(rq.depth.load(Ordering::Relaxed), 2);
+            let queue = rq.queue.lock().unwrap();
+            assert_eq!(queue[0].message, requests[2].message);
+            assert_eq!(queue[1].message, requests[3].message);
+            assert_eq!(queue[0].enqueued_at, requests[2].enqueued_at);
+            assert_eq!(queue[1].enqueued_at, requests[3].enqueued_at);
+            let stats = stats.lock().unwrap();
+            assert_eq!(stats.commits, 2);
+            assert_eq!(stats.batched, 4);
+            assert_eq!(
+                stats.errors, 1,
+                "one failed Git group, two retained requests"
+            );
+            assert_eq!(stats.batch_size_histogram, BTreeMap::from([(2, 2)]));
+        });
+    }
+
+    #[test]
+    fn coalescer_group_stats_record_unequal_sizes_and_author_boundaries() {
+        config::with_process_env_overrides_for_test(&[("AM_ARCHIVE_BATCH_EVENTS", "3")], || {
+            let tmp = TempDir::new().unwrap();
+            let repo = Repository::init(tmp.path()).unwrap();
+            let requests = (0..7)
+                .map(|index| {
+                    let path = format!("message-{index}.md");
+                    fs::write(tmp.path().join(&path), format!("message {index}\n")).unwrap();
+                    let mut request =
+                        coalescer_group_test_request(format!("request {index}"), vec![path]);
+                    if index >= 5 {
+                        request.git_author_name = "Other".to_string();
+                        request.git_author_email = "other@example.com".to_string();
+                    }
+                    request
+                })
+                .collect::<Vec<_>>();
+            let stats = Arc::new(Mutex::new(CommitQueueStats::default()));
+            let batch_sizes = Arc::new(Mutex::new(VecDeque::new()));
+
+            let outcome = coalescer_commit_batch(tmp.path(), &requests, &stats, &batch_sizes);
+
+            assert_eq!(outcome.committed_requests, 7);
+            assert_eq!(outcome.committed_commits, 3);
+            assert!(outcome.failed_requests.is_empty());
+            let newest = repo.head().unwrap().peel_to_commit().unwrap();
+            assert_eq!(newest.author().name(), Ok("Other"));
+            assert_eq!(newest.author().email(), Ok("other@example.com"));
+            let middle = newest.parent(0).unwrap();
+            let first = middle.parent(0).unwrap();
+            assert_eq!(middle.author().name(), Ok("Test"));
+            assert_eq!(first.author().name(), Ok("Test"));
+            assert_eq!(first.parent_count(), 0);
+            assert!(
+                first
+                    .tree()
+                    .unwrap()
+                    .get_path(Path::new("message-3.md"))
+                    .is_err()
+            );
+            assert!(
+                middle
+                    .tree()
+                    .unwrap()
+                    .get_path(Path::new("message-4.md"))
+                    .is_ok()
+            );
+            assert!(
+                middle
+                    .tree()
+                    .unwrap()
+                    .get_path(Path::new("message-5.md"))
+                    .is_err()
+            );
+            let stats = stats.lock().unwrap();
+            assert_eq!(stats.commits, 3);
+            assert_eq!(stats.batched, 7);
+            assert_eq!(stats.errors, 0);
+            assert_eq!(stats.batch_size_histogram, BTreeMap::from([(2, 2), (3, 1)]));
+            assert_eq!(stats.avg_batch_size, 2.33);
+            assert_eq!(*batch_sizes.lock().unwrap(), VecDeque::from([3, 2, 2]));
+        });
+    }
+
     #[test]
     fn coalescer_restore_spilled_work_restores_depth_and_paths() {
         let rq = RepoQueue::default();
@@ -27468,6 +32759,279 @@ mod tests {
         }
     }
 
+    fn wait_for_archive_index_sync_state(
+        ready: impl Fn(&ArchiveIndexSyncState) -> bool,
+        timeout: Duration,
+    ) -> std::sync::MutexGuard<'static, ArchiveIndexSyncState> {
+        let (state_lock, wake) = &*ARCHIVE_INDEX_SYNC;
+        let mut state = state_lock.lock().unwrap();
+        let deadline = Instant::now() + timeout;
+        while !ready(&state) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            state = wake.wait_timeout(state, left).unwrap().0;
+        }
+        state
+    }
+
+    #[test]
+    fn archive_index_sync_worker_retries_io_failure_without_another_commit() {
+        if !isolated_coalescer_regression(
+            "tests::archive_index_sync_worker_retries_io_failure_without_another_commit",
+        ) {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let repo = Repository::init(tmp.path()).unwrap();
+        fs::write(tmp.path().join("base.txt"), b"base\n").unwrap();
+        commit_paths_lockfree(&repo, &config, "base", &["base.txt"]).unwrap();
+        let original_tree = shared_index_tree(&repo);
+        let _background = BackgroundIndexSync::enter();
+        fs::write(tmp.path().join("pending.txt"), b"pending sync\n").unwrap();
+        commit_paths_lockfree(&repo, &config, "pending", &["pending.txt"]).unwrap();
+        let head_tree = repo.head().unwrap().peel_to_tree().unwrap().id();
+        assert_ne!(original_tree, head_tree);
+        let git_dir = repo.path().to_path_buf();
+        let original_lag = ARCHIVE_INDEX_SYNC.0.lock().unwrap().pending[&git_dir];
+
+        // A directory in place of the index causes a real filesystem read
+        // failure even when the test runs as root. Preserve the old index so
+        // repairing this condition does not itself create another commit.
+        let index_path = git_dir.join("index");
+        let retained_index = tmp.path().join("retained-index");
+        fs::rename(&index_path, &retained_index).unwrap();
+        fs::create_dir(&index_path).unwrap();
+        assert!(matches!(
+            sync_archive_index_to_head(&git_dir),
+            Err(StorageError::Io(_))
+        ));
+        let worker = std::thread::Builder::new()
+            .name("index-sync-io-recovery-regression".to_string())
+            .stack_size(storage_worker_stack_size())
+            .spawn(archive_index_sync_worker)
+            .unwrap();
+
+        let state = wait_for_archive_index_sync_state(
+            |state| state.warned.contains(&git_dir) && !state.in_flight,
+            Duration::from_secs(10),
+        );
+        let observed_failure = state.warned.contains(&git_dir) && !state.in_flight;
+        let retained_lag = state.pending.get(&git_dir).copied();
+        let pending_count = state.pending.len();
+        let has_backoff = state.next_due.contains_key(&git_dir);
+        let released_lock =
+            !git_dir.join("index.lock").exists() && !git_dir.join("index.lock.owner").exists();
+        // Holding the state lock after the completed failure prevents another
+        // attempt from starting between the two fixture-repair renames.
+        if observed_failure {
+            fs::rename(&index_path, tmp.path().join("invalid-index-directory")).unwrap();
+            fs::rename(&retained_index, &index_path).unwrap();
+        }
+        drop(state);
+
+        // No commit, enqueue, or notification follows the filesystem repair.
+        let recovered = if retained_lag.is_some() && observed_failure {
+            let state = wait_for_archive_index_sync_state(
+                |state| {
+                    !state.pending.contains_key(&git_dir)
+                        && !state.warned.contains(&git_dir)
+                        && !state.in_flight
+                },
+                Duration::from_secs(35),
+            );
+            !state.pending.contains_key(&git_dir)
+                && !state.warned.contains(&git_dir)
+                && !state.in_flight
+        } else {
+            false
+        };
+        stop_archive_index_sync(Duration::from_secs(5));
+        worker.join().expect("index sync worker shuts down cleanly");
+
+        assert!(observed_failure, "the actual background read must fail");
+        let retained_lag = retained_lag.expect("a failed sync must remain pending");
+        assert_eq!(retained_lag.since, original_lag.since);
+        assert_eq!(retained_lag.last_commit, original_lag.last_commit);
+        assert_eq!(pending_count, 1, "retries reuse one repository entry");
+        assert!(has_backoff);
+        assert!(released_lock, "failed attempts must release their Git lock");
+        assert!(
+            recovered,
+            "the same worker must retry without another commit"
+        );
+        assert_eq!(shared_index_tree(&repo), head_tree);
+        assert!(!git_dir.join("index.lock").exists());
+        assert!(!git_dir.join("index.lock.owner").exists());
+    }
+
+    #[test]
+    fn archive_index_sync_worker_recovers_panics_merges_lag_and_stops_with_pending_work() {
+        if !isolated_coalescer_regression(
+            "tests::archive_index_sync_worker_recovers_panics_merges_lag_and_stops_with_pending_work",
+        ) {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let repo = Repository::init(tmp.path()).unwrap();
+        fs::write(tmp.path().join("base.txt"), b"base\n").unwrap();
+        commit_paths_lockfree(&repo, &config, "base", &["base.txt"]).unwrap();
+        let git_dir = repo.path().to_path_buf();
+        let original_index = fs::read(git_dir.join("index")).unwrap();
+        let _background = BackgroundIndexSync::enter();
+        fs::write(tmp.path().join("pending.txt"), b"pending sync\n").unwrap();
+        commit_paths_lockfree(&repo, &config, "pending", &["pending.txt"]).unwrap();
+        let original_lag = ARCHIVE_INDEX_SYNC.0.lock().unwrap().pending[&git_dir];
+        let allow_recovery = Arc::new(AtomicBool::new(false));
+        let panic_count = Arc::new(AtomicU64::new(0));
+        let concurrent_lag = Arc::new(Mutex::new(None));
+        let worker_allow_recovery = Arc::clone(&allow_recovery);
+        let worker_panic_count = Arc::clone(&panic_count);
+        let worker_concurrent_lag = Arc::clone(&concurrent_lag);
+        let worker_root = tmp.path().to_path_buf();
+        let worker_git_dir = git_dir.clone();
+        let worker_config = config.clone();
+        let worker = std::thread::Builder::new()
+            .name("index-sync-panic-recovery-regression".to_string())
+            .stack_size(storage_worker_stack_size())
+            .spawn(move || {
+                ARCHIVE_INDEX_SYNC_AFTER_LOCK_TEST_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move |attempted_git_dir| {
+                        if attempted_git_dir != worker_git_dir
+                            || worker_allow_recovery.load(Ordering::Acquire)
+                        {
+                            return;
+                        }
+                        if worker_panic_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                            // A real commit arrives after this attempt removed
+                            // its lag record and while it owns index.lock. The
+                            // lock-free commit path must remain independent of
+                            // shared-index maintenance, and its newer pending
+                            // work must merge with the failed attempt's lag.
+                            let _background = BackgroundIndexSync::enter();
+                            let repo = Repository::open(&worker_root).unwrap();
+                            fs::write(worker_root.join("during-sync.txt"), b"newer commit\n")
+                                .unwrap();
+                            commit_paths_lockfree(
+                                &repo,
+                                &worker_config,
+                                "commit during index sync",
+                                &["during-sync.txt"],
+                            )
+                            .unwrap();
+                            let lag = ARCHIVE_INDEX_SYNC
+                                .0
+                                .lock()
+                                .unwrap()
+                                .pending
+                                .get(attempted_git_dir)
+                                .copied();
+                            *worker_concurrent_lag.lock().unwrap() = lag;
+                        }
+                        panic!("injected index sync panic after acquiring its lock"); // ubs:ignore -- Test-only fault injection exercises real lock cleanup and worker recovery.
+                    }));
+                });
+                archive_index_sync_worker();
+            })
+            .unwrap();
+
+        let state = wait_for_archive_index_sync_state(
+            |state| state.warned.contains(&git_dir) && !state.in_flight,
+            Duration::from_secs(10),
+        );
+        let retained_lag = state.pending.get(&git_dir).copied();
+        let warned_after_panic = state.warned.contains(&git_dir);
+        let pending_count = state.pending.len();
+        let released_lock =
+            !git_dir.join("index.lock").exists() && !git_dir.join("index.lock.owner").exists();
+        let preserved_index = fs::read(git_dir.join("index")).unwrap() == original_index;
+        allow_recovery.store(true, Ordering::Release);
+        drop(state);
+        let state = wait_for_archive_index_sync_state(
+            |state| {
+                !state.pending.contains_key(&git_dir)
+                    && !state.warned.contains(&git_dir)
+                    && !state.in_flight
+            },
+            Duration::from_secs(35),
+        );
+        let recovered = !state.pending.contains_key(&git_dir)
+            && !state.warned.contains(&git_dir)
+            && !state.in_flight;
+        let recovered_tree = shared_index_tree(&repo);
+        let head_after_recovery = repo.head().unwrap().peel_to_tree().unwrap().id();
+        drop(state);
+
+        // Stop with a fresh failed attempt pending, rather than only testing
+        // idle shutdown. Shutdown must wake the backoff wait and start no more
+        // syncs, leaving queued work intact as shutdown returns.
+        allow_recovery.store(false, Ordering::Release);
+        fs::write(
+            tmp.path().join("shutdown-pending.txt"),
+            b"pending at shutdown\n",
+        )
+        .unwrap();
+        commit_paths_lockfree(
+            &repo,
+            &config,
+            "pending at shutdown",
+            &["shutdown-pending.txt"],
+        )
+        .unwrap();
+        let state = wait_for_archive_index_sync_state(
+            |state| state.warned.contains(&git_dir) && !state.in_flight,
+            Duration::from_secs(10),
+        );
+        let pending_at_shutdown = state.pending.contains_key(&git_dir);
+        let warned_at_shutdown = state.warned.contains(&git_dir);
+        drop(state);
+        stop_archive_index_sync(Duration::from_secs(5));
+        worker
+            .join()
+            .expect("panics must not kill the index sync worker");
+
+        assert!(
+            warned_after_panic,
+            "the worker must report the caught panic"
+        );
+        let retained_lag = retained_lag.expect("the failed attempt must remain owed");
+        let concurrent_lag = concurrent_lag
+            .lock()
+            .unwrap()
+            .expect("new commit was queued");
+        assert_eq!(retained_lag.since, original_lag.since);
+        assert_eq!(retained_lag.last_commit, concurrent_lag.last_commit);
+        assert!(concurrent_lag.since > original_lag.since);
+        assert_eq!(pending_count, 1);
+        assert!(
+            released_lock,
+            "unwinding must release the owned lock and witness"
+        );
+        assert!(
+            preserved_index,
+            "a failed sync must leave the index untouched"
+        );
+        assert!(
+            recovered,
+            "the same worker must recover without another notification"
+        );
+        assert_eq!(recovered_tree, head_after_recovery);
+        assert!(panic_count.load(Ordering::Relaxed) >= 2);
+        assert!(pending_at_shutdown && warned_at_shutdown);
+        let state = ARCHIVE_INDEX_SYNC.0.lock().unwrap();
+        assert!(state.stopping);
+        assert!(!state.in_flight);
+        assert!(state.pending.contains_key(&git_dir));
+        assert_eq!(shared_index_tree(&repo), recovered_tree);
+        assert!(!git_dir.join("index.lock").exists());
+        assert!(!git_dir.join("index.lock.owner").exists());
+    }
+
     #[test]
     fn archive_index_sync_catches_up_but_never_overwrites_foreign_state() {
         // br-0i0g4: commits no longer rewrite .git/index; a later sync brings
@@ -27569,7 +33133,9 @@ mod tests {
         let mut exited = std::process::Command::new("true").spawn().unwrap();
         let dead = exited.id();
         exited.wait().unwrap();
-        fs::write(&owner, format!("{dead}\n0\n0\n")).unwrap();
+        let lock_file = mcp_agent_mail_core::disk::open_regular_file_no_follow(&lock).unwrap();
+        write_index_sync_lock_witness(&archive.repo_root, &lock_file, dead, 0).unwrap();
+        drop(lock_file);
         assert_eq!(sync(), ArchiveIndexSync::Settled);
         assert_eq!(shared_index_tree(&repo), head_tree());
         assert!(!lock.exists() && !owner.exists());
@@ -27615,6 +33181,298 @@ mod tests {
         commit("e.txt");
         assert_eq!(sync(), ArchiveIndexSync::Settled);
         assert_eq!(shared_index_tree(&repo), head_tree());
+    }
+
+    struct IndexWriterProcess(std::process::Child);
+
+    impl Drop for IndexWriterProcess {
+        fn drop(&mut self) {
+            drop(self.0.stdin.take());
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn archive_index_sync_preserves_an_aged_live_git_writer_without_owner_metadata() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let _background = BackgroundIndexSync::enter();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "live-index-writer").unwrap();
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        let git_dir = repo.path().to_path_buf();
+        let note = archive.root.join("ordinary.txt");
+        fs::write(&note, b"ordinary archive work").unwrap();
+        let relative = rel_path_cached(&archive.canonical_repo_root, &note).unwrap();
+        commit_paths_lockfree(&repo, &config, "ordinary", &[&relative]).unwrap();
+        assert_eq!(
+            sync_archive_index_to_head(&git_dir).unwrap(),
+            ArchiveIndexSync::Settled
+        );
+        let mut writer = IndexWriterProcess(
+            Command::new("git")
+                .arg("-C")
+                .arg(&archive.repo_root)
+                .args(["update-index", "--index-info"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let lock_path = git_dir.join("index.lock");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !lock_path.is_file() {
+            assert!(writer.0.try_wait().unwrap().is_none());
+            assert!(Instant::now() < deadline, "Git did not acquire index.lock");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Advancing only the timestamp exercises the old automatic 30-second
+        // age-based cleanup without making this regression sleep for minutes.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(3_600)),
+            )
+            .unwrap();
+        assert!(!git_dir.join("index.lock.owner").exists());
+        let identity = git_lock_identity(&lock_path);
+        let index_before = fs::read(git_dir.join("index")).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                sync_archive_index_to_head(&git_dir).unwrap(),
+                ArchiveIndexSync::Locked
+            );
+            assert_eq!(git_lock_identity(&lock_path), identity);
+            assert_eq!(fs::read(git_dir.join("index")).unwrap(), index_before);
+            assert!(writer.0.try_wait().unwrap().is_none());
+        }
+        // An advisory record left by a dead commit attempt never identified
+        // this Git writer's lock. A PID alone must not authorize its removal.
+        let mut exited = Command::new("git")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let dead = exited.id();
+        assert!(exited.wait().unwrap().success());
+        let owner_path = git_dir.join("index.lock.owner");
+        fs::write(&owner_path, format!("{dead}\n0\n0\n")).unwrap();
+        assert_eq!(
+            sync_archive_index_to_head(&git_dir).unwrap(),
+            ArchiveIndexSync::Locked
+        );
+        assert_eq!(git_lock_identity(&lock_path), identity);
+        // A witnessed record from a different lock file is equally powerless.
+        let prior_lock = tempfile::tempfile().unwrap();
+        let prior_witness = index_sync_lock_witness(&prior_lock).unwrap();
+        fs::write(
+            &owner_path,
+            format!("{dead}\n0\n0\n{INDEX_SYNC_LOCK_WITNESS_PREFIX}{prior_witness}\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            sync_archive_index_to_head(&git_dir).unwrap(),
+            ArchiveIndexSync::Locked
+        );
+        assert_eq!(git_lock_identity(&lock_path), identity);
+        assert_eq!(fs::read(git_dir.join("index")).unwrap(), index_before);
+
+        // The ordinary fallback also uses a private index: its advisory owner
+        // record and exact-path commit must leave the real Git lock untouched.
+        fs::write(&note, b"ordinary work while external Git owns its index").unwrap();
+        run_with_lock_owner(&archive.repo_root, || {
+            commit_paths(
+                &repo,
+                &config,
+                "ordinary private-index fallback",
+                &[&relative],
+            )
+        })
+        .unwrap();
+        assert_eq!(git_lock_identity(&lock_path), identity);
+        assert_eq!(fs::read(git_dir.join("index")).unwrap(), index_before);
+        let ordinary = repo
+            .head()
+            .unwrap()
+            .peel_to_tree()
+            .unwrap()
+            .get_path(Path::new(&relative))
+            .unwrap();
+        assert_eq!(
+            repo.find_blob(ordinary.id()).unwrap().content(),
+            b"ordinary work while external Git owns its index"
+        );
+        let staged = repo.blob(b"irreplaceable operator staging").unwrap();
+        writeln!(
+            writer.0.stdin.as_mut().unwrap(),
+            "100644 {staged}\toperator-pending.txt"
+        )
+        .unwrap();
+        drop(writer.0.stdin.take());
+        assert!(writer.0.wait().unwrap().success());
+        assert!(!lock_path.exists());
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        assert_eq!(
+            index
+                .get_path(Path::new("operator-pending.txt"), 0)
+                .unwrap()
+                .id,
+            staged
+        );
+        let published = fs::read(git_dir.join("index")).unwrap();
+        assert_eq!(
+            sync_archive_index_to_head(&git_dir).unwrap(),
+            ArchiveIndexSync::Settled
+        );
+        assert_eq!(fs::read(git_dir.join("index")).unwrap(), published);
+        assert!(
+            repo.head()
+                .unwrap()
+                .peel_to_tree()
+                .unwrap()
+                .get_path(Path::new("operator-pending.txt"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn archive_index_sync_keeps_old_locks_when_owner_evidence_is_inconclusive() {
+        let _background = BackgroundIndexSync::enter();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "ambiguous-index-owner").unwrap();
+        let git_dir = archive.repo_root.join(".git");
+        let lock_path = git_dir.join("index.lock");
+        let owner_path = git_dir.join("index.lock.owner");
+        fs::write(&lock_path, b"retain uncertain ownership").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(3_600)),
+            )
+            .unwrap();
+        let me = std::process::id();
+        for owner in [
+            String::new(),
+            "unknown\n0\n0\n".into(),
+            "0\n0\n0\n".into(),
+            format!("{me}\n0\n"),
+            format!("{me}\n0\n0\n"),
+            "999999999\ninvalid-time\n0\n".into(),
+            "999999999\n0\ninvalid-start\n".into(),
+        ] {
+            fs::write(&owner_path, &owner).unwrap();
+            assert_eq!(
+                sync_archive_index_to_head(&git_dir).unwrap(),
+                ArchiveIndexSync::Locked,
+                "owner {owner:?} is not proof that the lock was abandoned"
+            );
+            assert_eq!(fs::read(&lock_path).unwrap(), b"retain uncertain ownership");
+            assert_eq!(fs::read_to_string(&owner_path).unwrap(), owner);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_index_sync_requires_a_witness_for_the_exact_completed_lock_bytes() {
+        use std::io::Write as _;
+
+        let _background = BackgroundIndexSync::enter();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "witnessed-index-owner").unwrap();
+        let lock_path = archive.repo_root.join(".git/index.lock");
+        let owner_path = archive.repo_root.join(".git/index.lock.owner");
+        let mut lock = create_index_lock(&lock_path).unwrap();
+        let me = std::process::id();
+        assert!(!index_sync_owner_is_gone(0, 0));
+        assert!(!index_sync_owner_is_gone(u32::MAX, 0));
+        for ticks in [0, process_start_ticks(me).unwrap_or(0)] {
+            let live = write_index_sync_lock_witness(&archive.repo_root, &lock, me, ticks).unwrap();
+            assert!(!reclaim_abandoned_index_sync_lock(&archive.repo_root));
+            assert_eq!(fs::read(&owner_path).unwrap(), live);
+            assert!(lock_path.exists());
+        }
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let dead = exited.id();
+        exited.wait().unwrap();
+        let initial = write_index_sync_lock_witness(&archive.repo_root, &lock, dead, 0).unwrap();
+        lock.write_all(b"partially prepared index").unwrap();
+        lock.sync_all().unwrap();
+        assert!(!reclaim_abandoned_index_sync_lock(&archive.repo_root));
+        assert_eq!(fs::read(&owner_path).unwrap(), initial);
+        assert_eq!(fs::read(&lock_path).unwrap(), b"partially prepared index");
+
+        // A complete, fsynced write refreshes the exact witness. Reclamation
+        // of this abandoned sync does not authorize any staged publication.
+        let refreshed = write_index_sync_lock_witness(&archive.repo_root, &lock, dead, 0).unwrap();
+        assert_ne!(refreshed, initial);
+        assert!(reclaim_abandoned_index_sync_lock(&archive.repo_root));
+        assert!(!lock_path.exists() && !owner_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_index_sync_competing_cleaners_do_not_reclaim_a_replacement_lock() {
+        let _background = BackgroundIndexSync::enter();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "competing-index-cleaners").unwrap();
+        let lock_path = archive.repo_root.join(".git/index.lock");
+        let owner_path = archive.repo_root.join(".git/index.lock.owner");
+        let lock = create_index_lock(&lock_path).unwrap();
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let dead = exited.id();
+        exited.wait().unwrap();
+        let bytes = write_index_sync_lock_witness(&archive.repo_root, &lock, dead, 0).unwrap();
+        drop(lock);
+
+        let first = mcp_agent_mail_core::disk::open_regular_file_no_follow(&owner_path).unwrap();
+        fs2::FileExt::try_lock_exclusive(&first).unwrap();
+        std::thread::scope(|scope| {
+            let root = &archive.repo_root;
+            assert!(
+                !scope
+                    .spawn(move || reclaim_abandoned_index_sync_lock(root))
+                    .join()
+                    .unwrap()
+            );
+        });
+        assert_eq!(fs::read(&owner_path).unwrap(), bytes);
+        assert!(lock_path.exists());
+        drop(first);
+
+        // Model a second cleaner paused after opening the old owner. The
+        // first completes cleanup and a writer acquires an entirely new pair.
+        let stale = mcp_agent_mail_core::disk::open_regular_file_no_follow(&owner_path).unwrap();
+        assert!(reclaim_abandoned_index_sync_lock(&archive.repo_root));
+        let replacement = create_index_lock(&lock_path).unwrap();
+        let me = std::process::id();
+        let current = write_index_sync_lock_witness(
+            &archive.repo_root,
+            &replacement,
+            me,
+            process_start_ticks(me).unwrap_or(0),
+        )
+        .unwrap();
+        let identity = index_sync_lock_witness_at(&lock_path).unwrap();
+        assert!(!reclaim_index_sync_lock_with_owner(
+            &archive.repo_root,
+            stale
+        ));
+        assert_eq!(index_sync_lock_witness_at(&lock_path).unwrap(), identity);
+        assert_eq!(fs::read(&owner_path).unwrap(), current);
     }
 
     #[test]

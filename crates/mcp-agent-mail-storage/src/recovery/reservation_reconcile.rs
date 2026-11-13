@@ -8,6 +8,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use asupersync::{Cx, Outcome};
 use fastmcp_core::block_on;
@@ -57,6 +58,19 @@ pub struct ReservationReconcileCursor {
     retries: retry::RetryQueue,
 }
 
+impl ReservationReconcileCursor {
+    /// Earliest retained retry, not permission to reuse an earlier source read.
+    #[must_use]
+    pub fn next_retry_at(&self) -> Option<Instant> {
+        self.retries.next_ready_at()
+    }
+
+    #[must_use]
+    pub fn has_retry_capacity(&self) -> bool {
+        !self.retries.is_full()
+    }
+}
+
 #[derive(Debug, Default)]
 struct ScanPosition {
     after: i64,
@@ -76,6 +90,7 @@ pub struct ReservationReconcileReport {
     pub deferred_transient: usize,
     /// Pending IDs, including those whose per-ID cooldown has not elapsed.
     pub retry_len: usize,
+    pub scan_advanced: bool,
     pub interrupted: bool,
     pub budget_exhausted: bool,
 }
@@ -257,6 +272,47 @@ fn validate_source(pool: &DbPool, config: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// Admission, checkpoint binding and discovery all gate release retries. A
+/// failed reader at any of those gates must leave the pool before the next
+/// pass; successful reads of conflicting metadata remain ordinary refusals.
+/// Keep this boundary around source reads only, never checkpoint or archive I/O.
+fn read_discovery<T>(
+    cx: &Cx,
+    pool: &DbPool,
+    read: impl FnOnce(&DbConn) -> Result<T, ReleaseFailure>,
+) -> Result<T, String> {
+    let conn = outcome(block_on(pool.acquire(cx)))?;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(&conn)))
+        .unwrap_or_else(|_| {
+            Err(ReleaseFailure::source_unavailable(
+                "reservation archive discovery read panicked",
+            ))
+        });
+    if result.as_ref().is_err_and(|error| error.transient) {
+        mcp_agent_mail_db::close_db_conn(conn.detach(), "failed reservation discovery read");
+    }
+    result.map_err(|error| error.detail)
+}
+
+fn discovery_query(
+    conn: &DbConn,
+    sql: &str,
+    params: &[mcp_agent_mail_db::sqlmodel_core::Value],
+) -> Result<Vec<mcp_agent_mail_db::sqlmodel_core::Row>, ReleaseFailure> {
+    #[cfg(test)]
+    tests::discovery_read_fault(conn)?;
+    conn.query_sync(sql, params)
+        .map_err(ReleaseFailure::source_unavailable)
+}
+
+fn require_writable(conn: &DbConn) -> Result<(), ReleaseFailure> {
+    let mode = discovery_query(conn, "PRAGMA query_only", &[])?;
+    if mode.first().and_then(|row| row.get_as::<i64>(0).ok()) != Some(0) {
+        return Err("query-only snapshots cannot authorize reservation archive repair".into());
+    }
+    Ok(())
+}
+
 fn select_ids(
     cx: &Cx,
     pool: &DbPool,
@@ -264,50 +320,54 @@ fn select_ids(
     limit: i64,
     unexpired_only: bool,
 ) -> Result<Vec<i64>, String> {
-    let conn = outcome(block_on(pool.acquire(cx)))?;
-    let mode = conn
-        .query_sync("PRAGMA query_only", &[])
-        .map_err(source_error)?;
-    if mode.first().and_then(|row| row.get_as::<i64>(0).ok()) != Some(0) {
-        return Err("query-only snapshots cannot authorize reservation archive repair".into());
-    }
-    if cursor.ceiling.is_none() {
-        let rows = conn
-            .query_sync("SELECT COALESCE(MAX(id), 0) FROM file_reservations", &[])
-            .map_err(source_error)?;
-        cursor.ceiling = Some(
-            rows.first()
-                .ok_or("reservation ID aggregate is missing")?
-                .get_as::<i64>(0)
-                .map_err(source_error)?,
-        );
-        cursor.after = 0;
-    }
-    // History walks a bounded primary-key window, including active rows as
-    // unchanged, so a sparse release history cannot force a full table scan.
-    // Priority filters for still-unexpired terminal rows to reach guard-blocking
-    // releases promptly; its LIMIT bounds selected IDs, not SQL rows examined.
-    let rows = conn
-        .query_sync(
+    // Do not consume a new round until every query and ID decode succeeds.
+    // The retry queue and its independent checkpoint owner are never copied.
+    let mut selected = ScanPosition {
+        after: cursor.after,
+        ceiling: cursor.ceiling,
+    };
+    let ids = read_discovery(cx, pool, |conn| {
+        require_writable(conn)?;
+        if selected.ceiling.is_none() {
+            let rows = discovery_query(
+                conn,
+                "SELECT COALESCE(MAX(id), 0) FROM file_reservations",
+                &[],
+            )?;
+            selected.ceiling = Some(
+                rows.first()
+                    .ok_or("reservation ID aggregate is missing")?
+                    .get_as::<i64>(0)
+                    .map_err(source_error)?,
+            );
+            selected.after = 0;
+        }
+        // History walks a bounded primary-key window, including active rows as
+        // unchanged, so a sparse release history cannot force a full table scan.
+        let rows = discovery_query(
+            conn,
             "SELECT fr.id FROM file_reservations fr WHERE fr.id > ? AND fr.id <= ? \
          AND (? = 0 OR (fr.expires_ts > ? AND (fr.released_ts IS NOT NULL OR EXISTS \
              (SELECT 1 FROM file_reservation_releases rr WHERE rr.reservation_id = fr.id)))) \
          ORDER BY fr.id LIMIT ?",
             &[
-                cursor.after.into(),
-                cursor.ceiling.unwrap_or(0).into(),
+                selected.after.into(),
+                selected.ceiling.unwrap_or(0).into(),
                 i64::from(unexpired_only).into(),
                 mcp_agent_mail_db::now_micros().into(),
                 limit.into(),
             ],
-        )
-        .map_err(source_error)?;
-    if rows.is_empty() {
-        cursor.ceiling = None;
-    }
-    rows.iter()
-        .map(|row| row.get_named("id").map_err(source_error))
-        .collect()
+        )?;
+        if rows.is_empty() {
+            selected.ceiling = None;
+        }
+        Ok(rows
+            .iter()
+            .map(|row| row.get_named("id").map_err(source_error))
+            .collect::<Result<Vec<_>, _>>()?)
+    })?;
+    *cursor = selected;
+    Ok(ids)
 }
 
 fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<Option<ReleaseSource>, ReleaseFailure> {
@@ -349,23 +409,8 @@ fn read_source_connection_inner(
 ) -> Result<Option<ReleaseSource>, ReleaseFailure> {
     // Identity, effective release and generation belong to one SQL snapshot.
     // Bound raw strings before materializing them; never seed a generation.
-    let rows = conn.query_sync(
-        "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                fr.created_ts, fr.expires_ts, CAST(fr.released_ts AS TEXT) AS hot_release, \
-                rr.released_ts AS ledger_release, p.slug, p.human_key, a.name, d.generation_id \
-         FROM file_reservations fr JOIN projects p ON p.id = fr.project_id \
-         JOIN agents a ON a.id = fr.agent_id AND a.project_id = fr.project_id \
-         LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
-         LEFT JOIN db_identity d ON d.singleton = 0 \
-         WHERE fr.id = ? AND length(CAST(fr.path_pattern AS BLOB)) + length(CAST(fr.reason AS BLOB)) + \
-               length(CAST(p.slug AS BLOB)) + length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
-               length(CAST(fr.created_ts AS BLOB)) + length(CAST(fr.expires_ts AS BLOB)) + \
-               length(CAST(fr.\"exclusive\" AS BLOB)) + \
-               COALESCE(length(CAST(fr.released_ts AS BLOB)), 0) + \
-               COALESCE(length(CAST(rr.released_ts AS BLOB)), 0) + \
-               COALESCE(length(CAST(d.generation_id AS BLOB)), 0) <= ?",
-        &[id.into(), MAX_SOURCE_BYTES.into()],
-    ).map_err(ReleaseFailure::source_unavailable)?;
+    let rows = super::query_reservation_source(conn, id, MAX_SOURCE_BYTES)
+        .map_err(ReleaseFailure::source_unavailable)?;
     let [row] = rows.as_slice() else {
         return Err(
             "reservation source missing, oversized, or lacking project/holder authority".into(),
@@ -853,8 +898,10 @@ pub fn reconcile_released_reservation(
 /// finite history for manual review, not the contention retry lane. Retry debt
 /// is process-local; restarting safely starts new finite source scans.
 /// Source connections are acquired before archive locks and released before
-/// Git I/O; a write-activity lease prevents recovery promotion from replacing
-/// the source during the pass.
+/// Git I/O. Each selection and individual publication has its own source
+/// admission lease; recovery promotion can proceed between items. Checkpoint
+/// preparation holds no database activity, and its atomic publication rechecks
+/// the live source binding under a fresh lease.
 /// Closed or contended admission defers without advancing cursors or retries.
 pub fn reconcile_reservation_releases(
     cx: &Cx,
@@ -868,13 +915,93 @@ pub fn reconcile_reservation_releases(
 
 #[cfg(test)]
 mod tests {
+    use super::super::RESERVATION_SOURCE_SQL as SOURCE_SQL;
     use super::*;
+    use mcp_agent_mail_db::sqlmodel_core::Value as SqlValue;
+
+    // Execute the previous statement beside the new production query against
+    // the same runtime DB; preserve all projected values and refusals without
+    // making machine-dependent timing a unit-test gate.
+    const PREVIOUS_SOURCE_SQL: &str = "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
+                fr.created_ts, fr.expires_ts, CAST(fr.released_ts AS TEXT) AS hot_release, \
+                rr.released_ts AS ledger_release, p.slug, p.human_key, a.name, d.generation_id \
+         FROM file_reservations fr JOIN projects p ON p.id = fr.project_id \
+         JOIN agents a ON a.id = fr.agent_id AND a.project_id = fr.project_id \
+         LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
+         LEFT JOIN db_identity d ON d.singleton = 0 \
+         WHERE fr.id = ? AND length(CAST(fr.path_pattern AS BLOB)) + length(CAST(fr.reason AS BLOB)) + \
+               length(CAST(p.slug AS BLOB)) + length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
+               length(CAST(fr.created_ts AS BLOB)) + length(CAST(fr.expires_ts AS BLOB)) + \
+               length(CAST(fr.\"exclusive\" AS BLOB)) + \
+               COALESCE(length(CAST(fr.released_ts AS BLOB)), 0) + \
+               COALESCE(length(CAST(rr.released_ts AS BLOB)), 0) + \
+               COALESCE(length(CAST(d.generation_id AS BLOB)), 0) <= ?";
+
+    fn assert_source_projection_unchanged(conn: &DbConn, id: i64) {
+        let project = |sql| -> Vec<Vec<SqlValue>> {
+            conn.query_sync(sql, &[id.into(), MAX_SOURCE_BYTES.into()])
+                .unwrap()
+                .iter()
+                .map(|row| row.values().cloned().collect())
+                .collect()
+        };
+        assert_eq!(project(SOURCE_SQL), project(PREVIOUS_SOURCE_SQL), "id={id}");
+    }
 
     std::thread_local! {
         static CHECKOUT_PENDING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
             const { std::cell::RefCell::new(None) };
         static SOURCE_READ_PANIC: std::cell::Cell<Option<(i64, bool, usize)>> =
             const { std::cell::Cell::new(None) };
+        static DISCOVERY_READ_FAULT: std::cell::Cell<Option<(usize, bool)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) struct DiscoveryReadFault;
+
+    impl DiscoveryReadFault {
+        pub(super) fn new(query: usize, panic: bool) -> Self {
+            assert!(query > 0);
+            DISCOVERY_READ_FAULT.with(|slot| {
+                assert!(slot.get().is_none());
+                slot.set(Some((query, panic)));
+            });
+            Self
+        }
+
+        pub(super) fn assert_triggered(&self) {
+            assert!(DISCOVERY_READ_FAULT.with(|slot| slot.get().is_none()));
+        }
+    }
+
+    impl Drop for DiscoveryReadFault {
+        fn drop(&mut self) {
+            DISCOVERY_READ_FAULT.with(|slot| slot.set(None));
+        }
+    }
+
+    pub(super) fn discovery_read_fault(conn: &DbConn) -> Result<(), ReleaseFailure> {
+        let fault = DISCOVERY_READ_FAULT.with(|slot| {
+            let (remaining, panic) = slot.get()?;
+            slot.set((remaining > 1).then_some((remaining.saturating_sub(1), panic)));
+            (remaining == 1).then_some(panic)
+        });
+        let Some(panic) = fault else {
+            return Ok(());
+        };
+        // Connection-local state proves the one-slot pool discards this reader;
+        // no DB row, source result, archive operation or Git result is mocked.
+        conn.execute_raw("PRAGMA query_only = ON").unwrap();
+        assert_eq!(
+            conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap(),
+            1
+        );
+        assert!(!panic, "private-reservation-discovery-panic-payload");
+        conn.query_sync("SELECT * FROM missing_reservation_discovery_probe", &[])
+            .map(|_| ())
+            .map_err(ReleaseFailure::source_unavailable)
     }
 
     // An owned, one-shot unwind at a real read boundary; no source result or
@@ -1119,6 +1246,157 @@ mod tests {
         let bytes = serde_json::to_vec_pretty(&value).unwrap();
         fs::write(&path, &bytes).unwrap();
         (path, bytes)
+    }
+
+    #[test]
+    fn release_source_point_lookup_preserves_projection_with_unrelated_history() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(72, 'other-project', '/other-project', 1)").unwrap();
+            conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(82, 72, 'RedFox', 'test', 'test', 1, 1)").unwrap();
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            for start in (1_000..3_048).step_by(128) {
+                let reservations = (start..start + 128)
+                    .map(|id| {
+                        format!(
+                            "({id},72,82,'other/*.rs',1,'unrelated history',1000000,9000000,NULL)"
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                conn.execute_raw(&format!(
+                    "INSERT INTO file_reservations(id,project_id,agent_id,path_pattern,\"exclusive\",reason,created_ts,expires_ts,released_ts) VALUES {reservations}"
+                )).unwrap();
+                let releases = (start..start + 128)
+                    .step_by(2)
+                    .map(|id| format!("({id},5000000)"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                conn.execute_raw(&format!(
+                    "INSERT INTO file_reservation_releases(reservation_id,released_ts) VALUES {releases}"
+                )).unwrap();
+            }
+            conn.execute_raw("COMMIT").unwrap();
+            conn.execute_raw("INSERT INTO file_reservations(id,project_id,agent_id,path_pattern,\"exclusive\",reason,created_ts,expires_ts,released_ts) VALUES(402,71,81,'docs/*.md',0,'legacy-hot',2000000,10000000,6000000)").unwrap();
+
+            for id in [401, 402, 1_000, 1_001, 3_047, 9_999] {
+                assert_source_projection_unchanged(&conn, id);
+            }
+            let source = read_source_connection(&conn, 401).unwrap().unwrap();
+            assert_eq!(
+                (source.id, source.project_id, source.agent_id),
+                (401, 71, 81)
+            );
+            assert_eq!(source.project_slug, "project");
+            assert_eq!(source.generation.as_deref(), Some("aabb"));
+            assert_eq!(
+                source.artifact,
+                json!({
+                    "id": 401, "project": "/project", "agent": "BlueLake",
+                    "path_pattern": "src/*.rs", "exclusive": true, "reason": "release-test",
+                    "created_ts": mcp_agent_mail_db::micros_to_iso(1_000_000),
+                    "expires_ts": mcp_agent_mail_db::micros_to_iso(9_000_000),
+                    "released_ts": mcp_agent_mail_db::micros_to_iso(5_000_000),
+                    "db_generation": "aabb",
+                })
+            );
+            let legacy = read_source_connection(&conn, 402).unwrap().unwrap();
+            assert_eq!(
+                legacy.artifact,
+                json!({
+                    "id": 402, "project": "/project", "agent": "BlueLake",
+                    "path_pattern": "docs/*.md", "exclusive": false, "reason": "legacy-hot",
+                    "created_ts": mcp_agent_mail_db::micros_to_iso(2_000_000),
+                    "expires_ts": mcp_agent_mail_db::micros_to_iso(10_000_000),
+                    "released_ts": mcp_agent_mail_db::micros_to_iso(6_000_000),
+                    "db_generation": "aabb",
+                })
+            );
+            let other = read_source_connection(&conn, 1_000).unwrap().unwrap();
+            assert_eq!((other.project_id, other.agent_id), (72, 82));
+            assert_eq!(other.artifact["agent"], "RedFox");
+            assert_eq!(other.artifact["project"], "/other-project");
+            assert!(read_source_connection(&conn, 1_001).unwrap().is_none());
+            assert!(!read_source_connection(&conn, 9_999).unwrap_err().transient);
+
+            // A hot timestamp must not replace the release ledger's authority.
+            conn.execute_raw("UPDATE file_reservations SET released_ts = 4000000 WHERE id = 401")
+                .unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            assert_eq!(read_source_connection(&conn, 401).unwrap().unwrap(), source);
+            conn.execute_raw(
+                "UPDATE file_reservation_releases SET released_ts = 0 WHERE reservation_id = 401",
+            )
+            .unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            assert!(read_source_connection(&conn, 401).unwrap().is_none());
+            conn.execute_raw("UPDATE file_reservations SET released_ts = 'invalid' WHERE id = 402")
+                .unwrap();
+            assert_source_projection_unchanged(&conn, 402);
+            assert!(read_source_connection(&conn, 402).unwrap().is_none());
+            assert!(!config.storage_root.join(".git").exists());
+        });
+    }
+
+    #[test]
+    fn release_source_point_lookup_preserves_byte_bound_and_holder_authority() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            // Includes the ledger timestamp even though the hot column is NULL.
+            // UTF-8 must be limited by bytes before Rust materializes the row.
+            let fixed_bytes = [
+                "src/*.rs", "project", "/project", "BlueLake", "1000000", "9000000", "1",
+                "5000000", "aabb",
+            ]
+            .into_iter()
+            .map(str::len)
+            .sum::<usize>();
+            let reason_bytes = usize::try_from(MAX_SOURCE_BYTES).unwrap() - fixed_bytes;
+            let mut reason = format!("é{}", "x".repeat(reason_bytes - "é".len()));
+            conn.execute_sync(
+                "UPDATE file_reservations SET reason = ? WHERE id = 401",
+                &[reason.clone().into()],
+            )
+            .unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            assert_eq!(
+                read_source_connection(&conn, 401)
+                    .unwrap()
+                    .unwrap()
+                    .artifact["reason"],
+                reason
+            );
+            reason.push('x');
+            conn.execute_sync(
+                "UPDATE file_reservations SET reason = ? WHERE id = 401",
+                &[reason.into()],
+            )
+            .unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            let oversized = read_source_connection(&conn, 401).unwrap_err();
+            assert!(!oversized.transient);
+            assert!(oversized.detail.contains("oversized"));
+            conn.execute_raw("UPDATE file_reservations SET reason = 'release-test' WHERE id = 401")
+                .unwrap();
+
+            conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(72, 'other-project', '/other-project', 1)").unwrap();
+            conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(82, 72, 'RedFox', 'test', 'test', 1, 1)").unwrap();
+            conn.execute_raw("UPDATE file_reservations SET agent_id = 82 WHERE id = 401")
+                .unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            let foreign_holder = read_source_connection(&conn, 401).unwrap_err();
+            assert!(!foreign_holder.transient);
+            assert!(foreign_holder.detail.contains("holder authority"));
+            conn.execute_raw("UPDATE file_reservations SET agent_id = 81 WHERE id = 401")
+                .unwrap();
+            conn.execute_raw("UPDATE db_identity SET generation_id = '' WHERE singleton = 0")
+                .unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            let invalid_generation = read_source_connection(&conn, 401).unwrap_err();
+            assert!(!invalid_generation.transient);
+            assert!(invalid_generation.detail.contains("generation is invalid"));
+            assert!(!config.storage_root.join(".git").exists());
+        });
     }
 
     #[test]
@@ -1646,6 +1924,50 @@ mod tests {
     }
 
     #[test]
+    fn mailbox_scale_targeted_release_queries_remain_bounded_and_idempotent() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            super::super::tests::seed_reservation_history(&conn, 71, 81, 401);
+            conn.execute_raw(
+                "INSERT INTO file_reservation_releases(reservation_id, released_ts) \
+                 VALUES(9482, 6000000)",
+            )
+            .unwrap();
+            drop(conn);
+            let captured = captured_row(cx, pool, 9482);
+            let path = config
+                .storage_root
+                .join("projects/project/file_reservations/id-9482-gaabb.json");
+            for round in 0..2 {
+                super::super::tests::reset_reservation_source_queries();
+                let started = std::time::Instant::now();
+                let repaired =
+                    reconcile_released_reservation(cx, pool, config, &captured, "aabb").unwrap();
+                let queries = super::super::tests::reservation_source_queries();
+                assert_eq!(repaired, round == 0);
+                assert_eq!(queries, if round == 0 { 3 } else { 2 });
+                let artifact = read_artifact(&path).unwrap().unwrap();
+                assert_eq!(timestamp(&artifact.value["released_ts"]), Some(6_000_000));
+                let repo = Repository::open(&config.storage_root).unwrap();
+                let tree = head_tree(&repo).unwrap().unwrap();
+                let committed = committed_artifact(
+                    &repo,
+                    Some(&tree),
+                    "projects/project/file_reservations/id-9482-gaabb.json",
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(committed.bytes, artifact.bytes);
+                eprintln!(
+                    "GH354 release round={round} reservations=9482 source_queries={queries} \
+                     repaired={repaired} wall_us={}",
+                    started.elapsed().as_micros()
+                );
+            }
+        });
+    }
+
+    #[test]
     fn targeted_release_preserves_reused_aliases_and_commits_only_stable_identity() {
         fixture(|cx, pool, config| {
             let source = read_source(cx, pool, 401).unwrap().unwrap();
@@ -1843,7 +2165,7 @@ mod tests {
         });
     }
 
-    fn isolated_admission_test() -> bool {
+    pub(super) fn isolated_admission_test() -> bool {
         const CHILD: &str = "AM_TEST_RESERVATION_ADMISSION_CHILD";
         let thread = std::thread::current();
         let name = thread.name().expect("named libtest thread");
@@ -2009,7 +2331,7 @@ mod tests {
             let process = crate::archive_process_lock(&archive).unwrap();
             let held = process.lock().unwrap();
             let targeted = reconcile_released_reservation(cx, pool, config, &captured, "aabb");
-            assert!(targeted.unwrap_err().contains("lock budget exhausted"));
+            assert!(targeted.unwrap_err().contains("project lock busy"));
             assert_eq!(fs::read(&stable).unwrap(), before);
 
             let mut cursor = ReservationReconcileCursor::default();

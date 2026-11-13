@@ -1658,6 +1658,16 @@ fn generate_deploy_guide(hints: &[HostingHint]) -> String {
     guide
 }
 
+/// Read an asset from the immutable viewer files embedded in the binary.
+///
+/// The live Mail UI shares its Tailwind runtime with exported viewers. This
+/// lookup never opens a filesystem path or downloads a replacement asset.
+pub fn embedded_viewer_asset(path: &str) -> Option<&'static [u8]> {
+    BUILTIN_VIEWER_ASSETS
+        .get_file(path)
+        .map(|file| file.contents())
+}
+
 /// Copy embedded viewer assets into `viewer/` in the bundle.
 ///
 /// Mirrors legacy behavior (package resources). Writes files in deterministic order.
@@ -2975,7 +2985,14 @@ mod tests {
         let file = std::fs::File::open(&zip_path).unwrap();
         let mut archive = zip::ZipArchive::new(file).unwrap();
         let names: Vec<String> = (0..archive.len())
-            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .map(|index| {
+                archive
+                    .by_index(index)
+                    .unwrap()
+                    .name()
+                    .unwrap()
+                    .into_owned()
+            })
             .collect();
 
         assert_eq!(names, vec!["a.txt", "nested/b.txt"]);
@@ -3205,6 +3222,24 @@ mod tests {
         let copied1 = copy_viewer_assets_from(&source, &out1).unwrap();
         let copied2 = copy_viewer_assets_from(&source, &out2).unwrap();
         assert_eq!(copied1, copied2, "copy order should be deterministic");
+    }
+
+    #[test]
+    fn embedded_viewer_asset_cannot_read_outside_the_shipped_assets() {
+        let tailwind = embedded_viewer_asset("vendor/tailwind.min.js").unwrap();
+        assert_eq!(tailwind.len(), 407_279);
+        assert_eq!(
+            hex::encode(Sha256::digest(tailwind)),
+            "176e894661aa9cdc9a5cba6c720044cbbf7b8bd80d1c9a142a7c24b1b6c50d15"
+        );
+        for path in [
+            "../Cargo.toml",
+            "/etc/passwd",
+            "vendor/../../Cargo.toml",
+            "missing.js",
+        ] {
+            assert!(embedded_viewer_asset(path).is_none(), "{path}");
+        }
     }
 
     #[test]
@@ -3575,7 +3610,10 @@ mod tests {
 
     #[test]
     fn publish_staged_bundle_outputs_restores_existing_bundle_on_mid_publish_failure() {
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_file as symlink;
 
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("bundle");
@@ -3620,7 +3658,10 @@ mod tests {
 
     #[test]
     fn publish_staged_bundle_outputs_removes_fresh_bundle_dir_on_mid_publish_failure() {
+        #[cfg(unix)]
         use std::os::unix::fs::symlink;
+        #[cfg(windows)]
+        use std::os::windows::fs::symlink_file as symlink;
 
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("bundle");

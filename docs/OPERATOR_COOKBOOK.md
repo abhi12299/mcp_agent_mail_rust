@@ -81,6 +81,14 @@ which overrides the working-directory `.env`.
 instead of killing the existing server. If you expect auth to be enabled, drop
 `--no-auth` and make sure `HTTP_BEARER_TOKEN` resolves from your env file.
 
+For a slow headless start (`--no-tui`), use `LOG_LEVEL=info` in the launching
+environment. Look for `startup_phase_started` and `startup_phase_finished`.
+The `phase` field identifies listener detection,
+backup rotation, individual probes and archive preflight; `duration_us` records
+elapsed work. A finish event means the call returned; use the probe report to
+determine success. A start with no finish identifies an interrupted or still
+running phase. Work deferred during listener handoff has no phase events.
+
 For a slow boot-time integrity probe, `INTEGRITY_CHECK_ON_STARTUP=false` skips
 only that startup probe. The background guard remains enabled and starts its
 first cycle after `INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS` (default 300 seconds,
@@ -226,6 +234,29 @@ The reaper itself rechecks eligibility in its write transaction. An identity
 that becomes active or exempt after a sweep selects it is preserved, and the
 sweep reports it in `skipped_changed_count` rather than `reaped_count`.
 
+### Merge two keys of one repository with `am projects adopt`
+
+`am projects adopt SOURCE TARGET` prints a plan and changes nothing. With
+`--apply` it re-keys the source project's agents, messages and file
+reservations to the target, moves its product links, moves the source's archive
+files into the target's archive, and records the source slug in the target's
+`aliases.json`. It refuses when an agent name exists in both projects. Applying
+needs exclusive local mailbox ownership, like the reaper-exemption change
+above.
+
+Both keys must resolve to the same Git common directory: two worktrees of one
+repository, or two directories inside one checkout. The plan's last line says
+which case applies:
+
+- `- Plan status: executable; rerun with --apply to perform it` (exit 0)
+- `- Plan status: refused; nothing was changed` (exit 1, with or without
+  `--apply`)
+
+There is no supported re-key for a project key that is not inside a Git
+repository, such as a plain coordination directory. Keep using the existing
+key. If a new key is needed, register agents under it; the old project's
+messages stay readable under the old key.
+
 ## 4. Triage urgent inbox items and ack backlog [read-only]
 
 **Goal:** See what needs attention first for one operator.
@@ -355,7 +386,19 @@ am robot navigate "resource://file_reservations?project=$PROJECT&active_only=tru
 agent filtering, expiry warnings, conflict detection, and navigation ordering
 remain the same. Reservation attestation identifies `source: "mcp_server"`;
 the database/archive comparison fields are null because no local database was
-read. Without `--server`, the commands retain their direct-read behavior.
+read.
+
+Without `--server`, `am reservations`, `am robot reservations` and
+`am file_reservations list`, `active`, `soon` and `conflicts` first try a
+loopback server whose reported database and storage root match the CLI's own
+configuration. The probe has a 2 s timeout. If such a server answers, the read
+goes through it and its authentication, protocol and identity failures are
+errors. If no server answers, or the server is older and does not report its
+mailbox, or it serves a different mailbox, the command reads the local files
+directly. With `WORKTREES_ENABLED` and a Git `PROJECT_IDENTITY_MODE`, an
+absolute project path always uses the direct read. `am robot navigate` reads
+directly unless `--server` is given. Use `--server` when automation must never
+fall back to the local files.
 
 The endpoint follows the existing client configuration (`AGENT_MAIL_URL`, or
 the configured `HTTP_HOST`, `HTTP_PORT`, and `HTTP_PATH` with existing local
@@ -387,6 +430,56 @@ row count, project and holder IDs, timestamps, and requested active/history
 scope. A snapshot is bounded to 10,000 reservations and holder identities and
 4 MiB of JSON; exceeding a bound is an error, never a truncated success.
 
+**Large reservation histories (GH#377):** `am file_reservations list <project>
+--all` now handles that specific capacity refusal by requesting a materialized
+paged snapshot from the same authenticated endpoint. This also applies when
+the matching local daemon is selected automatically. The running server must
+contain the paged-snapshot implementation; upgrade and restart older servers.
+The CLI never substitutes an unverified local database after a server refusal.
+
+The server captures the entire bounded history in one database read scope and
+releases that connection before serving cached pages. Concurrent inserts,
+deletes, releases, and renewals cannot move page boundaries or change an
+already-captured row. The result is complete **as of that capture**, not as of
+the last HTTP request. A fresh read sees later changes. Project recreation,
+mailbox engine replacement, or changed project/agent authority still causes
+the read to fail closed.
+
+The larger snapshot is bounded to 100,000 reservations and holder identities,
+64 MiB of serialized pages (including repeated identity metadata), and at most
+250 reservations / 4 MiB per response. Pages may be short because of bytes;
+only `next_offset: null` signals the terminal page. One row or the required
+identity metadata that cannot fit a page is rejected explicitly. The server
+keeps at most four snapshots and 128 MiB of serialized cache data, counting
+in-progress captures against capacity. Tokens expire after 300 seconds without
+refresh and are lost on server restart. Capacity, expiry, authentication, or
+validation errors discard accumulated rows; retry the command from the start.
+The CLI also bounds the read to 1,024 page requests and a 300-second deadline.
+
+For a raw MCP client, start with
+`resource://file_reservations/<slug>?snapshot_pages=true&active_only=false&format=json`.
+Validate `schema_version: 1` and `consistency: "materialized_snapshot"`, then
+continue with the same URI plus `snapshot_token=<returned-token>` and
+`offset=<next_offset>`. The token, captured timestamp, project, full holder
+roster, history scope, and total count remain identical across every page.
+Check contiguous offsets, exact counts, and ascending `(created_ts, id)` order;
+do not publish a complete result until the terminal page accounts for the
+entire `total_count`. Each continuation passes normal server authentication.
+Neither `limit` nor `snapshot` is accepted alongside `snapshot_pages=true`.
+
+Pages advertising `supports_release: true` support explicit cache cleanup.
+After consuming or abandoning a snapshot, use the same URI with
+`snapshot_token=<returned-token>&snapshot_release=true`, omitting `offset`.
+The authenticated response identifies the token and reports `released: true`
+when it frees the entry, or `released: false` when the token is already gone.
+Repeating release is safe; a known token with the wrong project or mailbox
+scope is rejected without removing it. Normal page reads remain repeatable
+until release or expiry. The CLI automatically attempts this cleanup with a
+two-second request timeout, without replacing a successful result or the
+original read error if cleanup fails. This allows repeated large-history reads
+to reuse the cache immediately. Process termination, lost authorization, and
+older paged servers without the capability still rely on the 300-second expiry.
+
 An already-running v0.3.39 server supports only ordinary resource pages and
 ignores the newer `snapshot` parameter. A newer client recognizes only a
 successful, well-formed array response as that older protocol. It discards
@@ -399,12 +492,16 @@ roster are still verified before and after the read. This path needs a client
 containing the server-read implementation, but no server restart or mailbox
 change. The released v0.3.39 CLI itself does not have `--server`.
 
-An authentication/transport/RPC error, an invalid envelope, or a malformed
-snapshot object never causes negotiation to the older protocol. The client
-does not combine independent OFFSET pages, change endpoints, or read local
-storage after a refusal. Keep automation blocked if it cannot establish a
-complete result. For larger sets on an older server, a successful direct read
-or snapshot-capable server is needed for a complete safety decision.
+An authentication/transport error, unrelated RPC error, invalid envelope, or
+malformed snapshot object never causes protocol negotiation. Only a recognized
+snapshot-capacity refusal enables the new history path. The client does not
+combine independent OFFSET pages, change endpoints, or read local storage
+after a refusal. Numeric JSON-RPC codes and bounded, sanitized server reasons
+remain visible; unrelated rejections no longer suggest checking authentication.
+Keep automation blocked if it cannot establish a complete result. Active-only
+safety reads retain the original single-snapshot limits; larger sets on an
+older server still require an upgraded server or an independently successful
+direct read for a complete safety decision.
 
 Navigation sorts the verified complete result into its existing newest-first
 order before applying `limit`/`offset`. These reads observe reservation state;
@@ -554,6 +651,12 @@ am doctor support-bundle --json       # sanitized incident bundle for maintainer
 
 **Expected output:** `doctor check` reports archive or database problems, and
 `doctor backups` lists any available backup snapshots or recovery artifacts.
+With `--json`, `--format json`, or `--format toon`, `doctor check` exits 0 when
+it produces the report, including reports with `healthy: false`. Scripts must
+inspect the top-level `healthy` field. Table output exits 1 when `healthy` is
+false; use `am doctor health` for a simple exit-status health gate. An installer
+smoke test that checks only the structured command's exit 0 proves report
+execution; mailbox health requires reading the result or running the health gate.
 `doctor locks` / `doctor drain` tell you whether a live `am` still owns the
 mailbox — `repair` and `reconstruct` refuse while a live owner is present, so
 drain it via your supervisor first (never kill `am` directly).
@@ -567,6 +670,35 @@ If that reconciler is not running or has stopped making progress, health exits
 operation to finish and retry. Run repair commands only after reading the doctor
 output; diagnosis should come before mutation.
 
+### Controlling background archive repair
+
+The daemon has three independent repair lanes for file-backed mailboxes. Each
+defaults to enabled and accepts a process environment override:
+
+| Environment variable | Repair lane |
+|----------------------|-------------|
+| `AM_MESSAGE_ARCHIVE_RECONCILE_ENABLED` | Missing message archive artifacts |
+| `AM_AGENT_ARCHIVE_RECONCILE_ENABLED` | Agent profiles, including retirement and deregistration state |
+| `AM_RESERVATION_ARCHIVE_RECONCILE_ENABLED` | Terminal reservation release artifacts |
+
+Set the agent flag to `false` in the service environment to pause agent-profile
+repair while keeping message durability repair and reservation convergence on.
+Disabling the message flag does not disable the agent lane. Apply environment
+changes through the service's normal restart procedure. Explicit `true`, `1`,
+`yes`, and `on` values enable a lane (case-insensitive, surrounding whitespace
+ignored); other explicit values disable it. In-memory mailboxes never run these
+repair lanes.
+
+The startup log reports `message_archive_reconcile_enabled`,
+`agent_archive_reconcile_enabled`, and `reservation_release_reconcile_enabled`
+separately. Each enabled lane retains its own scan deadline and bounded backlog
+retries. Enabling any one lane starts the maintenance worker even when retention
+and quota reporting are off. Disabling all three removes repair work; the worker
+still runs if `RETENTION_REPORT_ENABLED`, `QUOTA_ENABLED`, or a positive
+`MESSAGES_RETENTION_DAYS` requests it. Otherwise it is not started. Repair flags
+do not enable destructive message retention or accelerate the reporting and
+pruning schedule.
+
 ### Automatic backup retention and actual disk reclamation
 
 Successful automatic publication runs retention immediately, including during
@@ -577,9 +709,14 @@ incident evidence into `doctor/reclaimable/` remains a move: those bytes still
 occupy the filesystem.
 
 `AM_BACKUP_KEEP_COUNT` requests the newest three generations per backup kind by
-default, with a minimum of one. The current `.bak` publication slot and the
-exact verified recovery generation remain protected, even when an older verified
-generation falls outside that window. Automatic deletion accepts only strict
+default, with a minimum of one. For periodic backups, this is one window across
+images beside the database and eligible images in native
+`doctor/reclaimable/rotation-*/` directories. Dated periodic generations are
+ordered by their filename timestamps and collision suffixes, independently of
+directory names or copy-preserved modification times. The current `.bak`
+publication slot retains its modification-time ordering and counts toward that
+window; it and the exact verified recovery generation remain protected even
+when they fall outside it. Automatic deletion accepts only strict
 timestamped periodic names, requires a fully verified newer restore point and
 a valid standalone candidate, and proves common mailbox scope through a
 matching nonempty database lineage or an exact byte-for-byte match to the
@@ -588,6 +725,73 @@ Companion recovery state, changed files, unsafe paths, or observed active
 readers cause refusal. On Linux this includes memory mappings whose file
 descriptors have already closed. A bad backup cannot become disposable merely
 because its filename looks old.
+
+On Linux, retention retries a denied descriptor, mapping or surviving-worker
+inventory once after 5 ms, within the same bounded scan. Retained process and
+task directory descriptors prevent PID reuse from redirecting that inspection.
+A persistent same-user denial is recorded as **unobservable readers**, not proof
+that the process is unrelated to the backup. Scanning continues: any observable reader
+still refuses deletion, as do malformed or unreadable process identity, scan
+exhaustion, and other IO errors. The cleaner's current descriptor table is
+strictly inspected first, before verification opens a candidate, preserving
+same-process SQLite locks. Every worker's descriptor table is inspected because
+a worker can unshare its table while its leader remains alive. Shared memory
+mappings are reused only after a successful nonempty inventory. A matching
+exclusive kernel flock identifies the cleaner's own retained descriptor across
+its threads; another reader reusing that descriptor number is still protected.
+
+Retention also performs the no-open current-thread check before selecting its
+verified restore point. That read-only selection checks actual POSIX lock
+records on every matching descriptor in the current descriptor table. It
+permits unlocked identity handles retained by the backup producer, while
+protecting POSIX locks on both the eventual pin and earlier candidates that
+verification would reject. Opening and closing such a candidate just to reject
+it could otherwise release a same-process POSIX lock. Descriptor-specific
+flock and OFD locks are not released by that independent open/close operation.
+Unavailable descriptor inventory, incomplete records or unrecognized lock
+data cause refusal. The full reader and mapping checks before deleting a
+candidate remain unchanged.
+If no verified fallback can be selected after a reader refusal, admission
+fails; the blocked pin does not count as missing verification or authorize a
+repair export.
+The existing shared-authority protocol for cooperating restore readers is
+unchanged.
+
+Automatic-export cleanup carries the retained parent-directory admission
+through preparation, publication and failure handling. Snapshot authority
+compares its captured directory handle with that retained parent before
+selecting a pin, and keeps the binding for later checks. A replaced parent
+pathname refuses cleanup of both backup files and empty rotation directories;
+it cannot lend the displaced directory's lease to a replacement mailbox.
+Standalone rotation acquires and binds its own parent admission.
+
+For a fully verified, superseded periodic snapshot only, this uncertainty need
+not block retention. Under exclusive snapshot and recovery authority, an owned,
+single-link file in an owned directory without group/world write access may be
+**unlinked**, with every verification and namespace check above still required.
+An external process's existing descriptor, `O_PATH` handle or memory mapping
+keeps the original inode and its bytes alive; the original pathname disappears,
+and reopening that pathname is not guaranteed. Cooperating Agent Mail restore
+readers remain excluded by snapshot authority. Retention never truncates or
+overwrites an unseen reader's bytes. Incident evidence, generic file cleanup,
+and empty-directory cleanup retain the strict same-owner visibility policy.
+
+The report distinguishes these successful unlinks with
+`unlinks_with_unobserved_readers` and `bytes_unlinked_with_unobserved_readers`.
+Their allocation is unknown and is not added to `bytes_reclaimed`: a hidden
+reader may retain blocks until its last descriptor or mapping closes. Namespace
+removal and directory-sync uncertainty are accounted separately. No reader scan,
+including a complete one, makes `bytes_reclaimed` a measured free-space delta.
+Session-daemon names, different groups, and capability changes do not prove
+that inherited descriptors or mappings have closed. A terminated thread-group
+leader is skipped only when kernel evidence proves its own descriptor table
+and address space are gone; surviving workers are still inspected. Cleanup
+uses the mounted `/proc/self` PID when excluding its own retained descriptor,
+so an ancestor procfs mount does not make it count itself as another reader.
+This inspection is bounded and best-effort for noncooperating external opens;
+snapshot authority supplies the separate exclusion for cooperating publishers
+and restore readers. Permission uncertainty grants no deletion authority by
+itself and never makes a generic reclaim operation safe.
 
 Retention inventories both resident backups and material already accumulated
 under `doctor/reclaimable/`. Native historical rotation files are eligible only
@@ -626,10 +830,16 @@ by older interrupted inspections also spend the parent-wide staging count
 and byte budget. They remain uncertain recovery evidence; automatic retention
 does not delete them. A failed inspection preserves its new staging directory
 and reports that path, while successful metadata publication removes it.
-The resident retention window can shorten to restore count or byte capacity,
-while preserving the publication slot and verified recovery generation. Only
-confirmed removals reduce that calculation; a refused candidate cannot prevent
-cleanup from considering another safely superseded generation in the window.
+The periodic retention window can shorten to restore count or byte capacity,
+while preserving the publication slot and verified recovery generation. It
+uses the same generation ordering as keep-window selection: the oldest
+eligible image goes first, including numeric collision suffixes across resident
+and parked locations. Directory spelling and copied mtimes cannot promote a
+newer dated collision ahead of an older one for deletion. Only
+confirmed removals reduce that calculation; an ordinary candidate-local refusal
+before mutation cannot prevent cleanup from considering another safely
+superseded generation in the window. Loss of the shared snapshot or namespace
+authority still stops the pass.
 These are bounds on cooperating automatic producers, not a filesystem quota
 on operator exports or other programs.
 
@@ -643,8 +853,11 @@ before that later check. A reader or a failed live check can therefore defer
 without spending the allowance. Once export begins, a crash, failed backup
 validation, or failed metadata publication does not replenish that allowance.
 Further over-budget exports remain refused
-until an ordinary admission check observes sufficient retained count and byte
-capacity after cleanup. Existing failed-stage admission is checked first. A
+until the next attempt's ordinary admission check observes sufficient retained
+count and byte capacity after cleanup. Completion and post-attempt cleanup never
+replenish the durable repair allowance: an unlink with unconfirmed durability
+can make a pathname inventory look smaller without confirming reusable capacity.
+Existing failed-stage admission is checked first. A
 refused export still permits independently admitted, bounded reclamation of
 superseded backups, including when interrupted staging or an unavailable
 journal prevents publication, or when the producer refuses disk headroom or
@@ -659,8 +872,9 @@ the same admission limits when staging cannot release space. Leaving the
 variable unset enables the verified periodic reclamation policy. Setting it
 to `true` also allows incident-backup reclamation. On Unix, this requires an
 older, standalone SQLite image with a fully verified successor, matching
-mailbox lineage or exact duplicate bytes, and the same pin, reader, hardlink,
-and namespace checks used for periodic generations. Corrupt or insufficiently
+mailbox lineage or exact duplicate bytes, and the same pin, hardlink, and
+namespace checks used for periodic generations, plus the strict same-owner
+reader-visibility policy. Corrupt or insufficiently
 verified incident evidence stays available even with explicit deletion enabled.
 Platforms without the verified descriptor-bound deletion boundary preserve
 incident evidence. Explicit opt-in never falls back to unchecked pathname deletion.
@@ -679,14 +893,19 @@ Startup and publication logs report `bytes_staged`, `bytes_deleted`,
 `empty_directories_deleted` separately from backup payload counts and bytes.
 Staged and retained values are logical file lengths still occupying storage.
 Deleted bytes are the logical lengths of confirmed removals; reclaimed bytes
-count the allocated blocks associated with verified backup unlinks. The latter
+count the allocated blocks associated with verified backup unlinks without
+recorded reader uncertainty. The latter
 is not a measurement of the
 filesystem's free-space delta: filesystem snapshots and shared storage can
 retain blocks independently. Refused operations retain their byte accounting.
-An incomplete inventory refuses backup-file mutations and marks totals as lower
-bounds; the separately admitted empty-directory sweep can still make progress.
+An incomplete backup namespace inventory refuses backup-file mutations and
+marks totals as lower bounds; the separately admitted empty-directory sweep
+can still make progress.
 Uncertain moves or unlinks have separate counters rather than being reported
-as successful reclamation. Each cleanup pass attempts at most 128 periodic
+as successful reclamation. If a rename or unlink completed but its durability
+or namespace validation failed, the current pass stops further mutations and
+refuses backup publication. The apparent absence of a pathname cannot override
+that unconfirmed result. Each cleanup pass attempts at most 128 periodic
 candidates, with a candidate-byte budget of the larger of 512 MiB and the
 current database's size. One oversized candidate can still be attempted so a
 large mailbox can make progress. Verifying the pinned restore point adds I/O
@@ -697,6 +916,16 @@ same candidate-byte limit, so incident verification cannot spend the periodic
 queue's entire cleanup allowance.
 Bounded cleanup passes can leave more work for a later attempt; the publication
 limit remains in force while that work is pending.
+
+Startup cleanup also has a wall-clock budget. Its early empty-directory sweep
+checks the deadline before acquiring authority. After inventory finishes for
+retained counts and bytes, a further deadline check precedes admission of new
+backup-file reclamation and survivor verification work. If the budget has
+expired, it preserves the remaining files for a later pass and reports
+`deadline_reached`; deferral alone does not report an admission refusal or create
+snapshot/recovery control files.
+This is a cooperative budget: it does not interrupt an operation already
+underway or impose a hard limit on inventory, a syscall, or a SQLite check.
 
 `am doctor health` prints a `backup_retention:` line for this state. It reads
 `storage.sqlite3.bak.meta.json` the way a verified backup would and computes

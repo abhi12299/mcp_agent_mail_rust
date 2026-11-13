@@ -3473,6 +3473,10 @@ fn projects_adopt_dry_run_prints_plan_and_leaves_artifacts_unchanged() {
         stdout
     );
     assert!(
+        stdout.contains("- Plan status: executable; rerun with --apply to perform it"),
+        "expected executable plan status in stdout:\n{stdout}"
+    );
+    assert!(
         source_archive_file.exists(),
         "dry-run should not move source artifacts"
     );
@@ -3677,19 +3681,27 @@ fn projects_adopt_apply_cross_repo_refuses_and_keeps_source_artifacts() {
         &["projects", "adopt", &source_key, &target_key, "--apply"],
         None,
     );
-    if !out.status.success() {
+    // GH#366: a refused --apply must not exit 0, or a script would read the
+    // refusal as a completed move.
+    if out.status.code() != Some(1) {
         write_artifact(
             "projects_adopt_apply_cross_repo_refusal",
             &["projects", "adopt", &source_key, &target_key, "--apply"],
             &out,
         );
         panic!(
-            "expected success with refusal semantics\nstdout:\n{}\nstderr:\n{}",
+            "expected exit 1 for a refused adopt, got {:?}\nstdout:\n{}\nstderr:\n{}",
+            out.status.code(),
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
     }
 
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("- Plan status: refused; nothing was changed"),
+        "expected refused plan status in stdout:\n{stdout}"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains(
@@ -3711,6 +3723,165 @@ fn projects_adopt_apply_cross_repo_refuses_and_keeps_source_artifacts() {
     assert!(
         !target_archive_file.exists(),
         "cross-repo refusal should not create target artifacts"
+    );
+}
+
+#[test]
+fn projects_adopt_refuses_non_git_keys_in_dry_run_and_apply() {
+    // GH#366: two registered keys that are plain directories, not checkouts.
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
+        .expect("open sqlite db");
+    let tmp_root = env.tmp.path().canonicalize().expect("canonical tmp root");
+    let source_dir = tmp_root.join("plain_source");
+    let target_dir = tmp_root.join("plain_target");
+    std::fs::create_dir_all(&source_dir).expect("create source dir");
+    std::fs::create_dir_all(&target_dir).expect("create target dir");
+    let source_key = source_dir.display().to_string();
+    let target_key = target_dir.display().to_string();
+    insert_project(&conn, 1, "plain-source", &source_key);
+    insert_project(&conn, 2, "plain-target", &target_key);
+    drop(conn);
+
+    // Keep Git discovery inside the temp root, so a checkout that happens to
+    // enclose the test's temp directory cannot make the keys look related.
+    let mut env_vars = env.base_env();
+    env_vars.push((
+        "GIT_CEILING_DIRECTORIES".to_string(),
+        tmp_root.display().to_string(),
+    ));
+    for args in [
+        vec![
+            "projects",
+            "adopt",
+            source_key.as_str(),
+            target_key.as_str(),
+        ],
+        vec![
+            "projects",
+            "adopt",
+            source_key.as_str(),
+            target_key.as_str(),
+            "--apply",
+        ],
+    ] {
+        let out = run_am(&env_vars, Some(&tmp_root), &args, None);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "args={args:?}: a refused plan must exit 1\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("- Same repo (git-common-dir): no"),
+            "args={args:?}: stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("- Plan status: refused; nothing was changed")
+                && !stdout.contains("Plan status: executable"),
+            "args={args:?}: stdout:\n{stdout}"
+        );
+        assert!(
+            stderr.contains("A project key outside a Git repository cannot be re-keyed"),
+            "args={args:?}: stderr:\n{stderr}"
+        );
+    }
+    assert!(
+        !env.storage_root
+            .join("projects")
+            .join("plain-target")
+            .join("aliases.json")
+            .exists(),
+        "a refused adopt must not write aliases.json"
+    );
+}
+
+#[test]
+fn projects_adopt_accepts_keys_at_different_depths_of_one_checkout() {
+    // `git rev-parse --git-common-dir` is relative to the directory it ran in,
+    // so keys at different depths print different relative paths.
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
+        .expect("open sqlite db");
+    let tmp_root = env.tmp.path().canonicalize().expect("canonical tmp root");
+    let repo_root = tmp_root.join("checkout");
+    init_git_repo(&repo_root);
+    let nested = repo_root.join("crates").join("app");
+    std::fs::create_dir_all(&nested).expect("create nested dir");
+    let source_key = repo_root.display().to_string();
+    let target_key = nested.display().to_string();
+    insert_project(&conn, 1, "checkout-root", &source_key);
+    insert_project(&conn, 2, "checkout-nested", &target_key);
+    drop(conn);
+
+    let args = [
+        "projects",
+        "adopt",
+        source_key.as_str(),
+        target_key.as_str(),
+    ];
+    let out = run_am(&env.base_env(), Some(env.tmp.path()), &args, None);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "two directories of one checkout must merge\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("- Same repo (git-common-dir): yes")
+            && stdout.contains("- Plan status: executable; rerun with --apply to perform it"),
+        "expected an executable same-repo plan:\n{stdout}"
+    );
+}
+
+#[test]
+fn projects_adopt_refuses_separate_repositories_nested_in_a_parent_repository() {
+    // Keys one level below two different repositories print the same `../.git`.
+    // Resolved against the repository root, both landed on the parent's `.git`
+    // and an unrelated pair looked like one repository.
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
+        .expect("open sqlite db");
+    let tmp_root = env.tmp.path().canonicalize().expect("canonical tmp root");
+    let parent = tmp_root.join("parent");
+    init_git_repo(&parent);
+    let first_repo = parent.join("first");
+    let second_repo = parent.join("second");
+    init_git_repo(&first_repo);
+    init_git_repo(&second_repo);
+    let source_dir = first_repo.join("src");
+    let target_dir = second_repo.join("src");
+    std::fs::create_dir_all(&source_dir).expect("create source dir");
+    std::fs::create_dir_all(&target_dir).expect("create target dir");
+    let source_key = source_dir.display().to_string();
+    let target_key = target_dir.display().to_string();
+    insert_project(&conn, 1, "first-src", &source_key);
+    insert_project(&conn, 2, "second-src", &target_key);
+    drop(conn);
+
+    let args = [
+        "projects",
+        "adopt",
+        source_key.as_str(),
+        target_key.as_str(),
+    ];
+    let out = run_am(&env.base_env(), Some(env.tmp.path()), &args, None);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "separate repositories must not merge\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("- Same repo (git-common-dir): no")
+            && stdout.contains("- Plan status: refused; nothing was changed"),
+        "expected a refused plan:\n{stdout}"
     );
 }
 
@@ -3818,6 +3989,12 @@ fn projects_adopt_apply_duplicate_agent_name_conflict_exits_nonzero() {
         stderr
     );
     assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .contains("- Plan status: refused; nothing was changed"),
+        "expected the refused status line:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
         source_archive_file.exists(),
         "conflict should preserve source artifacts"
     );
@@ -3830,6 +4007,43 @@ fn projects_adopt_apply_duplicate_agent_name_conflict_exits_nonzero() {
     assert!(
         !target_archive_file.exists(),
         "conflict should not move artifacts to target"
+    );
+}
+
+#[test]
+fn projects_adopt_dry_run_refuses_duplicate_agent_name_conflict() {
+    // --apply refuses this pair, so the dry run must not call it executable.
+    let env = TestEnv::new();
+    let (_source_slug, _target_slug, source_key, target_key) = seed_projects_for_adopt(&env, true);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
+        .expect("open sqlite db");
+    insert_agent(&conn, 101, 1, "GreenCastle", "test", "test");
+    insert_agent(&conn, 202, 2, "greencastle", "test", "test");
+    drop(conn);
+
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &["projects", "adopt", &source_key, &target_key],
+        None,
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a dry run of a conflicting pair must exit 1\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("- Plan status: refused; nothing was changed")
+            && !stdout.contains("- Plan status: executable"),
+        "expected a refused plan:\n{stdout}"
+    );
+    assert!(
+        stderr
+            .to_ascii_lowercase()
+            .contains("agent name conflicts in target project"),
+        "expected the conflict reason in stderr:\n{stderr}"
     );
 }
 
@@ -5774,6 +5988,423 @@ fn reservation_reads_direct_and_real_server_preserve_output_without_local_admiss
     reservation_read_failed_closed(&offline);
 }
 
+fn reservation_history_fixture(count: i64, reason: &str) -> (TestEnv, String, String) {
+    use std::fmt::Write as _;
+
+    let (env, project, slug) = reservation_read_fixture();
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    insert_agent(&conn, 3, 1, "RetiredVale", "test", "test");
+    conn.execute_raw("UPDATE agents SET retired_at=1704067500000000 WHERE id=3; BEGIN")
+        .unwrap();
+    // Batched inserts keep this real persisted >10,000-row fixture affordable.
+    for start in (7..=count).step_by(250) {
+        let end = count.min(start + 249);
+        let mut sql = String::from(
+            "INSERT INTO file_reservations \
+             (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) VALUES ",
+        );
+        let mut params = Vec::new();
+        for id in start..=end {
+            if id != start {
+                sql.push(',');
+            }
+            write!(
+                sql,
+                "({id}, 1, 3, 'history/{id:05}.rs', 1, ?, {}, 4102444800000000)",
+                1_704_067_200_000_000_i64 + id
+            )
+            .unwrap();
+            params.push(SqlValue::Text(reason.to_string()));
+        }
+        conn.execute_sync(&sql, &params).unwrap();
+    }
+    conn.execute_raw(
+        "UPDATE file_reservations SET released_ts=1704067400000000 WHERE id>=7 AND id%2=0; \
+         INSERT INTO file_reservation_releases (reservation_id, released_ts) \
+         SELECT id, 1704067400000000 FROM file_reservations WHERE id>=7 AND id%2=1; COMMIT",
+    )
+    .unwrap();
+    conn.close_sync().unwrap();
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&env.db_path).unwrap();
+    (env, project, slug)
+}
+
+fn reservation_read_http_rpc(port: u16, bearer: Option<&str>, request: &Value) -> (u16, Value) {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut socket =
+        std::net::TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(45)))
+        .unwrap();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let body = request.to_string();
+    write!(
+        socket,
+        "POST /mcp/ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: mcp_agent_mail_rust-agent\r\nContent-Type: application/json\r\nAccept: application/json\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
+    )
+    .unwrap();
+    if let Some(bearer) = bearer {
+        write!(socket, "Authorization: Bearer {bearer}\r\n").unwrap();
+    }
+    write!(socket, "\r\n{body}").unwrap();
+    let mut response = Vec::new();
+    socket
+        .take(12 * 1024 * 1024)
+        .read_to_end(&mut response)
+        .unwrap();
+    let split = response
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")
+        .unwrap();
+    let headers = std::str::from_utf8(&response[..split]).unwrap();
+    let status = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let body = &response[split + 4..];
+    let payload = serde_json::from_slice(body)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(body).into_owned()));
+    (status, payload)
+}
+
+fn reservation_read_http_resource(port: u16, uri: &str) -> Value {
+    let request = json!({
+        "jsonrpc": "2.0", "id": "gh377-history", "method": "resources/read",
+        "params": {"uri": uri},
+    });
+    let (status, reply) =
+        reservation_read_http_rpc(port, Some(RESERVATION_READ_TEST_TOKEN), &request);
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["id"], request["id"]);
+    assert!(reply.get("error").is_none(), "{reply}");
+    let contents = reply["result"]["contents"].as_array().unwrap();
+    assert_eq!(contents.len(), 1);
+    assert_eq!(contents[0]["uri"], uri);
+    let text = contents[0]["text"].as_str().unwrap();
+    assert!(text.len() <= mcp_agent_mail_db::queries::FILE_RESERVATION_SNAPSHOT_MAX_BYTES);
+    serde_json::from_str(text).unwrap()
+}
+
+fn reservation_read_assert_snapshot_limit(port: u16, slug: &str) {
+    let (status, reply) = reservation_read_http_rpc(
+        port,
+        Some(RESERVATION_READ_TEST_TOKEN),
+        &json!({
+            "jsonrpc": "2.0", "id": "gh377-limit", "method": "resources/read",
+            "params": {"uri": format!(
+                "resource://file_reservations/{slug}?snapshot=true&active_only=false&format=json"
+            )},
+        }),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert!(
+        reply.get("result").is_none(),
+        "bounded snapshot unexpectedly fit"
+    );
+    assert!(
+        reply["error"]
+            .to_string()
+            .contains("FILE_RESERVATION_SNAPSHOT_TOO_LARGE"),
+        "snapshot capacity refusal must retain a machine-readable reason: {reply}"
+    );
+}
+
+fn reservation_read_history_pages(port: u16, slug: &str, first: &Value) -> Vec<Value> {
+    let token = first["snapshot_token"].as_str().unwrap();
+    assert_eq!(token.len(), 64);
+    assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(first["schema_version"], 1);
+    assert_eq!(first["consistency"], "materialized_snapshot");
+    assert_eq!(first["supports_release"], true);
+    assert_eq!(first["active_only"], false);
+    let total = usize::try_from(first["total_count"].as_u64().unwrap()).unwrap();
+    let mut rows = Vec::with_capacity(total);
+    let mut page = first.clone();
+    loop {
+        for field in [
+            "schema_version",
+            "consistency",
+            "snapshot_token",
+            "supports_release",
+            "project",
+            "agents",
+            "active_only",
+            "captured_ts",
+            "total_count",
+        ] {
+            assert_eq!(page[field], first[field], "page authority changed: {field}");
+        }
+        assert_eq!(page["offset"], rows.len());
+        let batch = page["reservations"].as_array().unwrap();
+        assert_eq!(page["count"], batch.len());
+        assert!(batch.len() <= 250);
+        rows.extend(batch.iter().cloned());
+        assert!(rows.len() <= total);
+        if page["next_offset"].is_null() {
+            assert_eq!(rows.len(), total, "terminal page lost reservations");
+            return rows;
+        }
+        assert!(!batch.is_empty(), "nonterminal page must advance");
+        assert_eq!(page["next_offset"], rows.len());
+        page = reservation_read_http_resource(
+            port,
+            &format!(
+                "resource://file_reservations/{slug}?snapshot_pages=true&snapshot_token={token}&offset={}&active_only=false&format=json",
+                rows.len()
+            ),
+        );
+    }
+}
+
+fn reservation_read_native_ids(out: &Output) -> Vec<i64> {
+    reservation_read_success(out)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+        .collect()
+}
+
+#[test]
+fn reservation_history_real_server_reads_over_snapshot_row_limit_without_local_admission() {
+    let (env, project, slug) = reservation_history_fixture(10_001, "retained-history");
+    let port = unused_loopback_port();
+    let _server = reservation_read_start_server(&env, port);
+    reservation_read_assert_snapshot_limit(port, &slug);
+    let unavailable = env.tmp.path().join("gh377-unusable-client.sqlite3");
+    std::fs::write(
+        &unavailable,
+        b"History must come from the authenticated server.\n",
+    )
+    .unwrap();
+    let before = file_snapshot(&unavailable);
+    let vars = reservation_read_env(&env, port, &format!("sqlite:///{}", unavailable.display()));
+    let history_started = Instant::now();
+    let history = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &["file_reservations", "list", &project, "--all", "--server"],
+    );
+    assert_eq!(
+        reservation_read_native_ids(&history),
+        (1..=10_001).collect::<Vec<_>>()
+    );
+    let history_text = reservation_read_success(&history);
+    for (id, holder) in [
+        (7, "RetiredVale"),
+        (250, "RetiredVale"),
+        (10_001, "RetiredVale"),
+    ] {
+        let id_text = id.to_string();
+        let line = history_text
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some(id_text.as_str()))
+            .unwrap();
+        assert!(
+            line.contains(holder),
+            "retired holder omitted from history: {line}"
+        );
+        assert!(line.contains(&format!("history/{id:05}.rs")));
+    }
+    let active = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &["file_reservations", "list", &project, "--server"],
+    );
+    assert_eq!(reservation_read_native_ids(&active), [1, 2, 3]);
+    assert_eq!(file_snapshot(&unavailable), before);
+    for suffix in ["-wal", "-shm", ".fsqlite-shm", ".fsqlite-wal"] {
+        assert!(!PathBuf::from(format!("{}{suffix}", unavailable.display())).exists());
+    }
+
+    // The normal command must select the same authenticated daemon when the
+    // configured local mailbox matches, including when its history needs pages.
+    let automatic = run_am_hermetic(
+        &reservation_read_env(&env, port, &env.database_url()),
+        Some(env.hostile_repo()),
+        &["file_reservations", "list", &project, "--all"],
+    );
+    assert_eq!(
+        reservation_read_native_ids(&automatic),
+        (1..=10_001).collect::<Vec<_>>()
+    );
+    // These are history reads three through five against the same daemon.
+    // Every completed CLI read must release its token: retaining all captures
+    // until TTL would exhaust the four-slot cache on the fifth invocation.
+    for read_number in 3..=5 {
+        let repeated = run_am_hermetic(
+            &vars,
+            Some(env.hostile_repo()),
+            &["file_reservations", "list", &project, "--all", "--server"],
+        );
+        assert_eq!(
+            reservation_read_native_ids(&repeated),
+            (1..=10_001).collect::<Vec<_>>(),
+            "completed history read {read_number} must not exhaust snapshot slots"
+        );
+    }
+    assert!(
+        history_started.elapsed() < Duration::from_secs(300),
+        "five history reads must complete inside the cache TTL to distinguish release from expiry"
+    );
+    assert_eq!(file_snapshot(&unavailable), before);
+}
+
+#[test]
+fn reservation_history_real_server_byte_pages_remain_immutable_between_requests() {
+    let reason = "x".repeat(20_000);
+    let (env, project, slug) = reservation_history_fixture(301, &reason);
+    let writer = mcp_agent_mail_db::DbConn::open_file(env.db_path.to_str().unwrap()).unwrap();
+    // Put the two leases that will change after page zero near the end of the
+    // captured order, beyond both the byte boundary and the usual row boundary.
+    writer.execute_raw(
+        "BEGIN; UPDATE file_reservations SET agent_id=1, released_ts=NULL WHERE id IN (300,301); \
+         DELETE FROM file_reservation_releases WHERE reservation_id IN (300,301); COMMIT",
+    ).unwrap();
+    let port = unused_loopback_port();
+    let _server = reservation_read_start_server(&env, port);
+    reservation_read_assert_snapshot_limit(port, &slug);
+    let vars = reservation_read_env(&env, port, &env.database_url());
+    let history = run_am_hermetic(
+        &vars,
+        Some(env.hostile_repo()),
+        &["file_reservations", "list", &project, "--all", "--server"],
+    );
+    assert_eq!(
+        reservation_read_native_ids(&history),
+        (1..=301).collect::<Vec<_>>()
+    );
+    assert!(history.stdout.len() > 4 * 1024 * 1024);
+    assert!(reservation_read_success(&history).contains(&reason));
+
+    let initial_uri = format!(
+        "resource://file_reservations/{slug}?snapshot_pages=true&active_only=false&format=json"
+    );
+    let first = reservation_read_http_resource(port, &initial_uri);
+    assert_eq!(first["total_count"], 301);
+    let offset = first["next_offset"].as_u64().unwrap();
+    assert!(
+        offset > 0 && offset < 250,
+        "byte-bound page must be short but nonterminal"
+    );
+    let token = first["snapshot_token"].as_str().unwrap();
+    let next_uri = format!(
+        "resource://file_reservations/{slug}?snapshot_pages=true&snapshot_token={token}&offset={offset}&active_only=false&format=json"
+    );
+    let release_uri = format!(
+        "resource://file_reservations/{slug}?snapshot_pages=true&snapshot_token={token}&snapshot_release=true&active_only=false&format=json"
+    );
+
+    // Same total count, different membership and lease state: a count check or
+    // independent offset reads would silently mix these two database versions.
+    writer.execute_raw(
+        "BEGIN IMMEDIATE; \
+         INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (300,1800000000000000); \
+         UPDATE file_reservations SET expires_ts=4102444860000000 WHERE id=301; \
+         DELETE FROM file_reservations WHERE id=250; \
+         INSERT INTO file_reservations \
+         (id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
+         VALUES (302,1,1,'inserted-between-pages.rs',1,'concurrent grant',1704067200000302,4102444800000000); \
+         COMMIT",
+    ).unwrap();
+
+    for bearer in [None, Some("wrong-history-token")] {
+        for uri in [&next_uri, &release_uri] {
+            let (status, response) = reservation_read_http_rpc(
+                port,
+                bearer,
+                &json!({
+                    "jsonrpc": "2.0", "id": "gh377-denied", "method": "resources/read",
+                    "params": {"uri": uri},
+                }),
+            );
+            assert!(matches!(status, 401 | 403), "{status}: {response}");
+            assert!(
+                response.get("result").is_none(),
+                "snapshot token bypassed authentication"
+            );
+        }
+    }
+    let (status, response) = reservation_read_http_rpc(
+        port,
+        Some(RESERVATION_READ_TEST_TOKEN),
+        &json!({
+            "jsonrpc": "2.0", "id": "gh377-wrong-release-scope", "method": "resources/read",
+            "params": {"uri": format!(
+                "resource://file_reservations/{slug}?snapshot_pages=true&snapshot_token={token}&snapshot_release=true&active_only=true&format=json"
+            )},
+        }),
+    );
+    assert_eq!(status, 200, "{response}");
+    assert!(response.get("result").is_none());
+    assert_eq!(
+        response["error"]["data"]["error"]["type"],
+        "PAGED_SNAPSHOT_SCOPE_MISMATCH"
+    );
+
+    // Unauthorized or mismatched releases must leave the capture usable.
+    let captured = reservation_read_history_pages(port, &slug, &first);
+    let ids = |rows: &[Value]| {
+        rows.iter()
+            .map(|row| row["id"].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&captured), (1..=301).collect::<Vec<_>>());
+    assert!(captured[299]["released_ts"].is_null());
+    assert_eq!(captured[300]["expires_ts"], "2100-01-01T00:00:00.000000Z");
+    let repeated = reservation_read_http_resource(
+        port,
+        &format!(
+            "resource://file_reservations/{slug}?snapshot_pages=true&snapshot_token={token}&offset=0&active_only=false&format=json"
+        ),
+    );
+    assert_eq!(
+        repeated, first,
+        "retrying an immutable page changed its contents"
+    );
+    assert_eq!(
+        reservation_read_http_resource(port, &release_uri),
+        json!({"schema_version": 1, "snapshot_token": token, "released": true})
+    );
+    let (status, response) = reservation_read_http_rpc(
+        port,
+        Some(RESERVATION_READ_TEST_TOKEN),
+        &json!({
+            "jsonrpc": "2.0", "id": "gh377-released-snapshot", "method": "resources/read",
+            "params": {"uri": next_uri},
+        }),
+    );
+    assert_eq!(status, 200, "{response}");
+    assert!(response.get("result").is_none());
+    assert_eq!(
+        response["error"]["data"]["error"]["type"],
+        "PAGED_SNAPSHOT_EXPIRED"
+    );
+    assert_eq!(
+        reservation_read_http_resource(port, &release_uri),
+        json!({"schema_version": 1, "snapshot_token": token, "released": false}),
+        "releasing an already released token must be idempotent"
+    );
+
+    let fresh = reservation_read_http_resource(port, &initial_uri);
+    assert_ne!(fresh["snapshot_token"], first["snapshot_token"]);
+    let current = reservation_read_history_pages(port, &slug, &fresh);
+    assert_eq!(
+        ids(&current),
+        (1..=302).filter(|id| *id != 250).collect::<Vec<_>>()
+    );
+    let released = current.iter().find(|row| row["id"] == 300).unwrap();
+    assert_eq!(
+        released["released_ts"],
+        mcp_agent_mail_db::micros_to_iso(1_800_000_000_000_000)
+    );
+    let renewed = current.iter().find(|row| row["id"] == 301).unwrap();
+    assert_eq!(renewed["expires_ts"], "2100-01-01T00:01:00.000000Z");
+    assert_eq!(
+        current.last().unwrap()["path_pattern"],
+        "inserted-between-pages.rs"
+    );
+    writer.close_sync().unwrap();
+}
+
 /// Scripted transport faults complement the real-server test above. The peer
 /// only accepts authenticated resources/read requests, never tools/call.
 struct ReservationReadPeer {
@@ -7302,6 +7933,89 @@ fn list_acks_with_seeded_project() {
 }
 
 #[test]
+fn beads_show_renders_real_issue_and_preserves_json_response() {
+    let env = TestEnv::new();
+    let project_dir = std::fs::canonicalize(env.tmp.path()).expect("canonical project path");
+    let beads_dir = project_dir.join(".beads");
+    let mut child_env = env.isolated_env();
+    child_env.extend([
+        (
+            "PATH".to_string(),
+            std::env::var("PATH").expect("test PATH"),
+        ),
+        ("AM_BR_BIN".to_string(), "br".to_string()),
+        ("AM_INTERFACE_MODE".to_string(), "cli".to_string()),
+    ]);
+    let run_br = |args: &[&str]| {
+        let out = Command::new("br")
+            .current_dir(env.tmp.path())
+            .envs(child_env.iter().map(|(key, value)| (key, value)))
+            .env("BEADS_DIR", &beads_dir)
+            .env_remove("BEADS_DB")
+            .env_remove("BD_DB")
+            .env_remove("BD_DATABASE")
+            .args([
+                "--json",
+                "--quiet",
+                "--no-daemon",
+                "--allow-stale",
+                "--no-auto-import",
+                "--no-auto-flush",
+            ])
+            .args(args)
+            .output()
+            .expect("run real br");
+        assert!(
+            out.status.success(),
+            "br {args:?} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    run_br(&["init", "--prefix", "show"]);
+    let created = run_br(&[
+        "create",
+        "Visible Beads title",
+        "--description",
+        "Visible Beads description",
+        "--priority",
+        "1",
+    ]);
+    let issue: Value = serde_json::from_slice(&created.stdout).expect("created issue JSON");
+    let id = issue["id"].as_str().expect("created issue ID");
+    let expected = run_br(&["show", id]);
+    let project = project_dir.to_str().expect("UTF-8 project path");
+    for format in ["table", "json"] {
+        let args = ["beads", "show", id, "--path", project, "--format", format];
+        let out = run_am(&child_env, Some(env.tmp.path()), &args, None);
+        if !out.status.success() {
+            write_artifact("beads_show_real_issue", &args, &out);
+        }
+        assert!(out.status.success(), "am beads show failed: {out:?}");
+        if format == "json" {
+            let actual: Value = serde_json::from_slice(&out.stdout).expect("am show JSON");
+            let expected: Value = serde_json::from_slice(&expected.stdout).expect("br show JSON");
+            assert_eq!(
+                actual, expected,
+                "JSON must retain the complete br response"
+            );
+        } else {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for required in [
+                id,
+                "Visible Beads title",
+                "Visible Beads description",
+                "P1",
+                "open",
+            ] {
+                assert!(text.contains(required), "missing {required:?} in {text:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn robot_handoff_dashboard_writes_artifacts_and_keeps_beads_read_only() {
     let env = TestEnv::new();
     init_cli_schema(&env.db_path);
@@ -8630,6 +9344,123 @@ fn serve_http_updates_client_configs_only_with_explicit_setup() {
     check_serve_http_client_config_setup(true);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn robot_health_preserves_real_daemon_memory_pressure() {
+    struct OwnedServer(std::process::Child);
+    impl Drop for OwnedServer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let env = TestEnv::new();
+    let port = unused_loopback_port();
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let log_path = env.tmp.path().join("health-pressure-server.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut server = OwnedServer(
+        Command::new(am_bin())
+            .env_clear()
+            .envs(env.isolated_env())
+            .env("AM_ATC_ENABLED", "false")
+            .env("HTTP_PORT", port.to_string())
+            // Exercise the real serving process's RSS sampler without putting
+            // the host under pressure. The CLI keeps its ordinary thresholds.
+            .env("MEMORY_WARNING_MB", "1")
+            .env("MEMORY_CRITICAL_MB", "2")
+            .env("MEMORY_FATAL_MB", "0")
+            .current_dir(env.hostile_repo())
+            .args([
+                "serve-http",
+                "--no-tui",
+                "--no-auth",
+                "--port",
+                &port.to_string(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .expect("start real health server"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline && server.0.try_wait().unwrap().is_none(),
+            "health server failed to start: {}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let output = Command::new(am_bin())
+        .env_clear()
+        .envs(env.isolated_env())
+        .env("HTTP_PORT", port.to_string())
+        .env("AGENT_MAIL_URL", format!("http://127.0.0.1:{port}/mcp/"))
+        .current_dir(env.hostile_repo())
+        .args(["robot", "health", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\nserver:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        std::fs::read_to_string(&log_path).unwrap()
+    );
+    let health: Value = serde_json::from_slice(&output.stdout).expect("robot health JSON");
+    assert_eq!(health["overall"], "unhealthy", "{health}");
+    assert_eq!(health["health_level"], "red", "{health}");
+    assert_eq!(health["capacity_health_level"], "red", "{health}");
+    let probes = health["probes"].as_array().unwrap();
+    let server_probe = probes
+        .iter()
+        .find(|probe| probe["name"] == "server_health")
+        .unwrap();
+    assert_eq!(server_probe["status"], "fail", "{server_probe}");
+    assert!(
+        server_probe["detail"]
+            .as_str()
+            .unwrap()
+            .contains("pressure=red")
+    );
+    let pressure = probes
+        .iter()
+        .find(|probe| probe["name"] == "backpressure")
+        .unwrap();
+    assert_eq!(pressure["status"], "red", "{pressure}");
+    assert!(
+        pressure["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("live server:")
+    );
+    assert!(pressure["detail"].as_str().unwrap().contains("memory"));
+    let circuits = probes
+        .iter()
+        .find(|probe| probe["name"] == "circuit_breakers")
+        .unwrap();
+    assert!(
+        circuits["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("live server:")
+    );
+    assert!(
+        health["_alerts"].as_array().unwrap().iter().any(|alert| {
+            alert["severity"] == "error"
+                && alert["summary"]
+                    .as_str()
+                    .is_some_and(|summary| summary.contains("pressure=red"))
+        }),
+        "{health}"
+    );
+}
+
 fn check_serve_http_client_config_setup(setup: bool) {
     let env = TestEnv::new();
     let project = env.hostile_repo();
@@ -8815,7 +9646,10 @@ fn legacy_am_serve_reports_migration_preflight() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn cli_discovers_nondefault_mailbox_daemon_port() {
+fn cli_serves_integrity_checked_tailwind_without_exposing_mailbox_pages() {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+
     struct OwnedServer(std::process::Child);
     impl Drop for OwnedServer {
         fn drop(&mut self) {
@@ -8824,6 +9658,119 @@ fn cli_discovers_nondefault_mailbox_daemon_port() {
         }
     }
     let env = TestEnv::new();
+    let port = unused_loopback_port();
+    let token = mcp_agent_mail_core::setup::generate_token().expect("secure test bearer token");
+    let log_path = env.tmp.path().join("asset-daemon.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut server = OwnedServer(
+        Command::new(am_bin())
+            .env_clear()
+            .envs(env.isolated_env())
+            .env("HTTP_BEARER_TOKEN", &token)
+            .env("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
+            .env("AM_ATC_ENABLED", "false")
+            .env("TMPDIR", env.tmp.path())
+            .current_dir(&env.hostile_repo)
+            .args([
+                "serve-http",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--no-tui",
+            ])
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "{}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
+        assert!(Instant::now() < deadline, "asset daemon did not bind");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let request = |method: &str, path: &str| {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        write!(stream, "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: mcp_agent_mail_rust-agent\r\nConnection: close\r\n\r\n").unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        let split = response
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap();
+        (
+            String::from_utf8(response[..split].to_vec()).unwrap(),
+            response[split + 4..].to_vec(),
+        )
+    };
+    let path = "/mail/static/tailwind-3.4.17.min.js";
+    let (headers, script) = request("GET", path);
+    assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("content-type: text/javascript")
+    );
+    assert_eq!(script.len(), 407_279);
+    let integrity = format!(
+        "sha256-{}",
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&script))
+    );
+    assert_eq!(
+        integrity,
+        "sha256-F26JRmGqnNyaXLpscgBEy797i9gNHJoUKnwksbbFDRU="
+    );
+    let (headers, _) = request("GET", "/mail");
+    assert!(headers.starts_with("HTTP/1.1 401"), "{headers}");
+    let (headers, html) = request("GET", &format!("/mail?token={token}"));
+    assert!(
+        headers.starts_with("HTTP/1.1 200"),
+        "{headers}\n{}",
+        std::fs::read_to_string(&log_path).unwrap()
+    );
+    let html = String::from_utf8(html).unwrap().replace("&#x2f;", "/");
+    assert!(html.contains(&format!("src=\"{path}\"")));
+    assert!(html.contains(&format!("integrity=\"{integrity}\"")));
+    assert!(!html.contains("https://cdn.tailwindcss.com"));
+    let (headers, body) = request("HEAD", path);
+    assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("content-length: 407279")
+    );
+    assert!(body.is_empty());
+    let (headers, _) = request("GET", "/mail/static/vendor_manifest.json");
+    assert!(headers.starts_with("HTTP/1.1 401"), "{headers}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_discovers_nondefault_mailbox_daemon_port() {
+    struct OwnedServer(std::process::Child);
+    impl Drop for OwnedServer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut env = TestEnv::new();
+    // Percent-encoding makes this URI exceed the request-ID limit without
+    // inflating its ASCII archive slug or exceeding a filesystem component.
+    env.hostile_repo = env.hostile_repo.join("é".repeat(100));
+    std::fs::create_dir_all(&env.hostile_repo).unwrap();
     let project = env.hostile_repo.to_str().unwrap();
     let port = unused_loopback_port();
     let log_path = env.tmp.path().join("discovered-daemon.log");
@@ -8988,6 +9935,85 @@ fn cli_discovers_nondefault_mailbox_daemon_port() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("discovered-port-proof"));
+}
+
+/// br-eos8u: a client that sees a live server own a non-default mailbox, but
+/// cannot tie a listener to it, stops with an error. Its own TMPDIR hides the
+/// daemon's listener hints, so the only endpoint left is the default one, which
+/// could belong to another mailbox's server.
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_refuses_a_mailbox_server_it_cannot_confirm() {
+    struct OwnedServer(std::process::Child);
+    impl Drop for OwnedServer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let env = TestEnv::new();
+    let project = env.hostile_repo.to_str().unwrap();
+    let port = unused_loopback_port();
+    let log_path = env.tmp.path().join("unconfirmed-daemon.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let client_tmp = env.tmp.path().join("client-tmp");
+    std::fs::create_dir_all(&client_tmp).unwrap();
+    let command = |tmpdir: &std::path::Path| {
+        let mut cmd = Command::new(am_bin());
+        cmd.env_clear()
+            .envs(env.isolated_env())
+            .env_remove("HTTP_HOST")
+            .env_remove("HTTP_PORT")
+            .env("TMPDIR", tmpdir)
+            .env("HTTP_BEARER_TOKEN", "unconfirmed-server-token")
+            .env("AM_ATC_ENABLED", "false")
+            .current_dir(&env.hostile_repo);
+        cmd
+    };
+    let mut server_command = command(env.tmp.path());
+    server_command
+        .args([
+            "serve-http",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--no-tui",
+            "--no-auth",
+        ])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log);
+    let mut server = OwnedServer(server_command.spawn().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "{}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
+        assert!(Instant::now() < deadline, "daemon did not bind");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let agents_list = ["agents", "list", "--project", project, "--json"];
+    let out = command(&client_tmp).args(agents_list).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("could not be confirmed"), "{stderr}");
+    assert!(stderr.contains("nothing was sent to"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("owner PID {}", server.0.id())),
+        "{stderr}"
+    );
+    assert!(stderr.contains("HTTP_PORT"), "{stderr}");
+    assert!(!stderr.contains("unconfirmed-server-token"), "{stderr}");
+    // The daemon's own TMPDIR reaches the same listener, so only the guess was
+    // refused. The daemon has no such project, and the refusal is its answer.
+    let out = command(env.tmp.path()).args(agents_list).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("list_agents via server failed"), "{stderr}");
+    assert!(stderr.contains("NOT_FOUND"), "{stderr}");
+    assert!(!stderr.contains("could not be confirmed"), "{stderr}");
 }
 
 #[test]

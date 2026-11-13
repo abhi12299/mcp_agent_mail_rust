@@ -20,9 +20,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_project};
+#[cfg(test)]
+use crate::tool_util::get_db_pool;
+use crate::tool_util::{
+    db_outcome_to_mcp_result, get_db_pool_for_request, legacy_tool_error, resolve_project,
+};
 
 static LEASE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+// Leases are small control records, like archived profiles and reservations.
+// Bound every reader and writer alike so a successful write remains readable.
+const MAX_BUILD_SLOT_LEASE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildSlotLease {
@@ -110,51 +117,54 @@ fn existing_agent_lease_path(
     slot_path: &Path,
     agent_name: &str,
     branch: Option<&str>,
-) -> Option<PathBuf> {
+) -> std::io::Result<Option<PathBuf>> {
     let mut same_agent_paths = Vec::new();
-    let entries = std::fs::read_dir(slot_path).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
+    let entries = match std::fs::read_dir(slot_path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let path = entry?.path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(lease) = serde_json::from_str::<BuildSlotLease>(&text) else {
-            continue;
-        };
+        let lease = read_lease_json(&path)?;
         if lease.agent != agent_name {
             continue;
         }
         if lease.branch.as_deref() == branch {
-            return Some(path);
+            return Ok(Some(path));
         }
         same_agent_paths.push(path);
     }
-    if same_agent_paths.len() == 1 {
+    Ok(if same_agent_paths.len() == 1 {
         same_agent_paths.pop()
     } else {
         None
-    }
+    })
 }
 
-fn resolve_holder_lease_path(slot_path: &Path, agent_name: &str, branch: Option<&str>) -> PathBuf {
+fn resolve_holder_lease_path(
+    slot_path: &Path,
+    agent_name: &str,
+    branch: Option<&str>,
+) -> std::io::Result<PathBuf> {
     let preferred = lease_path_for_holder(slot_path, agent_name, branch);
     if preferred.exists() {
-        return preferred;
+        return Ok(preferred);
     }
 
     let legacy = legacy_lease_path_for_holder(slot_path, agent_name, branch);
     if legacy.exists() {
-        return legacy;
+        return Ok(legacy);
     }
 
-    if let Some(existing) = existing_agent_lease_path(slot_path, agent_name, branch) {
-        return existing;
+    if let Some(existing) = existing_agent_lease_path(slot_path, agent_name, branch)? {
+        return Ok(existing);
     }
 
-    preferred
+    Ok(preferred)
 }
 
 fn compute_branch(repo_path: &str) -> Option<String> {
@@ -180,6 +190,29 @@ struct ActiveSlotLease {
     expires_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Never wait on a FIFO or follow a lease symlink while holding the slot lock.
+/// The shared opener verifies the opened handle, and the bounded read catches
+/// both oversized metadata and growth during reading. Invalid evidence is an
+/// error even when it might have described an expired or released lease.
+fn read_lease_json(path: &Path) -> std::io::Result<BuildSlotLease> {
+    let bytes = mcp_agent_mail_core::disk::read_regular_file_no_follow_bounded(
+        path,
+        MAX_BUILD_SLOT_LEASE_BYTES,
+    )
+    .map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("cannot read build slot lease {}: {error}", path.display()),
+        )
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid build slot lease {}: {error}", path.display()),
+        )
+    })
+}
+
 /// Retain the exact path alongside the validated record. A second filename
 /// resolution can choose a stale preferred file instead of this active lease,
 /// or even a different holder's file. Callers keep the slot lock throughout.
@@ -198,15 +231,7 @@ fn read_active_lease_entries(
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let text = std::fs::read_to_string(&path).map_err(|error| {
-            std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
-        })?;
-        let lease: BuildSlotLease = serde_json::from_str(&text).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid build slot lease {}: {error}", path.display()),
-            )
-        })?;
+        let lease = read_lease_json(&path)?;
         let exp = chrono::DateTime::parse_from_rfc3339(&lease.expires_ts).map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -294,11 +319,39 @@ fn unique_tmp_lease_path(path: &Path) -> PathBuf {
 }
 
 fn write_lease_json(path: &Path, lease: &BuildSlotLease) -> std::io::Result<()> {
+    // Production callers hold the slot lock. A preferred or legacy filename
+    // is not ownership evidence, including for an expired or released lease.
+    // Refuse before staging so a failed acquisition preserves the incumbent.
+    match read_lease_json(path) {
+        Ok(existing) => {
+            if !lease_matches_holder(&existing, &lease.agent, lease.branch.as_deref()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "build slot lease {} belongs to another holder",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let text =
+        serde_json::to_string_pretty(lease).map_err(|e| std::io::Error::other(e.to_string()))?;
+    if text.len() as u64 > MAX_BUILD_SLOT_LEASE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "build slot lease {} exceeds the {MAX_BUILD_SLOT_LEASE_BYTES}-byte limit",
+                path.display(),
+            ),
+        ));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let text =
-        serde_json::to_string_pretty(lease).map_err(|e| std::io::Error::other(e.to_string()))?;
 
     // Write atomically to prevent race conditions during read_active_leases
     let tmp_path = unique_tmp_lease_path(path);
@@ -331,6 +384,7 @@ enum SlotOperation {
 
 fn enforce_slot_lifecycle(
     agent: &mcp_agent_mail_db::AgentRow,
+    deregistered_at: Option<i64>,
     operation: SlotOperation,
 ) -> McpResult<()> {
     // Withdrawing existing work must remain possible after retirement. This
@@ -338,17 +392,17 @@ fn enforce_slot_lifecycle(
     if matches!(operation, SlotOperation::Release) {
         return Ok(());
     }
-    let (code, state) =
-        if mcp_agent_mail_db::models::task_description_uses_reserved_deregistered_prefix(
+    let (code, state) = if deregistered_at.is_some()
+        || mcp_agent_mail_db::models::task_description_uses_reserved_deregistered_prefix(
             &agent.task_description,
         ) {
-            // Imported Python tombstones need not also carry retired_at.
-            ("AGENT_DEREGISTERED", "deregistered")
-        } else if agent.retired_at.is_some() {
-            ("AGENT_RETIRED", "retired")
-        } else {
-            return Ok(());
-        };
+        // Imported Python tombstones need not also carry retired_at.
+        ("AGENT_DEREGISTERED", "deregistered")
+    } else if agent.retired_at.is_some() {
+        ("AGENT_RETIRED", "retired")
+    } else {
+        return Ok(());
+    };
     let action = match operation {
         SlotOperation::Acquire => "acquire",
         SlotOperation::Renew => "renew",
@@ -380,8 +434,13 @@ async fn resolve_authorized_agent_name(
 ) -> McpResult<String> {
     let agent_name = mcp_agent_mail_core::models::normalize_agent_name(agent_name)
         .unwrap_or_else(|| agent_name.to_string());
-    let agent = match mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, &agent_name)
-        .await
+    let mut agent = match mcp_agent_mail_db::queries::get_agent(
+        ctx.cx(),
+        pool,
+        project_id,
+        &agent_name,
+    )
+    .await
     {
         asupersync::Outcome::Ok(agent) => agent,
         asupersync::Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => {
@@ -397,7 +456,28 @@ async fn resolve_authorized_agent_name(
         other => db_outcome_to_mcp_result(other)?,
     };
     crate::session_identity::authorize_actor(ctx, &agent, false, "manage build slots")?;
-    enforce_slot_lifecycle(&agent, operation)?;
+    let deregistered_at = if !matches!(operation, SlotOperation::Release)
+        && let Some(agent_id) = agent.id
+    {
+        // Resolve the canonical identity as before, but never use its cached
+        // lifecycle to admit new filesystem work. Another process can retire
+        // it without invalidating this process's cache, and a permanent ledger
+        // entry is authoritative even when the profile has no tombstone text.
+        agent = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::get_agent_by_id_fresh(ctx.cx(), pool, agent_id).await,
+        )?;
+        db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::get_agent_deregistered_at(ctx.cx(), pool, agent_id).await,
+        )?
+    } else {
+        // Cleanup stays available to authorized inactive and trusted-local
+        // unregistered holders; it never admits new work.
+        None
+    };
+    // The database reads can yield; keep session authority and cancellation
+    // checks current for the refreshed identity before touching lease files.
+    crate::session_identity::authorize_actor(ctx, &agent, false, "manage build slots")?;
+    enforce_slot_lifecycle(&agent, deregistered_at, operation)?;
     Ok(agent.name)
 }
 
@@ -440,7 +520,7 @@ fn acquire_slot_lease(
     let now = chrono::Utc::now();
     let active = read_active_leases(slot_path, now)?;
     let conflicts = collect_slot_conflicts(active, agent_name, branch.as_deref(), is_exclusive);
-    let lease_path = resolve_holder_lease_path(slot_path, agent_name, branch.as_deref());
+    let lease_path = resolve_holder_lease_path(slot_path, agent_name, branch.as_deref())?;
     let granted = BuildSlotLease {
         slot: slot.to_string(),
         agent: agent_name.to_string(),
@@ -561,7 +641,7 @@ pub async fn acquire_build_slot(
         return Err(worktrees_required());
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let agent_name =
@@ -601,7 +681,7 @@ pub async fn renew_build_slot(
         return Err(worktrees_required());
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let agent_name =
@@ -635,7 +715,7 @@ pub async fn release_build_slot(
         return Err(worktrees_required());
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
     let agent_name =
@@ -789,7 +869,8 @@ mod tests {
             legacy_lease_path_for_holder(slot_dir.path(), "BlueLake", Some("feature/x"));
         std::fs::write(&legacy_path, "{}").unwrap();
 
-        let resolved = resolve_holder_lease_path(slot_dir.path(), "BlueLake", Some("feature/x"));
+        let resolved =
+            resolve_holder_lease_path(slot_dir.path(), "BlueLake", Some("feature/x")).unwrap();
         assert_eq!(resolved, legacy_path);
     }
 
@@ -800,7 +881,8 @@ mod tests {
         let lease = make_lease("BlueLake", Some("main"), true);
         std::fs::write(&existing_path, serde_json::to_string(&lease).unwrap()).unwrap();
 
-        let resolved = resolve_holder_lease_path(slot_dir.path(), "BlueLake", Some("feature/x"));
+        let resolved =
+            resolve_holder_lease_path(slot_dir.path(), "BlueLake", Some("feature/x")).unwrap();
         assert_eq!(resolved, existing_path);
     }
 
@@ -1218,6 +1300,119 @@ mod tests {
     }
 
     #[test]
+    fn acquisition_preserves_foreign_owners_at_preferred_and_legacy_paths() {
+        for legacy in [false, true] {
+            for state in ["active", "expired", "released"] {
+                let dir = tempfile::tempdir().unwrap();
+                let occupied = if legacy {
+                    legacy_lease_path_for_holder(dir.path(), "BlueLake", Some("main"))
+                } else {
+                    lease_path_for_holder(dir.path(), "BlueLake", Some("main"))
+                };
+                let mut incumbent = make_lease("GreenPeak", Some("main"), true);
+                if state == "expired" {
+                    incumbent.expires_ts =
+                        (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+                } else if state == "released" {
+                    incumbent.released_ts = Some(chrono::Utc::now().to_rfc3339());
+                }
+                let original = serde_json::to_vec(&incumbent).unwrap();
+                std::fs::write(&occupied, &original).unwrap();
+
+                let error = acquire_slot_lease(
+                    dir.path(),
+                    "slot-a",
+                    "BlueLake",
+                    Some("main".to_string()),
+                    3600,
+                    true,
+                )
+                .unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert_eq!(std::fs::read(&occupied).unwrap(), original);
+                assert_eq!(
+                    std::fs::read_dir(dir.path())
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .filter(|path| {
+                            path.extension().and_then(|ext| ext.to_str()) == Some("json")
+                        })
+                        .count(),
+                    1,
+                    "failed acquisition must not publish another lease"
+                );
+                let lock = try_lock_slot(dir.path(), false).unwrap().unwrap();
+                drop(lock);
+
+                // Ordinary acquisition still succeeds and sees the preserved
+                // incumbent whenever it remains active and unreleased.
+                let next =
+                    acquire_slot_lease(dir.path(), "slot-a", "RedStone", None, 3600, true).unwrap();
+                if state == "active" {
+                    assert_eq!(next.conflicts.len(), 1);
+                    assert_eq!(next.conflicts[0].agent, "GreenPeak");
+                } else {
+                    assert!(next.conflicts.is_empty());
+                }
+                assert_eq!(std::fs::read(&occupied).unwrap(), original);
+            }
+        }
+    }
+
+    #[test]
+    fn acquisition_can_replace_its_own_released_lease_after_a_branch_change() {
+        let dir = tempfile::tempdir().unwrap();
+        acquire_slot_lease(
+            dir.path(),
+            "slot-a",
+            "BlueLake",
+            Some("main".to_string()),
+            3600,
+            true,
+        )
+        .unwrap();
+        assert!(
+            release_slot_lease(dir.path(), "BlueLake", None)
+                .unwrap()
+                .released
+        );
+        let result = acquire_slot_lease(
+            dir.path(),
+            "slot-a",
+            "BlueLake",
+            Some("feature".to_string()),
+            7200,
+            false,
+        )
+        .unwrap();
+        assert!(result.conflicts.is_empty());
+        let stored = stored_lease(&lease_path_for_holder(dir.path(), "BlueLake", None));
+        assert_eq!(stored.agent, "BlueLake");
+        assert_eq!(stored.branch.as_deref(), Some("feature"));
+        assert_eq!(stored.expires_ts, result.granted.expires_ts);
+        assert!(stored.released_ts.is_none());
+        assert!(!stored.exclusive);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquisition_preserves_a_linked_destination_and_its_foreign_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join("slot");
+        std::fs::create_dir(&slot).unwrap();
+        let target = dir.path().join("foreign.json");
+        let original = serde_json::to_vec(&make_lease("GreenPeak", None, true)).unwrap();
+        std::fs::write(&target, &original).unwrap();
+        let linked = lease_path_for_holder(&slot, "BlueLake", None);
+        std::os::unix::fs::symlink(&target, &linked).unwrap();
+
+        assert!(acquire_slot_lease(&slot, "slot-a", "BlueLake", None, 3600, true).is_err());
+        assert_eq!(std::fs::read_link(&linked).unwrap(), target);
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        let _lock = try_lock_slot(&slot, false).unwrap().unwrap();
+    }
+
+    #[test]
     fn renewal_after_release_does_not_resurrect_lease() {
         let dir = tempfile::tempdir().unwrap();
         acquire_slot_lease(
@@ -1262,6 +1457,190 @@ mod tests {
     }
 
     #[test]
+    fn lease_reader_accepts_bounded_extensions_and_the_exact_size_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lease.json");
+        let mut value =
+            serde_json::to_value(make_lease("BlueLake", Some("fêature"), true)).unwrap();
+        value["extension"] = serde_json::json!({"description": "保留"});
+        let mut bytes = serde_json::to_vec(&value).unwrap();
+        bytes.resize(usize::try_from(MAX_BUILD_SLOT_LEASE_BYTES).unwrap(), b' ');
+        std::fs::write(&path, &bytes).unwrap();
+
+        let lease = read_lease_json(&path).unwrap();
+        assert_eq!(lease.agent, "BlueLake");
+        assert_eq!(lease.branch.as_deref(), Some("fêature"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        bytes.push(b' ');
+        std::fs::write(&path, &bytes).unwrap();
+        let error = read_lease_json(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("lease.json"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn invalid_or_oversized_evidence_blocks_acquire_renew_release_and_resolution() {
+        for invalid in ["json", "utf8", "expired-oversize", "released-oversize"] {
+            let dir = tempfile::tempdir().unwrap();
+            acquire_slot_lease(dir.path(), "slot-a", "BlueLake", None, 3600, true).unwrap();
+            let owned = lease_path_for_holder(dir.path(), "BlueLake", None);
+            let before = std::fs::read(&owned).unwrap();
+            let obstacle = dir.path().join("unknown-lease.json");
+            let bytes = match invalid {
+                "json" => b"{ invalid".to_vec(),
+                "utf8" => vec![0xff, 0xfe],
+                _ => {
+                    let mut value = serde_json::to_value(make_lease("RedFox", None, true)).unwrap();
+                    if invalid == "expired-oversize" {
+                        value["expires_ts"] = serde_json::json!("2020-01-01T00:00:00Z");
+                    } else {
+                        value["released_ts"] = serde_json::json!("2020-01-01T00:00:00Z");
+                    }
+                    value["extension"] = serde_json::json!(
+                        "x".repeat(usize::try_from(MAX_BUILD_SLOT_LEASE_BYTES).unwrap())
+                    );
+                    serde_json::to_vec(&value).unwrap()
+                }
+            };
+            std::fs::write(&obstacle, &bytes).unwrap();
+
+            assert!(
+                acquire_slot_lease(dir.path(), "slot-a", "GreenPeak", None, 3600, true).is_err()
+            );
+            assert!(renew_slot_lease(dir.path(), "BlueLake", None, 600).is_err());
+            assert!(release_slot_lease(dir.path(), "BlueLake", None).is_err());
+            assert!(resolve_holder_lease_path(dir.path(), "GreenPeak", None).is_err());
+            assert!(write_lease_json(&obstacle, &make_lease("RedFox", None, true)).is_err());
+            assert_eq!(std::fs::read(&owned).unwrap(), before, "case {invalid}");
+            assert_eq!(std::fs::read(&obstacle).unwrap(), bytes, "case {invalid}");
+            assert!(!lease_path_for_holder(dir.path(), "GreenPeak", None).exists());
+            let _lock = try_lock_slot(dir.path(), false).unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn oversized_publication_preserves_incumbent_and_does_not_stage_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        acquire_slot_lease(dir.path(), "slot-a", "BlueLake", None, 3600, true).unwrap();
+        let _lock = try_lock_slot(dir.path(), false).unwrap().unwrap();
+        let path = lease_path_for_holder(dir.path(), "BlueLake", None);
+        let before = std::fs::read(&path).unwrap();
+        let mut lease = read_lease_json(&path).unwrap();
+        lease.branch = Some("x".repeat(usize::try_from(MAX_BUILD_SLOT_LEASE_BYTES).unwrap()));
+
+        let error = write_lease_json(&path, &lease).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        let absent_parent = dir.path().join("not-created");
+        assert!(write_lease_json(&absent_parent.join("lease.json"), &lease).is_err());
+        assert!(!absent_parent.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_lease_evidence_blocks_every_mutation_and_preserves_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = dir.path().join("slot");
+        acquire_slot_lease(&slot, "slot-a", "BlueLake", None, 3600, true).unwrap();
+        let owned = lease_path_for_holder(&slot, "BlueLake", None);
+        let before = std::fs::read(&owned).unwrap();
+        let target = dir.path().join("foreign.json");
+        let contents = serde_json::to_vec(&make_lease("RedFox", None, true)).unwrap();
+        std::fs::write(&target, &contents).unwrap();
+        let linked = slot.join("linked.json");
+        std::os::unix::fs::symlink(&target, &linked).unwrap();
+
+        assert!(acquire_slot_lease(&slot, "slot-a", "GreenPeak", None, 3600, true).is_err());
+        assert!(renew_slot_lease(&slot, "BlueLake", None, 600).is_err());
+        assert!(release_slot_lease(&slot, "BlueLake", None).is_err());
+        assert!(resolve_holder_lease_path(&slot, "GreenPeak", None).is_err());
+        assert!(write_lease_json(&linked, &make_lease("RedFox", None, true)).is_err());
+        assert_eq!(std::fs::read_link(&linked).unwrap(), target);
+        assert_eq!(std::fs::read(&target).unwrap(), contents);
+        assert_eq!(std::fs::read(&owned).unwrap(), before);
+        assert!(!lease_path_for_holder(&slot, "GreenPeak", None).exists());
+        let _lock = try_lock_slot(&slot, false).unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_slot_operations_reject_fifo_without_waiting_for_a_writer() {
+        const CHILD_PATH: &str = "MCP_AGENT_MAIL_SLOT_FIFO_TEST_PATH";
+        const CHILD_OPERATION: &str = "MCP_AGENT_MAIL_SLOT_FIFO_TEST_OPERATION";
+        const TEST: &str =
+            "build_slots::tests::build_slot_operations_reject_fifo_without_waiting_for_a_writer";
+        const WITNESS: &str = "build-slot-fifo-refused";
+
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            // The regression used to block in open while holding the slot
+            // flock. Bound only this private child, never the test runner.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                eprintln!("build-slot operation waited on a writerless FIFO");
+                std::process::exit(3);
+            });
+            let slot = Path::new(&path).parent().unwrap();
+            let operation = std::env::var(CHILD_OPERATION).unwrap();
+            let result = match operation.as_str() {
+                "acquire" => {
+                    acquire_slot_lease(slot, "slot-a", "GreenPeak", None, 3600, true).map(|_| ())
+                }
+                "renew" => renew_slot_lease(slot, "BlueLake", None, 600).map(|_| ()),
+                "release" => release_slot_lease(slot, "BlueLake", None).map(|_| ()),
+                "write" => write_lease_json(Path::new(&path), &make_lease("RedFox", None, true)),
+                _ => panic!("unexpected FIFO test operation"),
+            };
+            assert!(result.is_err(), "writerless FIFO must be refused");
+            let _lock = try_lock_slot(slot, false).unwrap().unwrap();
+            println!("{WITNESS}");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        acquire_slot_lease(dir.path(), "slot-a", "BlueLake", None, 3600, true).unwrap();
+        let owned = lease_path_for_holder(dir.path(), "BlueLake", None);
+        let before = std::fs::read(&owned).unwrap();
+        let fifo = dir.path().join("blocked.json");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .args(["-m", "600"])
+                .arg(&fifo)
+                .status()
+                .expect("create real writerless FIFO")
+                .success()
+        );
+        for operation in ["acquire", "renew", "release", "write"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD_PATH, &fifo)
+                .env(CHILD_OPERATION, operation)
+                .current_dir(dir.path())
+                .output()
+                .expect("run private bounded build-slot child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success()
+                    && stdout.contains(WITNESS)
+                    && stdout.contains("test result: ok. 1 passed;"),
+                "{operation} child must pass exactly one test: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::fs::read(&owned).unwrap(), before);
+            assert!(!lease_path_for_holder(dir.path(), "GreenPeak", None).exists());
+        }
+        use std::os::unix::fs::FileTypeExt as _;
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+    }
+
+    #[test]
     fn directory_read_failure_is_not_an_empty_slot() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("not-a-directory");
@@ -1298,23 +1677,23 @@ mod tests {
             SlotOperation::Renew,
             SlotOperation::Release,
         ] {
-            enforce_slot_lifecycle(&agent, operation).unwrap();
+            enforce_slot_lifecycle(&agent, None, operation).unwrap();
         }
         agent.retired_at = Some(5_000_000);
         for operation in [SlotOperation::Acquire, SlotOperation::Renew] {
-            let error = enforce_slot_lifecycle(&agent, operation).unwrap_err();
+            let error = enforce_slot_lifecycle(&agent, None, operation).unwrap_err();
             assert_eq!(crate::tool_error_code(&error), Some("AGENT_RETIRED"));
         }
-        enforce_slot_lifecycle(&agent, SlotOperation::Release).unwrap();
+        enforce_slot_lifecycle(&agent, None, SlotOperation::Release).unwrap();
         for retired_at in [None, Some(5_000_000)] {
             agent.retired_at = retired_at;
             agent.task_description =
                 "[DEREGISTERED at 2026-10-01 00:00:00] imported identity".into();
             for operation in [SlotOperation::Acquire, SlotOperation::Renew] {
-                let error = enforce_slot_lifecycle(&agent, operation).unwrap_err();
+                let error = enforce_slot_lifecycle(&agent, None, operation).unwrap_err();
                 assert_eq!(crate::tool_error_code(&error), Some("AGENT_DEREGISTERED"));
             }
-            enforce_slot_lifecycle(&agent, SlotOperation::Release).unwrap();
+            enforce_slot_lifecycle(&agent, None, SlotOperation::Release).unwrap();
         }
     }
 
@@ -1744,6 +2123,192 @@ mod tests {
                 .unwrap();
                 assert!(row.retired_at.is_none());
                 assert!(row.task_description.starts_with("[DEREGISTERED "));
+            });
+        });
+    }
+
+    #[test]
+    fn public_slots_refuse_ledger_only_deregistration_and_preserve_release() {
+        lifecycle_mailbox(|ctx, pool, config, key| {
+            fastmcp_core::block_on(async {
+                crate::session_identity::bind(ctx, 71, 81, "BlueLake");
+                acquire_build_slot(
+                    ctx,
+                    key.into(),
+                    "BlueLake".into(),
+                    "existing".into(),
+                    Some(3600),
+                    None,
+                )
+                .await
+                .unwrap();
+                let root = project_archive_root(config, "slot-lifecycle");
+                let path = lease_path_for_holder(&slot_dir(&root, "existing"), "BlueLake", None);
+                let before = std::fs::read(&path).unwrap();
+                let external = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
+                external
+                    .execute_raw("INSERT INTO agent_deregistrations(agent_id, deregistered_at) VALUES(81, 123)")
+                    .unwrap();
+                drop(external);
+
+                // A normal profile is not proof of active lifecycle state.
+                let profile = db_outcome_to_mcp_result(
+                    mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, 71, "BlueLake").await,
+                )
+                .unwrap();
+                assert!(profile.retired_at.is_none());
+                assert_eq!(profile.task_description, "active");
+                let acquire = acquire_build_slot(
+                    ctx,
+                    key.into(),
+                    "BlueLake".into(),
+                    "new-work".into(),
+                    None,
+                    None,
+                )
+                .await;
+                let renew =
+                    renew_build_slot(ctx, key.into(), "BlueLake".into(), "existing".into(), None)
+                        .await;
+                for result in [acquire, renew] {
+                    assert_eq!(
+                        result.as_ref().err().and_then(crate::tool_error_code),
+                        Some("AGENT_DEREGISTERED")
+                    );
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                assert!(!slot_dir(&root, "new-work").exists());
+                let released =
+                    release_build_slot(ctx, key.into(), "BlueLake".into(), "existing".into())
+                        .await
+                        .unwrap();
+                assert!(
+                    serde_json::from_str::<ReleaseBuildSlotResponse>(&released)
+                        .unwrap()
+                        .released
+                );
+                assert!(stored_lease(&path).released_ts.is_some());
+                assert_eq!(
+                    db_outcome_to_mcp_result(
+                        mcp_agent_mail_db::queries::get_agent_deregistered_at(ctx.cx(), pool, 81)
+                            .await,
+                    )
+                    .unwrap(),
+                    Some(123)
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn public_slots_recheck_external_retirement_before_file_mutation() {
+        lifecycle_mailbox(|ctx, pool, config, key| {
+            fastmcp_core::block_on(async {
+                acquire_build_slot(
+                    ctx,
+                    key.into(),
+                    "BlueLake".into(),
+                    "existing".into(),
+                    Some(3600),
+                    None,
+                )
+                .await
+                .unwrap();
+                let root = project_archive_root(config, "slot-lifecycle");
+                let path = lease_path_for_holder(&slot_dir(&root, "existing"), "BlueLake", None);
+                let before = std::fs::read(&path).unwrap();
+                let external = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
+                external
+                    .execute_raw("UPDATE agents SET retired_at = 123 WHERE id = 81")
+                    .unwrap();
+                drop(external);
+                let cached = db_outcome_to_mcp_result(
+                    mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, 71, "BlueLake").await,
+                )
+                .unwrap();
+                assert!(
+                    cached.retired_at.is_none(),
+                    "fixture must retain stale cached authority"
+                );
+                let acquire = acquire_build_slot(
+                    ctx,
+                    key.into(),
+                    "BlueLake".into(),
+                    "new-work".into(),
+                    None,
+                    None,
+                )
+                .await;
+                let renew =
+                    renew_build_slot(ctx, key.into(), "BlueLake".into(), "existing".into(), None)
+                        .await;
+                for result in [acquire, renew] {
+                    assert_eq!(
+                        result.as_ref().err().and_then(crate::tool_error_code),
+                        Some("AGENT_RETIRED")
+                    );
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                assert!(!slot_dir(&root, "new-work").exists());
+                let released =
+                    release_build_slot(ctx, key.into(), "BlueLake".into(), "existing".into())
+                        .await
+                        .unwrap();
+                assert!(
+                    serde_json::from_str::<ReleaseBuildSlotResponse>(&released)
+                        .unwrap()
+                        .released
+                );
+                assert!(stored_lease(&path).released_ts.is_some());
+            });
+        });
+    }
+
+    #[test]
+    fn public_slots_observe_external_unretirement_despite_cached_retirement() {
+        lifecycle_mailbox(|ctx, pool, _, key| {
+            fastmcp_core::block_on(async {
+                db_outcome_to_mcp_result(
+                    mcp_agent_mail_db::queries::set_agent_retired_at(ctx.cx(), pool, 81, Some(123))
+                        .await,
+                )
+                .unwrap();
+                let external = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
+                external
+                    .execute_raw("UPDATE agents SET retired_at = NULL WHERE id = 81")
+                    .unwrap();
+                drop(external);
+                let cached = db_outcome_to_mcp_result(
+                    mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, 71, "BlueLake").await,
+                )
+                .unwrap();
+                assert_eq!(cached.retired_at, Some(123));
+                let acquired = acquire_build_slot(
+                    ctx,
+                    key.into(),
+                    "BlueLake".into(),
+                    "resumed".into(),
+                    Some(3600),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<AcquireBuildSlotResponse>(&acquired)
+                        .unwrap()
+                        .granted
+                        .agent,
+                    "BlueLake"
+                );
+                let renewed =
+                    renew_build_slot(ctx, key.into(), "BlueLake".into(), "resumed".into(), None)
+                        .await
+                        .unwrap();
+                assert!(
+                    serde_json::from_str::<RenewBuildSlotResponse>(&renewed)
+                        .unwrap()
+                        .renewed
+                );
             });
         });
     }

@@ -95,7 +95,10 @@ const MAX_ITEMIZED_WARNINGS: usize = 10_000;
 /// failure (so an oversized artifact is logged/counted rather than OOMing).
 fn read_archive_text_capped(path: &Path) -> std::io::Result<String> {
     use std::io::Read as _;
-    let mut file = std::fs::File::open(path)?;
+    // A prior directory-entry check cannot exclude a leaf swapped to a link
+    // or FIFO before open. Verify the opened handle and refuse without waiting
+    // for a writer on a non-regular archive artifact.
+    let mut file = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
     let mut buf = String::new();
     let read = file
         .by_ref()
@@ -111,6 +114,66 @@ fn read_archive_text_capped(path: &Path) -> std::io::Result<String> {
         ));
     }
     Ok(buf)
+}
+
+/// Read only the metadata prefix needed by archive inventories. Message bodies
+/// can dominate mailbox size, but neither ID enumeration nor drift inspection
+/// consumes them. Full reconstruction still uses `read_archive_text_capped`.
+/// Keep the existing artifact limit and frontmatter grammar, including legacy
+/// preambles, CRLF and a closing marker at EOF. This best-effort inventory is
+/// not the descriptor-bound, authoritative allocator scan in `id_floor`.
+fn read_archive_frontmatter_capped(path: &Path) -> std::io::Result<Option<String>> {
+    let file = mcp_agent_mail_core::disk::open_regular_file_no_follow(path)?;
+    if file.metadata()?.len() > MAX_ARCHIVE_ARTIFACT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "archive artifact exceeds {MAX_ARCHIVE_ARTIFACT_BYTES} byte cap: {}",
+                path.display()
+            ),
+        ));
+    }
+    read_archive_frontmatter_prefix(file)
+}
+
+fn read_archive_frontmatter_prefix(reader: impl std::io::Read) -> std::io::Result<Option<String>> {
+    use std::io::BufRead as _;
+
+    let mut reader = std::io::BufReader::new(reader.take(MAX_ARCHIVE_ARTIFACT_BYTES + 1));
+    let mut prefix = Vec::with_capacity(8 * 1024);
+    let mut found_header = false;
+    loop {
+        let line_start = prefix.len();
+        let read = reader.read_until(b'\n', &mut prefix)?;
+        if prefix.len() as u64 > MAX_ARCHIVE_ARTIFACT_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("archive frontmatter exceeds {MAX_ARCHIVE_ARTIFACT_BYTES} byte cap"),
+            ));
+        }
+        if read == 0 {
+            return Ok(None);
+        }
+        let line = &prefix[line_start..];
+        // Decode the consumed prefix, never arbitrary body bytes that a
+        // BufReader may have prefetched after the closing marker.
+        let text = std::str::from_utf8(line)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if !found_header {
+            if let Some(start) = text.find("---json") {
+                // Match frontmatter_bounds: its first header candidate is
+                // decisive, even if a later line contains a valid header.
+                if !matches!(&text[start..], "---json\n" | "---json\r\n") {
+                    return Ok(None);
+                }
+                found_header = true;
+            }
+        } else if matches!(line, b"---\n" | b"---\r\n" | b"---") {
+            return String::from_utf8(prefix)
+                .map(Some)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -236,7 +299,7 @@ fn apply_snapshot_migrations(
                     let rows = conn
                         .query_sync(schema::PROJECT_EVENT_SCHEMA_SQL, &[])
                         .map_err(|error| DbError::Sqlite(error.to_string()))?;
-                    schema::validate_project_event_rebuild_schema(&migration, &rows)
+                    schema::validate_multi_statement_migration_schema(&migration, &rows)
                         .map_err(|error| DbError::Sqlite(error.to_string()))?;
                 }
                 for sql in statements {
@@ -1495,8 +1558,11 @@ fn scan_project_archive_message_inventory(
 }
 
 fn scan_archive_message_id(file_path: &Path) -> DbResult<Option<i64>> {
-    let content = read_archive_text_capped(file_path)
-        .map_err(|e| DbError::Sqlite(format!("read {}: {e}", file_path.display())))?;
+    let Some(content) = read_archive_frontmatter_capped(file_path)
+        .map_err(|e| DbError::Sqlite(format!("read {}: {e}", file_path.display())))?
+    else {
+        return Ok(None);
+    };
     let Some(frontmatter) = extract_json_frontmatter(&content) else {
         return Ok(None);
     };
@@ -2423,7 +2489,13 @@ fn discover_agents(
         let last_active_ts = parse_ts_from_json(&profile, "last_active_ts")
             .unwrap_or_else(|| inception_ts.unwrap_or_else(crate::now_micros));
         let inception_ts = inception_ts.unwrap_or(last_active_ts);
-        let retired_at = parse_ts_from_json(&profile, "retired_at");
+        let retired_at = parse_reconstructed_agent_lifecycle_timestamp(
+            &profile,
+            "retired_at",
+            last_active_ts,
+            &profile_source,
+            stats,
+        );
         // Exempt agents must remain exempt after rebuilding from the archive;
         // otherwise the inactivity reaper can retire an identity that the
         // operator explicitly protected. Older profiles omit this field.
@@ -2440,8 +2512,14 @@ fn discover_agents(
             crate::models::deregistered_task_timestamp_micros(task_description)
                 .unwrap_or(last_active_ts)
         });
-        let deregistered_at =
-            parse_ts_from_json(&profile, "deregistered_at").or(legacy_deregistered_at);
+        let deregistered_at = parse_reconstructed_agent_lifecycle_timestamp(
+            &profile,
+            "deregistered_at",
+            legacy_deregistered_at.unwrap_or(last_active_ts),
+            &profile_source,
+            stats,
+        )
+        .or(legacy_deregistered_at);
 
         conn.execute_sync(
             "INSERT OR IGNORE INTO agents \
@@ -6811,6 +6889,31 @@ fn parse_ts_from_json(value: &serde_json::Value, key: &str) -> Option<i64> {
     }
 }
 
+/// An unreadable lifecycle timestamp still records an inactive identity.
+/// Archive-only recovery must preserve that evidence just as live-DB salvage
+/// does: treating a malformed non-null marker as absence would silently
+/// restore permission to send, receive, and acquire new reservations. Keep
+/// valid timestamps unchanged and allow absent/null fields from active or
+/// older profiles; substitute an observed profile timestamp only when the
+/// marker is present but cannot be decoded, and report the uncertainty.
+fn parse_reconstructed_agent_lifecycle_timestamp(
+    profile: &serde_json::Value,
+    field: &str,
+    fallback: i64,
+    source: &str,
+    stats: &mut ReconstructStats,
+) -> Option<i64> {
+    if profile.get(field).is_none_or(serde_json::Value::is_null) {
+        return None;
+    }
+    parse_ts_from_json(profile, field).or_else(|| {
+        stats.push_warning(format!(
+            "{source} has an unparseable {field} value; preserving the inactive state with fallback timestamp {fallback}"
+        ));
+        Some(fallback)
+    })
+}
+
 /// Query the ID of a row by a unique text column, or the last inserted row.
 fn query_last_insert_or_existing_id(
     conn: &DbConn,
@@ -7279,6 +7382,123 @@ fn collect_message_files_with_ids(
 mod tests {
     use super::*;
 
+    #[test]
+    fn capped_archive_reader_preserves_regular_text_and_missing_file_errors() {
+        let dir = tempfile::tempdir().expect("private archive reader fixture");
+        let path = dir.path().join("artifact.md");
+        for contents in ["", "---json\n{\"id\":7}\n---\n\nhéllo 📨\n"] {
+            std::fs::write(&path, contents).expect("write regular archive artifact");
+            assert_eq!(read_archive_text_capped(&path).unwrap(), contents);
+        }
+        let error = read_archive_text_capped(&dir.path().join("missing.md"))
+            .expect_err("missing archive artifact must remain an error");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn capped_archive_reader_preserves_byte_cap_and_utf8_errors() {
+        let dir = tempfile::tempdir().expect("private bounded reader fixture");
+        let invalid = dir.path().join("invalid.md");
+        std::fs::write(&invalid, [0xf0, 0x28, 0x8c, 0x28]).expect("write invalid UTF-8");
+        assert_eq!(
+            read_archive_text_capped(&invalid).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let path = dir.path().join("bounded.md");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_ARCHIVE_ARTIFACT_BYTES)
+            .expect("extend sparse regular artifact to the inclusive cap");
+        let contents = read_archive_text_capped(&path).expect("exact cap is accepted");
+        assert_eq!(
+            u64::try_from(contents.len()).unwrap(),
+            MAX_ARCHIVE_ARTIFACT_BYTES
+        );
+        drop(contents);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_ARCHIVE_ARTIFACT_BYTES + 1)
+            .expect("extend artifact one byte beyond cap");
+        let error = read_archive_text_capped(&path).expect_err("oversized artifact must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("byte cap"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capped_archive_reader_rejects_linked_project_identity() {
+        let dir = tempfile::tempdir().expect("private linked identity fixture");
+        let archive = dir.path().join("archive");
+        let project = archive.join("projects/inside");
+        std::fs::create_dir_all(&project).unwrap();
+        let outside = dir.path().join("outside.json");
+        let contents = r#"{"slug":"foreign","human_key":"/foreign"}"#;
+        std::fs::write(&outside, contents).unwrap();
+        let link = project.join("project.json");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        // The previous plain File::open reader follows this valid leaf link.
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), contents);
+        assert!(read_archive_text_capped(&link).is_err());
+        let inventory = scan_archive_message_inventory(&archive);
+        let expected = MailboxProjectIdentity::from_parts(Some("inside".into()), None, None)
+            .expect("directory identity fallback");
+        assert_eq!(inventory.projects, 1);
+        assert_eq!(inventory.project_identities, BTreeSet::from([expected]));
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), contents);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capped_archive_reader_rejects_fifo_without_waiting_for_a_writer() {
+        const CHILD_PATH_ENV: &str = "MCP_AGENT_MAIL_CAPPED_ARCHIVE_FIFO_PATH";
+        const TEST: &str =
+            "reconstruct::tests::capped_archive_reader_rejects_fifo_without_waiting_for_a_writer";
+        const WITNESS: &str = "capped-archive-fifo-refused";
+
+        if let Some(path) = std::env::var_os(CHILD_PATH_ENV) {
+            // Bound the regression itself: plain File::open blocks forever on
+            // this writerless FIFO. Only this private child is terminated.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                eprintln!("capped archive FIFO reader did not refuse within 5 seconds");
+                std::process::exit(3);
+            });
+            let error = read_archive_text_capped(Path::new(&path))
+                .expect_err("writerless FIFO must be refused at open");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            println!("{WITNESS}");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("private FIFO fixture");
+        let fifo = dir.path().join("artifact.md");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("create real writerless FIFO");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD_PATH_ENV, &fifo)
+            .current_dir(dir.path())
+            .output()
+            .expect("execute private bounded reader child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success()
+                && stdout.contains(WITNESS)
+                && stdout.contains("test result: ok. 1 passed;"),
+            "FIFO reader child must execute and pass exactly one test: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        print!("{stdout}");
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+
     fn assert_compact_reconstruction_candidate(conn: &DbConn) {
         assert_eq!(
             conn.query_sync("PRAGMA freelist_count", &[]).unwrap()[0]
@@ -7468,10 +7688,10 @@ mod tests {
             .position(|migration| migration.id == "v33_project_scoped_inbox_delivery_events")
             .unwrap();
         let migration = legacy.remove(index);
-        // This fixture predates the v33 event representation. Installing v34
-        // first creates a mixed-epoch schema that the ownership guard refuses
-        // before the intended ledger-write rollback control can be reached.
-        legacy.retain(|migration| !migration.id.starts_with("v34_"));
+        // This fixture predates v33. Keep only its actual predecessors: later
+        // cursor migrations depend on each other and must not run before the
+        // intended ledger-write rollback control can be reached.
+        legacy.truncate(index);
         apply_snapshot_migrations(&conn, legacy, "legacy fixture").unwrap();
         conn.execute_raw(
             "PRAGMA foreign_keys = OFF; \
@@ -8148,6 +8368,125 @@ mod tests {
             .map(|row| row.get_as::<String>(0).unwrap())
             .collect();
         assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
+    }
+
+    #[test]
+    fn reconstructed_deregistration_excludes_shared_delivery_and_retains_direct_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = tmp.path().join("archive");
+        let project = storage.join("projects/lifecycle");
+        let messages = project.join("messages/2026/10");
+        std::fs::create_dir_all(&messages).unwrap();
+        std::fs::write(
+            project.join("project.json"),
+            r#"{"slug":"lifecycle","human_key":"/lifecycle","created_at":1}"#,
+        )
+        .unwrap();
+        for name in ["Sender", "Active", "Ended", "Retired"] {
+            let dir = project.join("agents").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let profile = serde_json::json!({
+                "name": name, "program": "test", "model": "test",
+                "inception_ts": 1, "last_active_ts": 2, "contact_policy": "auto",
+                "retired_at": (name == "Retired").then_some(100),
+                "deregistered_at": (name == "Ended").then_some(100),
+            });
+            std::fs::write(
+                dir.join("profile.json"),
+                serde_json::to_vec(&profile).unwrap(),
+            )
+            .unwrap();
+        }
+        for (id, recipient) in [(1, "project:lifecycle"), (2, "Ended")] {
+            let message = serde_json::json!({
+                "id": id, "from": "Sender", "to": [recipient], "cc": [], "bcc": [],
+                "subject": format!("lifecycle {id}"), "created": "2026-10-01T00:00:00Z",
+                "attachments": [], "importance": "high", "ack_required": true,
+            });
+            std::fs::write(
+                messages.join(format!("2026-10-01T00-00-00Z__lifecycle__{id}.md")),
+                format!("---json\n{message}\n---\n\nretained body {id}\n"),
+            )
+            .unwrap();
+        }
+        let db = tmp.path().join("restored.sqlite3");
+        let stats = reconstruct_from_archive(&db, &storage).unwrap();
+        assert_eq!(
+            (
+                stats.agents,
+                stats.messages,
+                stats.recipients,
+                stats.project_mailbox_deliveries
+            ),
+            (4, 2, 1, 1)
+        );
+        assert_eq!(stats.parse_errors, 0);
+        let conn = crate::guard_db_conn(
+            crate::DbConn::open_file(db.to_str().unwrap()).unwrap(),
+            "reconstructed lifecycle shared mailbox",
+        );
+        conn.execute_raw("PRAGMA query_only=ON").unwrap();
+        let identities = conn
+            .query_sync("SELECT id, project_id, name FROM agents", &[])
+            .unwrap();
+        let ids: HashMap<String, i64> = identities
+            .iter()
+            .map(|row| (row.get_named("name").unwrap(), row.get_named("id").unwrap()))
+            .collect();
+        let project_id = identities[0].get_named::<i64>("project_id").unwrap();
+        let lifecycle = conn
+            .query_sync(
+                "SELECT a.retired_at, a.contact_policy, d.deregistered_at FROM agents a \
+             JOIN agent_deregistrations d ON d.agent_id=a.id WHERE a.name='Ended'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle[0].get_named::<Option<i64>>("retired_at").unwrap(),
+            None
+        );
+        assert_eq!(
+            lifecycle[0].get_named::<String>("contact_policy").unwrap(),
+            "auto"
+        );
+        assert_eq!(
+            lifecycle[0].get_named::<i64>("deregistered_at").unwrap(),
+            100
+        );
+        for (name, expected) in [("Active", vec![1]), ("Ended", vec![2]), ("Retired", vec![])] {
+            let inbox = crate::sync::fetch_inbox_rows_from_conn(
+                &*conn, project_id, ids[name], false, false, false, None, 50,
+            )
+            .unwrap();
+            assert_eq!(
+                inbox
+                    .iter()
+                    .map(|row| row.message.id.unwrap())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{name}"
+            );
+            if name == "Ended" {
+                assert_eq!(inbox[0].kind, "to");
+                assert_eq!(inbox[0].message.body_md, "retained body 2\n");
+            }
+        }
+        let delivery = crate::project_mailbox::project_mailbox_delivery_from_conn(&*conn, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            delivery
+                .agents
+                .iter()
+                .map(|agent| agent.agent_name.as_str())
+                .collect::<Vec<_>>(),
+            ["Active"]
+        );
+        assert!(
+            conn.query_sync("SELECT * FROM project_mailbox_receipts", &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -8942,6 +9281,214 @@ mod tests {
                 .get_named::<i64>("deregistered_at")
                 .expect("deregistered_at"),
             crate::iso_to_micros("2026-02-22T13:00:00Z").unwrap()
+        );
+    }
+
+    #[test]
+    fn reconstructed_agent_lifecycle_timestamp_preserves_active_and_valid_states() {
+        let mut stats = ReconstructStats::default();
+        for field in ["retired_at", "deregistered_at"] {
+            for profile in [serde_json::json!({}), serde_json::json!({field: null})] {
+                assert_eq!(
+                    parse_reconstructed_agent_lifecycle_timestamp(
+                        &profile,
+                        field,
+                        4_000_000,
+                        "test profile",
+                        &mut stats,
+                    ),
+                    None,
+                    "absent and explicit null markers must retain active state"
+                );
+            }
+            for timestamp in [
+                serde_json::json!(2_000_000),
+                serde_json::json!("2000000"),
+                serde_json::json!("1970-01-01T00:00:02Z"),
+            ] {
+                assert_eq!(
+                    parse_reconstructed_agent_lifecycle_timestamp(
+                        &serde_json::json!({field: timestamp}),
+                        field,
+                        4_000_000,
+                        "test profile",
+                        &mut stats,
+                    ),
+                    Some(2_000_000),
+                    "valid lifecycle evidence must not be replaced by a fallback"
+                );
+            }
+        }
+        assert_eq!(stats.warnings, Vec::<String>::new());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reconstruct_preserves_malformed_agent_lifecycle_markers_and_history() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("lifecycle.db");
+        let storage_root = tmp.path().join("storage");
+        let project_dir = storage_root.join("projects/demo");
+        let write_profile = |name: &str, lifecycle: serde_json::Value| {
+            let agent_dir = project_dir.join("agents").join(name);
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            let mut profile = serde_json::json!({
+                "name": name,
+                "program": "claude-code",
+                "model": "opus-4.6",
+                "inception_ts": 1_000_000,
+                "last_active_ts": 4_000_000,
+            });
+            profile
+                .as_object_mut()
+                .unwrap()
+                .extend(lifecycle.as_object().unwrap().clone());
+            std::fs::write(
+                agent_dir.join("profile.json"),
+                serde_json::to_vec(&profile).unwrap(),
+            )
+            .unwrap();
+        };
+        let malformed = [
+            serde_json::json!("private-invalid-timestamp"),
+            serde_json::json!(""),
+            serde_json::json!("  "),
+            serde_json::json!(true),
+            serde_json::json!(1.5),
+            serde_json::json!(u64::MAX),
+            serde_json::json!([]),
+            serde_json::json!({"timestamp": 2_000_000}),
+        ];
+        for (index, marker) in malformed.iter().enumerate() {
+            write_profile(
+                &format!("Retired{index}"),
+                serde_json::json!({"retired_at": marker}),
+            );
+            write_profile(
+                &format!("Deregistered{index}"),
+                serde_json::json!({"deregistered_at": marker}),
+            );
+        }
+        write_profile(
+            "Active",
+            serde_json::json!({"retired_at": null, "deregistered_at": null}),
+        );
+        write_profile("Legacy", serde_json::json!({}));
+        write_profile(
+            "LegacyEnded",
+            serde_json::json!({
+                "task_description": "[DEREGISTERED 1970-01-01T00:00:02Z] completed work",
+                "contact_policy": "block_all",
+                "deregistered_at": "invalid",
+            }),
+        );
+        let messages_dir = project_dir.join("messages/2026/01");
+        std::fs::create_dir_all(&messages_dir).unwrap();
+        std::fs::write(
+            messages_dir.join("2026-01-01T00-00-00Z__history__77.md"),
+            "---json\n{\"id\":77,\"from\":\"Retired0\",\"to\":[\"Deregistered0\"],\"subject\":\"Retained history\",\"importance\":\"normal\",\"created_ts\":\"2026-01-01T00:00:00Z\"}\n---\n\nretained transcript\n",
+        )
+        .unwrap();
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("reconstruct archive");
+        assert_eq!(stats.agents, malformed.len() * 2 + 3);
+        assert_eq!(
+            (stats.messages, stats.recipients, stats.parse_errors),
+            (1, 1, 0)
+        );
+        for (field, count) in [
+            ("retired_at", malformed.len()),
+            ("deregistered_at", malformed.len() + 1),
+        ] {
+            assert_eq!(
+                stats
+                    .warnings
+                    .iter()
+                    .filter(|warning| warning.contains(&format!("unparseable {field}")))
+                    .count(),
+                count,
+                "every uncertain lifecycle marker must be reported"
+            );
+        }
+        assert!(
+            stats
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("private-invalid-timestamp"))
+        );
+
+        // Reopen the actual reconstructed database: both lifecycle columns
+        // and the deregistration ledger must survive candidate construction.
+        let conn =
+            DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("reopen rebuilt DB");
+        for index in 0..malformed.len() {
+            for (prefix, retired_at, deregistered_at) in [
+                ("Retired", Some(4_000_000), None),
+                ("Deregistered", None, Some(4_000_000)),
+            ] {
+                let rows = conn
+                    .query_sync(
+                        "SELECT a.retired_at, d.deregistered_at FROM agents a \
+                     LEFT JOIN agent_deregistrations d ON d.agent_id = a.id WHERE a.name = ?",
+                        &[Value::Text(format!("{prefix}{index}"))],
+                    )
+                    .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    rows[0].get_named::<Option<i64>>("retired_at").unwrap(),
+                    retired_at
+                );
+                assert_eq!(
+                    rows[0].get_named::<Option<i64>>("deregistered_at").unwrap(),
+                    deregistered_at
+                );
+            }
+        }
+        let legacy = conn
+            .query_sync(
+                "SELECT d.deregistered_at FROM agent_deregistrations d \
+             JOIN agents a ON a.id = d.agent_id WHERE a.name = 'LegacyEnded'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            legacy[0].get_named::<i64>("deregistered_at").unwrap(),
+            2_000_000
+        );
+        let active = conn.query_sync(
+            "SELECT a.name FROM agents a LEFT JOIN agent_deregistrations d ON d.agent_id = a.id \
+             WHERE a.retired_at IS NULL AND d.agent_id IS NULL ORDER BY a.name",
+            &[],
+        ).unwrap();
+        assert_eq!(
+            active
+                .iter()
+                .map(|row| row.get_named::<String>("name").unwrap())
+                .collect::<Vec<_>>(),
+            vec!["Active", "Legacy"],
+            "malformed inactive markers must not restore eligibility for new work"
+        );
+        let history = conn
+            .query_sync(
+                "SELECT m.body_md, sender.name AS sender, recipient.name AS recipient \
+             FROM messages m JOIN agents sender ON sender.id = m.sender_id \
+             JOIN message_recipients r ON r.message_id = m.id \
+             JOIN agents recipient ON recipient.id = r.agent_id WHERE m.id = 77",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].get_named::<String>("body_md").unwrap(),
+            "retained transcript\n"
+        );
+        assert_eq!(
+            history[0].get_named::<String>("sender").unwrap(),
+            "Retired0"
+        );
+        assert_eq!(
+            history[0].get_named::<String>("recipient").unwrap(),
+            "Deregistered0"
         );
     }
 
@@ -14475,6 +15022,203 @@ archive body
         let (ids, errors) = scan_archive_message_ids(tmp.path());
         assert_eq!(errors, 0);
         assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn archive_frontmatter_prefix_preserves_inventory_grammar() {
+        let cases = [
+            "---json\n{\"id\":1}\n---\nbody\n---\n",
+            "---json\r\n{\"id\":2}\r\n---\r\nbody",
+            "---json\n{\"id\":3}\n---",
+            "legacy preamble\n\u{feff}---json\n{\"id\":4}\n---\nbody",
+            "---json\n{\"id\":5,\"subject\":\"--- markers ---\"}\n---\nbody",
+            "---json\n{\"id\":6}\n---suffix\n---\nbody",
+            "---json invalid\n---json\n{\"id\":7}\n---\nbody",
+            "---json\n{\"id\":8}\n",
+            "---json",
+            "plain text\n---\n",
+            "",
+        ];
+        for content in cases {
+            let prefix = read_archive_frontmatter_prefix(content.as_bytes()).unwrap();
+            assert_eq!(
+                prefix.as_deref().and_then(extract_json_frontmatter),
+                extract_json_frontmatter(content),
+                "inventory frontmatter grammar changed for {content:?}",
+            );
+        }
+
+        let invalid_header = b"---json\n{\"id\":\xff}\n---\nbody";
+        assert_eq!(
+            read_archive_frontmatter_prefix(invalid_header.as_slice())
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData,
+        );
+        // An inventory reports metadata only. Body validation remains on the
+        // full reconstruction path and must not make this scan read the body.
+        let invalid_body = b"---json\n{\"id\":9}\n---\n\xff";
+        let prefix = read_archive_frontmatter_prefix(invalid_body.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(extract_json_frontmatter(&prefix), Some("{\"id\":9}\n"));
+    }
+
+    #[test]
+    fn archive_frontmatter_prefix_reads_metadata_instead_of_large_bodies() {
+        use std::cell::Cell;
+        use std::io::{Read as _, Write as _};
+
+        struct CountedFile<'a> {
+            file: std::fs::File,
+            bytes: &'a Cell<usize>,
+        }
+        impl std::io::Read for CountedFile<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.file.read(buffer)?;
+                self.bytes.set(self.bytes.get() + read);
+                Ok(read)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("large.md");
+        let header = b"---json\n{\"id\":42,\"subject\":\"large message\"}\n---\n";
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(header).unwrap();
+        let body_chunk = vec![b'x'; 64 * 1024];
+        for _ in 0..128 {
+            file.write_all(&body_chunk).unwrap();
+        }
+        drop(file);
+
+        // Run the incumbent full-artifact read and the metadata reader on the
+        // same real file. Count actual Read bytes instead of a noisy timing
+        // assertion; both paths must identify exactly the same message.
+        let full_bytes = Cell::new(0);
+        let mut full = String::new();
+        CountedFile {
+            file: std::fs::File::open(&path).unwrap(),
+            bytes: &full_bytes,
+        }
+        .take(MAX_ARCHIVE_ARTIFACT_BYTES + 1)
+        .read_to_string(&mut full)
+        .unwrap();
+        assert_eq!(full, read_archive_text_capped(&path).unwrap());
+
+        let prefix_bytes = Cell::new(0);
+        let prefix = read_archive_frontmatter_prefix(CountedFile {
+            file: std::fs::File::open(&path).unwrap(),
+            bytes: &prefix_bytes,
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            extract_json_frontmatter(&prefix),
+            extract_json_frontmatter(&full),
+        );
+        assert_eq!(scan_archive_message_id(&path).unwrap(), Some(42));
+        assert_eq!(prefix.len(), header.len());
+        assert_eq!(full_bytes.get(), 8 * 1024 * 1024 + header.len());
+        assert!(
+            prefix_bytes.get() <= 8 * 1024 + header.len(),
+            "body was read: {} bytes for {} metadata bytes",
+            prefix_bytes.get(),
+            header.len(),
+        );
+        eprintln!(
+            "archive inventory actual bytes: incumbent={}, metadata={}, retained_prefix={}",
+            full_bytes.get(),
+            prefix_bytes.get(),
+            prefix.len(),
+        );
+    }
+
+    #[test]
+    fn scan_archive_message_inventory_preserves_ids_duplicates_and_parse_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let directory = root.join("projects/alpha/messages/2026/11");
+        std::fs::create_dir_all(&directory).unwrap();
+        let cases = [
+            ("one.md", "---json\n{\"id\":1}\n---\nbody"),
+            ("duplicate.md", "---json\r\n{\"id\":1}\r\n---\r\nbody"),
+            ("two.md", "preamble\n---json\n{\"id\":2}\n---"),
+            ("zero.md", "---json\n{\"id\":0}\n---\nbody"),
+            ("negative.md", "---json\n{\"id\":-1}\n---\nbody"),
+            ("missing_id.md", "---json\n{}\n---\nbody"),
+            ("bad_json.md", "---json\nnot json\n---\nbody"),
+            ("missing_header.md", "plain text"),
+            ("incomplete.md", "---json\n{\"id\":99}\n"),
+        ];
+        for (name, content) in cases {
+            let path = directory.join(name);
+            std::fs::write(&path, content).unwrap();
+            let legacy = extract_json_frontmatter(content).map(|metadata| {
+                serde_json::from_str::<serde_json::Value>(metadata).map(|value| {
+                    value
+                        .get("id")
+                        .and_then(serde_json::Value::as_i64)
+                        .filter(|id| *id > 0)
+                })
+            });
+            match legacy {
+                Some(Ok(id)) => assert_eq!(scan_archive_message_id(&path).unwrap(), id),
+                Some(Err(_)) => assert!(scan_archive_message_id(&path).is_err()),
+                None => assert_eq!(scan_archive_message_id(&path).unwrap(), None),
+            }
+        }
+        let inventory = scan_archive_message_inventory(root);
+        assert_eq!(inventory.projects, 1);
+        assert_eq!(inventory.canonical_message_files, cases.len());
+        assert_eq!(inventory.unique_message_ids, 2);
+        assert_eq!(inventory.duplicate_canonical_message_files, 1);
+        assert_eq!(inventory.duplicate_canonical_message_ids, 1);
+        assert_eq!(inventory.latest_message_id, Some(2));
+        assert_eq!(inventory.parse_errors, 1);
+        let (ids, parse_errors) = scan_archive_message_ids(root);
+        assert_eq!(ids, BTreeSet::from([1, 2]));
+        assert_eq!(parse_errors, 1);
+    }
+
+    #[test]
+    fn archive_frontmatter_prefix_preserves_artifact_cap_and_bounds_missing_markers() {
+        use std::io::Read as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("oversized.md");
+        std::fs::write(&path, "---json\n{\"id\":42}\n---\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_ARCHIVE_ARTIFACT_BYTES + 1)
+            .unwrap();
+        assert_eq!(
+            read_archive_frontmatter_capped(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData,
+        );
+        assert!(scan_archive_message_id(&path).is_err());
+
+        let never_closes = b"---json\n".as_slice().chain(std::io::repeat(b'x'));
+        assert_eq!(
+            read_archive_frontmatter_prefix(never_closes)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_frontmatter_prefix_refuses_symlink_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.md");
+        let alias = tmp.path().join("alias.md");
+        std::fs::write(&source, "---json\n{\"id\":42}\n---\nbody").unwrap();
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        assert_eq!(scan_archive_message_id(&source).unwrap(), Some(42));
+        assert!(scan_archive_message_id(&alias).is_err());
     }
 
     #[test]

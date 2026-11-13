@@ -79,6 +79,8 @@ pub mod backup_rotation;
 mod cleanup;
 pub mod console;
 mod disk_monitor;
+#[cfg(unix)]
+mod headless_signals;
 mod http_sessions;
 mod integrity_guard;
 mod mail_ui;
@@ -194,7 +196,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -581,19 +583,13 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..idx]
 }
 
-/// Build a masked preview string (max 200 chars) from tool result contents.
+/// Build a masked preview string (max 200 bytes) from tool result contents.
 fn result_preview_from_contents(contents: &[Content]) -> Option<String> {
     let Content::Text { text: raw } = contents.first()? else {
         return None;
     };
-    let preview = truncate_utf8(raw, 200);
-    // Mask if it looks like JSON
-    Some(
-        serde_json::from_str::<serde_json::Value>(preview).map_or_else(
-            |_| preview.replace('\n', "\\n").replace('\r', "\\r"),
-            |v| console::mask_json(&v).to_string(),
-        ),
-    )
+    let masked = console::mask_result_preview(raw);
+    Some(truncate_utf8(&masked.replace('\n', "\\n").replace('\r', "\\r"), 200).to_owned())
 }
 
 /// Build a preview string (max 200 chars, masked) from a sync tool result.
@@ -662,8 +658,15 @@ fn add_tool<T: fastmcp::ToolHandler + 'static>(
 }
 
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Server {
+    build_server_with_startup_workers(config, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_server_with_startup_workers(
+    config: &mcp_agent_mail_core::Config,
+    startup_workers: Option<Arc<StartupWorkers>>,
+) -> fastmcp_server::Server {
     // Wire the config flag into the global atomic gate.
     mcp_agent_mail_core::set_shedding_enabled(config.backpressure_shedding_enabled);
 
@@ -674,6 +677,9 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
     // builder deliberately stays on the underlying dual-era server.
     let server = fastmcp_server::Server::new("mcp-agent-mail", env!("CARGO_PKG_VERSION"))
         .on_shutdown(move || {
+            if let Some(workers) = &startup_workers {
+                workers.shutdown();
+            }
             shutdown_runtime_services(&shutdown_config);
         });
 
@@ -1028,9 +1034,16 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> fastmcp_server::Ser
 
 fn shutdown_runtime_services(config: &mcp_agent_mail_core::Config) {
     tracing::info!("server transport exited; performing graceful shutdown of background services");
+    // Let independent sleepers stop while earlier services drain. Keep every
+    // join and the mailbox flushes below, in their existing ownership order.
+    integrity_guard::request_shutdown();
+    disk_monitor::request_shutdown();
+    maintenance::request_shutdown();
+    retention::request_shutdown();
     stop_atc_operator_runtime();
     integrity_guard::shutdown();
     disk_monitor::shutdown();
+    retention::shutdown();
     maintenance::shutdown();
     mcp_agent_mail_storage::wbq_shutdown();
     mcp_agent_mail_storage::flush_async_commits();
@@ -1076,32 +1089,196 @@ fn cleanup_shutdown_sqlite_sidecars_with_resolver<F>(
     }
 }
 
-static STARTUP_SEARCH_BACKFILL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+/// Startup work belongs to the server whose mailbox authority admitted it.
+/// A listener-bind deadline only stops waiting for readiness; it never releases
+/// ownership of the readiness worker. The scope is declared after the mailbox
+/// locks, so cancellation, errors and unwinding join it before those locks drop.
+#[derive(Default)]
+struct StartupWorkerScope {
+    workers: Arc<StartupWorkers>,
+}
+
+impl Drop for StartupWorkerScope {
+    fn drop(&mut self) {
+        self.workers.shutdown();
+    }
+}
+
+#[derive(Default)]
+struct StartupWorkers {
+    state: Mutex<StartupWorkersState>,
+    joined: Condvar,
+}
+
+#[derive(Default)]
+struct StartupWorkersState {
+    stopping: bool,
+    joining: bool,
+    workers: Vec<(Arc<StartupWorkerControl>, JoinHandle<()>)>,
+}
+
+/// The delay and native pool acquisition share the worker's stop request.
+/// Synchronous filesystem/engine operations already in progress are joined;
+/// the stop flag is checked between operations, never treated as permission
+/// to detach a thread that can still access the mailbox.
+#[derive(Default)]
+struct StartupWorkerControl {
+    stopped: AtomicBool,
+    wait: Mutex<()>,
+    wake: Condvar,
+    native_context: Mutex<Option<Cx>>,
+}
+
+struct StartupWorkerContextGuard<'a>(&'a StartupWorkerControl);
+
+impl Drop for StartupWorkerContextGuard<'_> {
+    fn drop(&mut self) {
+        *lock_mutex(&self.0.native_context) = None;
+    }
+}
+
+impl StartupWorkerControl {
+    fn request_shutdown(&self) {
+        {
+            let _wait = lock_mutex(&self.wait);
+            self.stopped.store(true, Ordering::Release);
+            self.wake.notify_all();
+        }
+        let context = lock_mutex(&self.native_context).clone();
+        if let Some(cx) = context {
+            cx.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("server startup shutdown"),
+            );
+        }
+    }
+
+    fn checkpoint(&self) -> Result<(), String> {
+        if self.stopped.load(Ordering::Acquire) {
+            Err("startup worker cancelled".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn wait_for_delay(&self, delay: Duration) -> bool {
+        let guard = lock_mutex(&self.wait);
+        let _wait = self
+            .wake
+            .wait_timeout_while(guard, delay, |_| !self.stopped.load(Ordering::Acquire))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !self.stopped.load(Ordering::Acquire)
+    }
+
+    fn bind_native_context(&self, cx: &Cx) -> Result<StartupWorkerContextGuard<'_>, String> {
+        let mut context = lock_mutex(&self.native_context);
+        if self.stopped.load(Ordering::Acquire) {
+            drop(context);
+            cx.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("server startup shutdown"),
+            );
+            return Err("startup worker cancelled".into());
+        }
+        *context = Some(cx.clone());
+        Ok(StartupWorkerContextGuard(self))
+    }
+}
+
+impl StartupWorkers {
+    fn spawn(
+        &self,
+        name: &'static str,
+        work: impl FnOnce(Arc<StartupWorkerControl>) + Send + 'static,
+    ) -> std::io::Result<()> {
+        // Registration and shutdown admission are atomic. No successful spawn
+        // can be lost between creating its thread and retaining its handle.
+        let mut state = lock_mutex(&self.state);
+        if state.stopping {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "server startup workers are stopping",
+            ));
+        }
+        let control = Arc::new(StartupWorkerControl::default());
+        let worker_control = Arc::clone(&control);
+        let handle = std::thread::Builder::new()
+            .name(name.into())
+            .stack_size(mcp_agent_mail_core::worker_stack_size())
+            .spawn(move || work(worker_control))?;
+        state.workers.push((control, handle));
+        Ok(())
+    }
+
+    fn request_shutdown(&self) {
+        let controls: Vec<_> = {
+            let mut state = lock_mutex(&self.state);
+            state.stopping = true;
+            state
+                .workers
+                .iter()
+                .map(|(control, _)| Arc::clone(control))
+                .collect()
+        };
+        for control in controls {
+            control.request_shutdown();
+        }
+    }
+
+    fn shutdown(&self) {
+        self.request_shutdown();
+        let workers = {
+            let mut state = lock_mutex(&self.state);
+            while state.joining {
+                state = self
+                    .joined
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            state.joining = true;
+            std::mem::take(&mut state.workers)
+        };
+        // Only lifecycle owners call shutdown, never the workers themselves.
+        // Do not hold the manager lock during a join: a TUI starter may still
+        // be registering work, which must receive the stopping refusal.
+        for (_, worker) in workers {
+            if worker.join().is_err() {
+                tracing::warn!("startup worker panicked during server shutdown");
+            }
+        }
+        let mut state = lock_mutex(&self.state);
+        state.joining = false;
+        self.joined.notify_all();
+    }
+}
+
+static STARTUP_SEARCH_MAINTENANCE_RUNNING: AtomicBool = AtomicBool::new(false);
+static STARTUP_SEARCH_REFRESH_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct StartupSearchRefreshGuard;
+
+impl StartupSearchRefreshGuard {
+    fn begin() -> Self {
+        // Only the single admitted maintenance worker owns refresh work.
+        STARTUP_SEARCH_REFRESH_ACTIVE.store(true, Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for StartupSearchRefreshGuard {
+    fn drop(&mut self) {
+        STARTUP_SEARCH_REFRESH_ACTIVE.store(false, Ordering::Release);
+    }
+}
 const DEFAULT_STARTUP_SEARCH_BACKFILL_DELAY_SECS: u64 = 8;
+const SEARCH_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
+const SEARCH_MAINTENANCE_MAX_RETRY: Duration = Duration::from_secs(60);
 
 struct StartupSearchBackfillResetGuard;
 
 impl Drop for StartupSearchBackfillResetGuard {
     fn drop(&mut self) {
-        STARTUP_SEARCH_BACKFILL_IN_PROGRESS.store(false, Ordering::SeqCst);
-    }
-}
-
-fn record_startup_search_backfill_completion(config: &mcp_agent_mail_core::Config) {
-    // GH#261 / GH#296: completion is recorded under the database's own
-    // Search V3 identity (`<path>@<db_identity generation>`), which the
-    // request handlers' pools derive identically whatever pool cache
-    // generation they carry. The earlier attempt to "resolve the live pool"
-    // here minted a throwaway file-backed pool with its own generation, so
-    // the recorded key never matched the handlers' and the daemon reported
-    // its only database as foreign whenever this thread won the boot race.
-    if let Err(error) = mcp_agent_mail_db::search_service::note_startup_lexical_backfill_completed(
-        &config.database_url,
-    ) {
-        tracing::warn!(
-            error = %error,
-            "[startup-search] failed to record lexical bootstrap completion"
-        );
+        STARTUP_SEARCH_MAINTENANCE_RUNNING.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1111,45 +1288,49 @@ fn startup_search_backfill_spawn_failure_message(error: &std::io::Error) -> Stri
     )
 }
 
-fn run_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
-    let backfill_database_url =
-        normalized_startup_search_backfill_database_url(&config.database_url);
-    match mcp_agent_mail_db::search_v3::backfill_from_db(&backfill_database_url) {
-        Ok((indexed, _skipped)) if indexed > 0 => {
-            record_startup_search_backfill_completion(config);
-            tracing::info!(
-                indexed,
-                "[startup-search] backfilled messages into Tantivy index"
+fn run_startup_search_backfill(
+    config: &mcp_agent_mail_core::Config,
+    pool: &mcp_agent_mail_db::DbPool,
+    control: &StartupWorkerControl,
+) -> bool {
+    if control.checkpoint().is_err() {
+        return false;
+    }
+    let _active_refresh = StartupSearchRefreshGuard::begin();
+    if let Err(error) =
+        mcp_agent_mail_db::search_service::refresh_lexical_index_cancellable(pool, &control.stopped)
+    {
+        if control.checkpoint().is_ok() {
+            tracing::warn!(%error, "owned lexical refresh failed; retrying with backoff");
+            let _ = recover_startup_search_backfill_db(config, &error.to_string());
+        }
+        return false;
+    }
+
+    // Certify coverage using the same serving pool after publication. Bind the
+    // native waiter to the existing startup cancellation owner.
+    let cx = runtime_request_cx(Budget::new().with_timeout(wall_now(), Duration::from_secs(2)));
+    let Ok(_context_guard) = control.bind_native_context(&cx) else {
+        return false;
+    };
+    let observed = block_on(async {
+        timeout(
+            wall_now(),
+            Duration::from_secs(2),
+            mcp_agent_mail_db::search_service::probe_lexical_readiness(&cx, pool),
+        )
+        .await
+    });
+    match observed {
+        Ok(asupersync::Outcome::Ok(state)) if state.available => {
+            tracing::debug!(
+                fresh = state.verified,
+                catch_up_required = state.catch_up_required,
+                "owned lexical refresh completed"
             );
+            true
         }
-        Ok(_) => {
-            record_startup_search_backfill_completion(config);
-        } // nothing to backfill or already up-to-date
-        Err(err) => {
-            tracing::warn!("[startup-search] Tantivy backfill failed (non-fatal): {err}");
-            if recover_startup_search_backfill_db(config, &err) {
-                match mcp_agent_mail_db::search_v3::backfill_from_db(&backfill_database_url) {
-                    Ok((indexed, _)) if indexed > 0 => {
-                        record_startup_search_backfill_completion(config);
-                        tracing::warn!(
-                            indexed,
-                            "[startup-search] backfill succeeded after sqlite auto-recovery"
-                        );
-                    }
-                    Ok(_) => {
-                        record_startup_search_backfill_completion(config);
-                        tracing::warn!(
-                            "[startup-search] backfill completed after sqlite auto-recovery"
-                        );
-                    }
-                    Err(retry_err) => {
-                        tracing::warn!(
-                            "[startup-search] backfill retry failed after sqlite auto-recovery: {retry_err}"
-                        );
-                    }
-                }
-            }
-        }
+        _ => false,
     }
 }
 
@@ -1161,30 +1342,104 @@ fn startup_search_backfill_delay_secs() -> u64 {
     )
 }
 
-fn spawn_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
-    if STARTUP_SEARCH_BACKFILL_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+fn spawn_startup_search_backfill(config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
+    spawn_startup_search_backfill_after(
+        config,
+        workers,
+        Duration::from_secs(startup_search_backfill_delay_secs()),
+    );
+}
+
+fn spawn_startup_search_backfill_after(
+    config: &mcp_agent_mail_core::Config,
+    workers: &StartupWorkers,
+    delay: Duration,
+) {
+    if STARTUP_SEARCH_MAINTENANCE_RUNNING.swap(true, Ordering::AcqRel) {
         return;
     }
-
-    let thread_config = config.clone();
-    let spawn = std::thread::Builder::new()
-        .name("am-search-backfill".to_string())
-        .stack_size(mcp_agent_mail_core::worker_stack_size())
-        .spawn(move || {
-            let _reset_guard = StartupSearchBackfillResetGuard;
-            let delay_secs = startup_search_backfill_delay_secs();
-            if delay_secs > 0 {
-                tracing::info!(
-                    delay_secs,
-                    "[startup-search] delaying backfill to prioritize startup responsiveness"
-                );
-                std::thread::sleep(Duration::from_secs(delay_secs));
+    // Capturing the guard resets admission if configuration, pool creation,
+    // or worker spawning fails before the closure can run.
+    let reset_guard = StartupSearchBackfillResetGuard;
+    let thread_config = match resolve_serving_config(config) {
+        Ok(config) => config,
+        Err(reason) => {
+            tracing::warn!(
+                reason,
+                "lexical maintenance refused mismatched serving configuration"
+            );
+            return;
+        }
+    };
+    let pool_config = DbPoolConfig::from_config(&thread_config);
+    let pool = match create_pool(&pool_config) {
+        Ok(pool) => pool,
+        Err(error) => {
+            tracing::warn!(%error, "lexical maintenance could not retain the serving pool");
+            return;
+        }
+    };
+    let spawn = workers.spawn("am-search-backfill", move |control| {
+        let _reset_guard = reset_guard;
+        if !delay.is_zero() {
+            tracing::info!(
+                delay_secs = delay.as_secs(),
+                "[startup-search] delaying backfill to prioritize startup responsiveness"
+            );
+            if !control.wait_for_delay(delay) {
+                return;
             }
-            run_startup_search_backfill(&thread_config);
-        });
+        }
+        let mut pool = pool;
+        let mut retry_delay = SEARCH_MAINTENANCE_INTERVAL;
+        loop {
+            if control.checkpoint().is_err() {
+                return;
+            }
+            if !pool.is_initialized() {
+                // Recovery retires the old generation. Adopt only an actual
+                // initialized serving generation; this loop never initializes
+                // a new mailbox or repeats migrations.
+                if let Some(current) = mcp_agent_mail_db::get_cached_pool(&pool_config)
+                    .filter(mcp_agent_mail_db::DbPool::is_initialized)
+                {
+                    pool = current;
+                } else {
+                    if !control.wait_for_delay(SEARCH_MAINTENANCE_INTERVAL) {
+                        return;
+                    }
+                    continue;
+                }
+            }
+            // Readiness/search observations invalidate this proof when the
+            // source changes. The idle loop performs no database query,
+            // archive inventory, or full index scan.
+            let state = mcp_agent_mail_db::search_service::lexical_readiness(&pool);
+            if !state.compiled {
+                return;
+            }
+            let delay = if (state.available && !state.catch_up_required)
+                || run_startup_search_backfill(&thread_config, &pool, &control)
+            {
+                retry_delay = SEARCH_MAINTENANCE_INTERVAL;
+                SEARCH_MAINTENANCE_INTERVAL
+            } else {
+                let delay = retry_delay;
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(SEARCH_MAINTENANCE_MAX_RETRY);
+                delay
+            };
+            // Condvar-backed wait: stop wakes both idle and retry backoff.
+            // StartupWorkers retains and joins this same worker before the
+            // server releases its mailbox activity lease.
+            if !control.wait_for_delay(delay) {
+                return;
+            }
+        }
+    });
 
     if let Err(err) = spawn {
-        STARTUP_SEARCH_BACKFILL_IN_PROGRESS.store(false, Ordering::Release);
         tracing::warn!(
             error = %err,
             "{}",
@@ -1193,14 +1448,75 @@ fn spawn_startup_search_backfill(config: &mcp_agent_mail_core::Config) {
     }
 }
 
-fn init_search_bridge(config: &mcp_agent_mail_core::Config) {
-    // Only initialize when lexical-capable modes are active.
-    // This avoids creating the index directory when lexical retrieval is disabled.
-    let rollout = &config.search_rollout;
-    let uses_v3 = rollout.engine.uses_lexical()
-        || rollout.surface_overrides.values().any(|e| e.uses_lexical());
+/// MCP tools and mail UI select their pool from the process configuration.
+/// An embedded server's pool-size fields do not currently change that request
+/// path. Observe the actual shape, but never initialize a different mailbox
+/// when its database/archive authority disagrees with the bound server.
+fn resolve_serving_config(
+    server: &mcp_agent_mail_core::Config,
+) -> Result<mcp_agent_mail_core::Config, &'static str> {
+    let actual = mcp_agent_mail_core::Config::from_env();
+    actual
+        .validate_user_env_authority()
+        .map_err(|_| "serving_configuration_invalid")?;
+    if actual.database_url != server.database_url {
+        let expected = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&server.database_url);
+        let selected = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&actual.database_url);
+        if !matches!(
+            (expected, selected),
+            (Ok(expected), Ok(selected)) if expected.canonical_path == selected.canonical_path
+        ) {
+            return Err("database_configuration_mismatch");
+        }
+    }
+    if actual.storage_root != server.storage_root {
+        let expected = std::fs::canonicalize(&server.storage_root);
+        let selected = std::fs::canonicalize(&actual.storage_root);
+        if !matches!(
+            (expected, selected),
+            (Ok(expected), Ok(selected)) if expected == selected
+        ) {
+            return Err("storage_configuration_mismatch");
+        }
+    }
+    Ok(actual)
+}
 
-    if !uses_v3 && !rollout.should_shadow() {
+fn serving_search_uses_lexical(config: &mcp_agent_mail_core::Config) -> bool {
+    use mcp_agent_mail_core::config::SearchEngine;
+    let rollout = &config.search_rollout;
+    // Actual deprecated Legacy/Shadow enum modes execute their ordinary SQL
+    // plan before lexical bootstrap. The "legacy"/"fts"/"sqlite" strings now
+    // parse as Lexical, so they do not invent a missing Tantivy fallback.
+    // Explicit lexical-only features still report their normal tool errors.
+    let requires_index = |engine| {
+        matches!(
+            rollout.allowed_engine(engine),
+            SearchEngine::Lexical | SearchEngine::Hybrid | SearchEngine::Auto
+        )
+    };
+    requires_index(rollout.engine)
+        || rollout
+            .surface_overrides
+            .values()
+            .any(|engine| requires_index(*engine))
+}
+
+fn init_search_bridge(config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
+    let config = match resolve_serving_config(config) {
+        Ok(config) => config,
+        Err(reason) => {
+            tracing::warn!(
+                reason,
+                "search startup refused mismatched serving configuration"
+            );
+            return;
+        }
+    };
+    // Include lexical fallback selected by the semantic kill switch.
+    let uses_v3 = serving_search_uses_lexical(&config);
+
+    if !uses_v3 && !config.search_rollout.should_shadow() {
         return;
     }
 
@@ -1220,9 +1536,9 @@ fn init_search_bridge(config: &mcp_agent_mail_core::Config) {
                 return;
             }
             // Backfill on a dedicated worker to keep first-render startup latency low.
-            // Search tool semantics remain robust: this is idempotent and retries with
-            // auto-recovery on recoverable sqlite failures.
-            spawn_startup_search_backfill(config);
+            // Backfill is idempotent; failures leave search to its lazy path.
+            // Database recovery remains an explicit, supervised doctor operation.
+            spawn_startup_search_backfill(&config, workers);
         }
         Err(err) => {
             tracing::warn!(
@@ -1233,6 +1549,7 @@ fn init_search_bridge(config: &mcp_agent_mail_core::Config) {
     }
 }
 
+#[cfg(test)]
 fn normalized_startup_search_backfill_database_url(database_url: &str) -> String {
     if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
         return database_url.to_string();
@@ -1272,8 +1589,15 @@ fn recover_startup_search_backfill_db(config: &mcp_agent_mail_core::Config, erro
     false
 }
 
-fn heal_storage_lock_artifacts(config: &mcp_agent_mail_core::Config) {
-    match mcp_agent_mail_storage::heal_archive_locks(config) {
+fn heal_storage_lock_artifacts(
+    config: &mcp_agent_mail_core::Config,
+    control: Option<&StartupWorkerControl>,
+) {
+    let result = control.map_or_else(
+        || mcp_agent_mail_storage::heal_archive_locks(config),
+        |control| mcp_agent_mail_storage::heal_archive_locks_cancellable(config, &control.stopped),
+    );
+    match result {
         Ok(report) => {
             if !report.locks_quarantined.is_empty() || !report.metadata_quarantined.is_empty() {
                 tracing::info!(
@@ -1289,20 +1613,45 @@ fn heal_storage_lock_artifacts(config: &mcp_agent_mail_core::Config) {
                 );
             }
         }
+        Err(mcp_agent_mail_storage::StorageError::Io(error))
+            if error.kind() == std::io::ErrorKind::Interrupted =>
+        {
+            tracing::debug!("[startup-heal] lock scan interrupted by shutdown");
+        }
         Err(err) => {
             tracing::warn!("[startup-heal] lock scan failed: {err}");
         }
     }
 }
 
-fn start_advisory_consistency_probe(config: &mcp_agent_mail_core::Config) {
+fn start_storage_lock_healing(config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
     let config = config.clone();
-    let _ = std::thread::Builder::new()
-        .name("startup-consistency-probe".into())
-        .stack_size(mcp_agent_mail_core::worker_stack_size())
-        .spawn(move || {
-            startup_checks::run_consistency_probe_advisory(&config);
-        });
+    if let Err(error) = workers.spawn("startup-heal", move |control| {
+        if control.checkpoint().is_ok() {
+            heal_storage_lock_artifacts(&config, Some(&control));
+        }
+    }) {
+        tracing::warn!(%error, "could not start archive lock healing worker");
+    }
+}
+
+fn start_advisory_consistency_probe(
+    config: &mcp_agent_mail_core::Config,
+    workers: &StartupWorkers,
+) {
+    let config = config.clone();
+    if let Err(error) = workers.spawn("startup-consistency-probe", move |control| {
+        if control.checkpoint().is_ok() {
+            if let Err(error) = startup_checks::run_consistency_probe_advisory_cancellable(
+                &config,
+                &control.stopped,
+            ) {
+                tracing::debug!(%error, "startup consistency probe interrupted");
+            }
+        }
+    }) {
+        tracing::warn!(%error, "could not start advisory archive consistency probe");
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1852,19 +2201,14 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
     // otherwise race its schema migrations. Retain the pool for the session so
     // tool calls can reuse its initialized connections through the weak cache.
     let _runtime_database_pool = initialize_stdio_database(cx, config).await?;
+    let startup_scope = StartupWorkerScope::default();
 
     // Enable global query tracker if instrumentation is on.
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
 
-    let heal_config = config.clone();
-    let _ = std::thread::Builder::new()
-        .name("startup-heal".into())
-        .stack_size(mcp_agent_mail_core::worker_stack_size())
-        .spawn(move || {
-            heal_storage_lock_artifacts(&heal_config);
-        });
+    start_storage_lock_healing(config, &startup_scope.workers);
 
     integrity_guard::start(config);
     disk_monitor::start(config);
@@ -1883,7 +2227,7 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
     start_atc_operator_runtime(config);
 
     // Start background backfill for Search V3 if enabled.
-    spawn_startup_search_backfill(config);
+    spawn_startup_search_backfill(config, &startup_scope.workers);
 
     log_active_database(config);
 
@@ -1900,7 +2244,9 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
     }
 
     tracing::info!("MCP Agent Mail server (stdio) starting transport loop");
-    build_server(config).run_stdio_with_cx(cx).await;
+    build_server_with_startup_workers(config, Some(Arc::clone(&startup_scope.workers)))
+        .run_stdio_with_cx(cx)
+        .await;
 
     // run_stdio() returns `!` so the lines below are unreachable today.
     // They are kept as documentation of the intended graceful-shutdown
@@ -1908,6 +2254,7 @@ pub async fn run_stdio(cx: &Cx, config: &mcp_agent_mail_core::Config) -> std::io
     #[allow(unreachable_code)]
     {
         tracing::info!("stdio loop exited; performing graceful shutdown of background services");
+        startup_scope.workers.shutdown();
         stop_atc_operator_runtime();
         integrity_guard::shutdown();
         disk_monitor::shutdown();
@@ -2526,7 +2873,50 @@ pub fn sd_notify(state: &str) {
 pub fn sd_notify(_state: &str) {}
 
 fn sd_notify_ready() {
-    sd_notify("READY=1");
+    sd_notify("READY=1\nSTATUS=Mailbox admission ready");
+}
+
+// The installed Type=notify unit permits 300s, while a large cold mailbox
+// can legitimately take longer. Once the listener starts, extend only while
+// owned initialization is active, for at most 30 minutes. Failures never
+// become READY, and the operator's systemd timeout resumes after this grace.
+const MAIL_STARTUP_NOTIFY_GRACE: Duration = Duration::from_secs(30 * 60);
+const MAIL_STARTUP_NOTIFY_EXTENSION: Duration = Duration::from_secs(15);
+static STARTUP_DATABASE_INITIALIZERS: AtomicU64 = AtomicU64::new(0);
+
+struct StartupDatabaseInitialization;
+
+impl StartupDatabaseInitialization {
+    fn begin() -> Self {
+        STARTUP_DATABASE_INITIALIZERS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for StartupDatabaseInitialization {
+    fn drop(&mut self) {
+        STARTUP_DATABASE_INITIALIZERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn startup_readiness_notify_payload(
+    reason: &str,
+    elapsed: Duration,
+    owned_initialization: bool,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut payload = format!("STATUS=Waiting for mailbox admission: {reason}");
+    if owned_initialization && elapsed < MAIL_STARTUP_NOTIFY_GRACE {
+        let extension = MAIL_STARTUP_NOTIFY_GRACE
+            .saturating_sub(elapsed)
+            .min(MAIL_STARTUP_NOTIFY_EXTENSION)
+            .as_micros();
+        if extension > 0 {
+            let _ = write!(payload, "\nEXTEND_TIMEOUT_USEC={extension}");
+        }
+    }
+    payload
 }
 
 fn build_http_runtime() -> std::io::Result<Runtime> {
@@ -2574,6 +2964,9 @@ fn run_http_headless_supervisor(
     // run_http_with_control retain their caller-supplied shutdown authority.
     #[cfg(any(unix, windows))]
     let (signal_control, control_rx) = if control_rx.is_none() {
+        #[cfg(unix)]
+        let signals = headless_signals::ShutdownSignals::new()?;
+        #[cfg(windows)]
         let signals = [
             asupersync::signal::sigterm()?,
             asupersync::signal::sigint()?,
@@ -2595,8 +2988,8 @@ fn run_http_headless_supervisor(
     // Serving has no deadline. Once signalled, request the normal supervisor
     // drain and use the same bounded join budget as the TUI shutdown path.
     #[cfg(any(unix, windows))]
-    let result = if let Some((tx, mut signals)) = signal_control {
-        recv_http_supervisor_result_signalled(&result_rx, &tx, &mut signals)
+    let result = if let Some((tx, signals)) = signal_control {
+        recv_http_supervisor_result_signalled(&result_rx, &tx, signals)
     } else {
         recv_http_supervisor_result(result_rx)
     };
@@ -2746,8 +3139,9 @@ fn ensure_boot_archive_preflight_pass(
     config: &mcp_agent_mail_core::Config,
 ) -> std::io::Result<mcp_agent_mail_storage::boot_check::BootCheckReport> {
     let mode = boot_check_mode_from_config(config);
-    let report =
-        mcp_agent_mail_storage::boot_check::preflight_archive_integrity(&config.storage_root, mode);
+    let report = startup_checks::timed_startup_phase("archive-preflight", || {
+        mcp_agent_mail_storage::boot_check::preflight_archive_integrity(&config.storage_root, mode)
+    });
     record_boot_archive_preflight_report(&report);
     if !report.should_abort() {
         return Ok(report);
@@ -3735,15 +4129,19 @@ impl TuiDeferredWorkerProgress {
         }
     }
 
-    fn start_db_if_needed(&self, config: &mcp_agent_mail_core::Config) {
+    fn start_db_if_needed(&self, config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
         if self.claim_db_start() {
-            start_tui_db_background_workers(config);
+            start_tui_db_background_workers(config, workers);
         }
     }
 
-    fn start_advisory_if_needed(&self, config: &mcp_agent_mail_core::Config) {
+    fn start_advisory_if_needed(
+        &self,
+        config: &mcp_agent_mail_core::Config,
+        workers: &StartupWorkers,
+    ) {
         if self.claim_advisory_start() {
-            start_advisory_consistency_probe(config);
+            start_advisory_consistency_probe(config, workers);
         }
     }
 }
@@ -3751,6 +4149,7 @@ impl TuiDeferredWorkerProgress {
 struct TuiDeferredWorkerHandle {
     join: Option<std::thread::JoinHandle<()>>,
     progress: Arc<TuiDeferredWorkerProgress>,
+    tui_state: Arc<tui_bridge::TuiSharedState>,
 }
 
 impl TuiDeferredWorkerHandle {
@@ -3761,12 +4160,24 @@ impl TuiDeferredWorkerHandle {
     }
 }
 
+impl Drop for TuiDeferredWorkerHandle {
+    fn drop(&mut self) {
+        if self.join.is_some() {
+            // Errors and unwinding must stop the starter before the startup
+            // scope joins its workers or releases mailbox authority. Explicit
+            // joins during headless detach leave this guard inert.
+            self.tui_state.request_shutdown();
+            self.join();
+        }
+    }
+}
+
 fn start_tui_non_db_background_workers(config: &mcp_agent_mail_core::Config) {
     disk_monitor::start(config);
 }
 
-fn start_tui_db_background_workers(config: &mcp_agent_mail_core::Config) {
-    init_search_bridge(config);
+fn start_tui_db_background_workers(config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
+    init_search_bridge(config, workers);
     cleanup::start(config);
     ack_ttl::start(config);
     tool_metrics::start(config);
@@ -3863,12 +4274,14 @@ fn handle_tui_deferred_background_worker_spawn_failure(
 fn spawn_tui_deferred_background_workers(
     config: &mcp_agent_mail_core::Config,
     tui_state: &Arc<tui_bridge::TuiSharedState>,
+    workers: &Arc<StartupWorkers>,
 ) -> TuiDeferredWorkerHandle {
     let worker_config = config.clone();
     let inline_tui_state = Arc::clone(tui_state);
     let worker_tui_state = Arc::clone(&inline_tui_state);
     let progress = Arc::new(TuiDeferredWorkerProgress::default());
     let worker_progress = Arc::clone(&progress);
+    let workers = Arc::clone(workers);
     match std::thread::Builder::new()
         .name("tui-deferred-workers".into())
         .stack_size(mcp_agent_mail_core::worker_stack_size())
@@ -3880,15 +4293,16 @@ fn spawn_tui_deferred_background_workers(
             if !wait_for_tui_db_readiness(&worker_tui_state) {
                 return;
             }
-            worker_progress.start_db_if_needed(&worker_config);
+            worker_progress.start_db_if_needed(&worker_config, &workers);
             if sleep_with_tui_shutdown(&worker_tui_state, TUI_ADVISORY_CONSISTENCY_IDLE_GRACE) {
                 return;
             }
-            worker_progress.start_advisory_if_needed(&worker_config);
+            worker_progress.start_advisory_if_needed(&worker_config, &workers);
         }) {
         Ok(handle) => TuiDeferredWorkerHandle {
             join: Some(handle),
             progress,
+            tui_state: Arc::clone(&inline_tui_state),
         },
         Err(error) => {
             handle_tui_deferred_background_worker_spawn_failure(
@@ -3899,6 +4313,7 @@ fn spawn_tui_deferred_background_workers(
             TuiDeferredWorkerHandle {
                 join: None,
                 progress,
+                tui_state: Arc::clone(&inline_tui_state),
             }
         }
     }
@@ -3907,17 +4322,17 @@ fn spawn_tui_deferred_background_workers(
 fn spawn_tui_readiness_warmup(
     config: &mcp_agent_mail_core::Config,
     tui_state: &Arc<tui_bridge::TuiSharedState>,
+    workers: &StartupWorkers,
 ) {
     let config = config.clone();
     let tui_state = Arc::clone(tui_state);
     let failure_tui_state = Arc::clone(&tui_state);
-    if let Err(error) = std::thread::Builder::new()
-        .name("tui-readiness-warmup".into())
-        .stack_size(mcp_agent_mail_core::worker_stack_size())
-        .spawn(move || {
-            handle_tui_readiness_warmup_result(Some(&tui_state), readiness_check(&config));
-        })
-    {
+    if let Err(error) = workers.spawn("tui-readiness-warmup", move |control| {
+        let result = readiness_check_with_startup_control(&config, &control);
+        if control.checkpoint().is_ok() {
+            handle_tui_readiness_warmup_result(Some(&tui_state), result);
+        }
+    }) {
         handle_tui_readiness_warmup_result(
             Some(&failure_tui_state),
             Err(format!("spawn failed: {error}")),
@@ -3963,24 +4378,32 @@ fn parse_startup_readiness_bind_deadline_secs(raw: Option<&str>) -> u64 {
 ///   * the listener binds within `startup_readiness_bind_deadline()` regardless,
 ///     so `/healthz` (liveness, DB-independent) is always reachable and the
 ///     installer's probe succeeds;
-///   * `/health` honestly reports `warming_up` / `service unavailable` (503)
+///   * `/health` reports unavailable capabilities (503) until admission succeeds
 ///     until the DB settles, then `ready` (200);
 ///   * if the warmup is still running at the deadline it is left to finish in
-///     the background — never joined — and recovery/diagnosis stay available via
-///     `am doctor`.
+///     the background, still owned and joined by the server's shutdown scope.
+///     Recovery/diagnosis stay available via `am doctor`.
 ///
 /// No data is mutated beyond what `readiness_check` already does; this is the
 /// "bind-degraded + report" contract, not aggressive auto-remediation.
-fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config) {
+fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config, workers: &StartupWorkers) {
+    run_startup_readiness_with_bind_deadline(config, workers, startup_readiness_bind_deadline());
+}
+
+fn run_startup_readiness_with_bind_deadline(
+    config: &mcp_agent_mail_core::Config,
+    workers: &StartupWorkers,
+    bind_deadline: Duration,
+) {
     let cfg = config.clone();
     let (tx, rx) = std::sync::mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name("am-db-readiness".to_string())
-        .stack_size(mcp_agent_mail_core::worker_stack_size())
-        .spawn(move || {
-            let _ = tx.send(readiness_check(&cfg));
-        });
+    let spawned = workers.spawn("am-db-readiness", move |control| {
+        let _ = tx.send(readiness_check_with_startup_control(&cfg, &control));
+    });
     if let Err(error) = spawned {
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            return;
+        }
         // Could not even spawn the warmup thread; fall back to an inline
         // (blocking) readiness so we never silently skip migrations. This path
         // is the pre-br-5mnkl behavior and only triggers under thread
@@ -3991,7 +4414,7 @@ fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config) {
         }
         return;
     }
-    match rx.recv_timeout(startup_readiness_bind_deadline()) {
+    match rx.recv_timeout(bind_deadline) {
         Ok(Ok(())) => {
             tracing::debug!("database readiness warmup completed before listener bind");
         }
@@ -4007,14 +4430,15 @@ fn run_bounded_startup_readiness(config: &mcp_agent_mail_core::Config) {
         }
         Err(_timeout) => {
             tracing::warn!(
-                deadline_secs = startup_readiness_bind_deadline().as_secs(),
+                deadline_secs = bind_deadline.as_secs(),
                 db = %config.database_url,
                 storage_root = %config.storage_root.display(),
                 "database readiness warmup still running after the bind deadline; binding the HTTP \
                  listener NOW so the server is reachable (degraded). Recovery continues in the \
                  background. If this persists, stop the service and run `am doctor check --json`."
             );
-            // Detach: let the warmup finish in the background; never join here.
+            // Stop waiting for readiness, not owning it. The server scope
+            // retains the handle and cancels/joins it on shutdown.
         }
     }
 }
@@ -4184,17 +4608,18 @@ fn run_http_supervised(
     // Preparation ran the exclusive integrity probe before runtime locks.
     // Acquire the real locks now; a competing owner still makes this fail.
     let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
+    let startup_scope = StartupWorkerScope::default();
 
     // br-5mnkl: run the DB readiness warmup on a bounded background thread so a
     // pathologically slow recovery can never wedge the listener bind. The
     // listener always comes up within the bind deadline; `/healthz` stays live
     // and `/health` reports degraded honestly until the DB settles.
-    run_bounded_startup_readiness(config);
+    run_bounded_startup_readiness(config, &startup_scope.workers);
 
     log_active_database(config);
     let _ = startup_checks::write_listener_pid_hint(&config.http_host, config.http_port);
-    heal_storage_lock_artifacts(config);
-    init_search_bridge(config);
+    heal_storage_lock_artifacts(config, None);
+    init_search_bridge(config, &startup_scope.workers);
     mcp_agent_mail_storage::wbq_start();
     // Ack-fast crash recovery (br-ack-fast-storage-commit-reply-3ac88).
     mcp_agent_mail_storage::archive_backlog_recover(config);
@@ -4211,7 +4636,7 @@ fn run_http_supervised(
     maintenance::start(config);
     integrity_guard::start(config);
     disk_monitor::start(config);
-    start_advisory_consistency_probe(config);
+    start_advisory_consistency_probe(config, &startup_scope.workers);
     let dashboard = StartupDashboard::maybe_start(config);
     set_dashboard_handle(dashboard.clone());
     arm_startup_readiness_fast_path();
@@ -4222,6 +4647,7 @@ fn run_http_supervised(
     let result = run_http_headless_supervisor(config.clone(), control_rx, on_ready);
     clear_startup_readiness_fast_path();
 
+    startup_scope.workers.shutdown();
     retention::shutdown();
     tool_metrics::shutdown();
     ack_ttl::shutdown();
@@ -4276,12 +4702,13 @@ fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<(
 
     // Preparation already ran the probes before runtime activity locks.
     let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
+    let startup_scope = StartupWorkerScope::default();
 
     let _ = startup_checks::write_listener_pid_hint(&config.http_host, config.http_port);
     log_active_database(config);
 
     // ── 2. Pre-paint essentials only ────────────────────────────────
-    heal_storage_lock_artifacts(config);
+    heal_storage_lock_artifacts(config, None);
     mcp_agent_mail_storage::wbq_start();
     // Ack-fast crash recovery (br-ack-fast-storage-commit-reply-3ac88).
     mcp_agent_mail_storage::archive_backlog_recover(config);
@@ -4330,8 +4757,9 @@ fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<(
     // Keep first paint fast: screens and the DB poller already degrade
     // gracefully while SQLite is still warming up, so do not block the
     // interactive handoff on migrations/readiness work here.
-    spawn_tui_readiness_warmup(config, &tui_state);
-    let mut deferred_workers = spawn_tui_deferred_background_workers(config, &tui_state);
+    spawn_tui_readiness_warmup(config, &tui_state, &startup_scope.workers);
+    let mut deferred_workers =
+        spawn_tui_deferred_background_workers(config, &tui_state, &startup_scope.workers);
 
     // ── 5. DB poller on dedicated thread ────────────────────────────
     let mut db_poller =
@@ -4380,8 +4808,12 @@ fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<(
         // leave the thread parked forever while the poller is being stopped.
         deferred_workers.join();
         deferred_workers.progress.start_non_db_if_needed(config);
-        deferred_workers.progress.start_db_if_needed(config);
-        deferred_workers.progress.start_advisory_if_needed(config);
+        deferred_workers
+            .progress
+            .start_db_if_needed(config, &startup_scope.workers);
+        deferred_workers
+            .progress
+            .start_advisory_if_needed(config, &startup_scope.workers);
         // Stop the poller BEFORE clearing the detach latch (finding F8).
         // The latch is the narrow TUI-side release here: while it is set,
         // `wait_for_db_warmup`-style startup waits short-circuit (see
@@ -4403,6 +4835,7 @@ fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<(
             &tui_state,
             HTTP_SUPERVISOR_SHUTDOWN_RECV_BUDGET,
         );
+        startup_scope.workers.shutdown();
         drop(http_runtime);
 
         retention::shutdown();
@@ -4427,6 +4860,7 @@ fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<(
     // control-channel recv / idle sleep), so this flag alone guarantees an
     // orderly supervisor exit even if the control message below is dropped.
     tui_state.request_shutdown();
+    startup_scope.workers.request_shutdown();
     // Belt-and-suspenders: also deliver the explicit Shutdown control message
     // with a bounded retry instead of a silent-drop `try_send`.
     send_server_shutdown_control(&server_ctl_tx);
@@ -4437,6 +4871,7 @@ fn run_http_with_tui_prepared(startup: PreparedHttpStartup) -> std::io::Result<(
         &supervisor_result_rx,
         HTTP_SUPERVISOR_SHUTDOWN_RECV_BUDGET,
     );
+    startup_scope.workers.shutdown();
     drop(http_runtime);
 
     // Shutdown background workers
@@ -4570,6 +5005,7 @@ mod tui_result_tests {
 }
 
 struct HttpServerInstance {
+    state: Arc<HttpState>,
     join: AsyncJoinHandle<std::io::Result<()>>,
     shutdown: asupersync::server::shutdown::ShutdownSignal,
     connection_manager: asupersync::server::connection::ConnectionManager,
@@ -4747,32 +5183,47 @@ fn recv_http_supervisor_result(
     })
 }
 
+#[cfg(unix)]
+type HeadlessShutdownSignals = headless_signals::ShutdownSignals;
+#[cfg(windows)]
+type HeadlessShutdownSignals = [asupersync::signal::Signal; 2];
+
+#[cfg(windows)]
+fn headless_shutdown_signal(signals: &mut HeadlessShutdownSignals) -> Option<&'static str> {
+    for (signal, name) in signals.iter_mut().zip(["SIGTERM", "SIGINT"]) {
+        let mut next = std::pin::pin!(signal.recv());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        if next.as_mut().poll(&mut cx).is_ready() {
+            return Some(name);
+        }
+    }
+    None
+}
+
 #[cfg(any(unix, windows))]
 fn recv_http_supervisor_result_signalled(
     result_rx: &std::sync::mpsc::Receiver<std::io::Result<()>>,
     control_tx: &mpsc::Sender<tui_bridge::ServerControlMsg>,
-    signals: &mut [asupersync::signal::Signal],
+    signals: HeadlessShutdownSignals,
 ) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let mut signals = signals;
     loop {
-        for signal in &mut *signals {
-            let kind = signal.kind();
-            // Signal::recv is cancel-safe and retains deliveries across polls.
-            // Poll once here, then park on the result receiver for at most
-            // 200ms; no detached signal-forwarder task outlives the server.
-            let received = {
-                let mut next = std::pin::pin!(signal.recv());
-                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-                next.as_mut().poll(&mut cx).is_ready()
-            };
-            if received {
-                tracing::info!(signal = %kind, "headless HTTP shutdown requested");
-                sd_notify("STOPPING=1");
-                send_server_shutdown_control(control_tx);
-                return recv_http_supervisor_result_within(
-                    result_rx,
-                    HTTP_SUPERVISOR_SHUTDOWN_RECV_BUDGET,
-                );
-            }
+        // Unix signals set a retained flag directly in the OS handler. A dead
+        // signal-dispatch thread or closed pipe cannot strand this supervisor.
+        // Poll before parking for at most 200ms; delivery survives every park.
+        #[cfg(unix)]
+        let requested = signals.requested();
+        #[cfg(windows)]
+        let requested = headless_shutdown_signal(&mut signals);
+        if let Some(kind) = requested {
+            tracing::info!(signal = kind, "headless HTTP shutdown requested");
+            sd_notify("STOPPING=1");
+            send_server_shutdown_control(control_tx);
+            return recv_http_supervisor_result_within(
+                result_rx,
+                HTTP_SUPERVISOR_SHUTDOWN_RECV_BUDGET,
+            );
         }
         match result_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(result) => return result,
@@ -5108,6 +5559,7 @@ async fn spawn_http_server_instance(
     Ok((
         updated_config,
         HttpServerInstance {
+            state,
             join,
             shutdown,
             connection_manager,
@@ -5309,8 +5761,9 @@ async fn run_http_server_supervisor(
     mut config: mcp_agent_mail_core::Config,
     tui_state: Option<Arc<tui_bridge::TuiSharedState>>,
     mut control_rx: Option<mpsc::Receiver<tui_bridge::ServerControlMsg>>,
-    on_ready: Option<HttpReadyCallback>,
+    mut on_ready: Option<HttpReadyCallback>,
 ) -> std::io::Result<()> {
+    let readiness_started = Instant::now();
     let (updated_config, mut instance) =
         spawn_http_server_instance(&runtime_handle, config.clone()).await?;
     config = updated_config;
@@ -5348,16 +5801,13 @@ async fn run_http_server_supervisor(
     tracing::info!(
         host = %config.http_host,
         port = config.http_port,
-        "Startup readiness self-probe passed — server is accepting requests"
+        "Listener self-probe passed; mailbox admission is being verified"
     );
-    // The endpoint is confirmed serving; tell systemd (`Type=notify`) we are
-    // ready so `systemctl is-active` only reports `active` once clients can
-    // actually connect (#174). No-op for `Type=simple`/non-systemd launches.
-    sd_notify_ready();
-
-    if let Some(on_ready) = on_ready {
-        on_ready(&config);
-    }
+    // /healthz establishes transport liveness only. Keep serving it and
+    // processing shutdown/restart control while the actual mail pool and
+    // configured search backend finish initialization.
+    let mut ready_notified = false;
+    let mut readiness_status_at: Option<Instant> = None;
 
     let mut last_restart_sleep_ms: u64 = 0;
     let (mut liveness_failures, mut next_probe_at, mut probe_grace_until) =
@@ -5427,6 +5877,35 @@ async fn run_http_server_supervisor(
             (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state(&config);
             probe_client = build_probe_http_client();
             continue;
+        }
+
+        if !ready_notified {
+            match instance.state.mail_readiness().result() {
+                Ok(()) => {
+                    sd_notify_ready();
+                    tracing::info!(
+                        host = %config.http_host,
+                        port = config.http_port,
+                        "Mailbox admission ready"
+                    );
+                    if let Some(on_ready) = on_ready.take() {
+                        on_ready(&config);
+                    }
+                    ready_notified = true;
+                }
+                Err(reason) => {
+                    if readiness_status_at
+                        .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+                    {
+                        sd_notify(&startup_readiness_notify_payload(
+                            reason,
+                            readiness_started.elapsed(),
+                            instance.state.startup_initialization_active(reason),
+                        ));
+                        readiness_status_at = Some(Instant::now());
+                    }
+                }
+            }
         }
 
         let mut handled_control = false;
@@ -5822,6 +6301,146 @@ struct HealthSample<T> {
     value: T,
 }
 
+// Mandatory admission checks use the serving pool. The listener never waits
+// for a checkout: one runtime-owned worker refreshes a short-lived sample.
+const MAIL_READINESS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const MAIL_READINESS_MAX_SAMPLE_AGE: Duration = Duration::from_secs(6);
+const MAIL_READINESS_PROBE_BUDGET: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct MailReadinessCache {
+    // Keep the observed engine alive between probes. Only the owned worker
+    // replaces this owner, so native connection teardown cannot block health.
+    // generation is the desired target; samples are invalid while it changes.
+    pool: Option<mcp_agent_mail_db::DbPool>,
+    generation: Option<String>,
+    last_attempt: Option<Instant>,
+    refreshing: bool,
+    sample: Option<HealthSample<MailReadinessProbe>>,
+}
+
+struct MailReadinessProbe {
+    database: Result<(), String>,
+    lexical: LexicalReadiness,
+}
+
+struct MailReadinessRefreshGuard {
+    cache: Arc<Mutex<MailReadinessCache>>,
+    generation: String,
+}
+
+impl Drop for MailReadinessRefreshGuard {
+    fn drop(&mut self) {
+        let mut cache = lock_mutex(&self.cache);
+        cache.last_attempt =
+            (cache.generation.as_ref() == Some(&self.generation)).then(Instant::now);
+        cache.refreshing = false;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LexicalReadiness {
+    Disabled,
+    Initializing,
+    Rebuilding,
+    Unverified,
+    Unavailable,
+    CatchUpRequired,
+    Ready,
+}
+
+impl LexicalReadiness {
+    fn from_index(state: mcp_agent_mail_db::search_service::LexicalReadiness) -> Self {
+        if !state.compiled {
+            Self::Unavailable
+        } else if !state.initialized {
+            Self::Initializing
+        } else if state.available {
+            if state.verified {
+                Self::Ready
+            } else {
+                Self::CatchUpRequired
+            }
+        } else if state.backfilling {
+            Self::Rebuilding
+        } else {
+            Self::Unverified
+        }
+    }
+
+    const fn available(self) -> bool {
+        matches!(self, Self::Ready | Self::CatchUpRequired)
+    }
+
+    const fn state(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Initializing => "initializing",
+            Self::Rebuilding => "rebuilding",
+            Self::Unverified => "unverified",
+            Self::Unavailable => "unavailable",
+            Self::CatchUpRequired => "catch_up_required",
+            Self::Ready => "ready",
+        }
+    }
+
+    const fn failure(self) -> Option<&'static str> {
+        match self {
+            Self::Disabled | Self::Ready | Self::CatchUpRequired => None,
+            Self::Initializing => Some("lexical_initializing"),
+            Self::Rebuilding => Some("lexical_rebuilding"),
+            Self::Unverified => Some("lexical_unverified"),
+            Self::Unavailable => Some("lexical_unavailable"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MailReadinessSnapshot {
+    database: Result<(), &'static str>,
+    lexical: LexicalReadiness,
+    durability_degraded: bool,
+    disk_full: bool,
+}
+
+impl MailReadinessSnapshot {
+    fn result(self) -> Result<(), &'static str> {
+        self.database?;
+        if self.disk_full {
+            return Err("disk_full");
+        }
+        if self.durability_degraded {
+            return Err("durability_degraded");
+        }
+        self.lexical.failure().map_or(Ok(()), Err)
+    }
+
+    fn json(self) -> serde_json::Value {
+        let database_ready = self.database.is_ok();
+        let result = self.result();
+        let mut body = serde_json::json!({
+            "status": if result.is_ok() { "ready" } else { "unavailable" },
+            "capabilities": {
+                "mail_read": database_ready,
+                "mail_write": database_ready && !self.durability_degraded && !self.disk_full,
+                "lexical_search": database_ready && self.lexical.available(),
+            },
+            "lexical_state": self.lexical.state(),
+            "lexical_fresh": self.lexical == LexicalReadiness::Ready,
+            "durability_state": "not_probed",
+        });
+        if let Err(reason) = result {
+            body["reason"] = serde_json::json!(reason);
+        }
+        if self.disk_full {
+            body["writes_refused"] = serde_json::json!("DISK_FULL");
+        } else if self.durability_degraded {
+            body["writes_refused"] = serde_json::json!("DURABILITY_DEGRADED");
+        }
+        body
+    }
+}
+
 /// Owned by one HTTP state/configuration, never shared across mailboxes.
 #[derive(Debug, Default)]
 struct HealthEnrichmentCache {
@@ -6115,11 +6734,77 @@ const fn micros_to_millis_ceil(micros: u64) -> u64 {
     micros.saturating_add(999).saturating_div(1_000)
 }
 
+const DISPATCH_LOCK_SUMMARY_MAX_BYTES: usize = 4096;
+const DISPATCH_LOCK_SUMMARY_MAX_INSTANCES: usize = 4;
+
+/// Keep timeout replies usable while retaining the complete bounded observation
+/// in structured logs. These are process-wide waits, not proof that one of them
+/// caused the timed-out request. Missing samples never mean "no blockers".
+fn dispatch_lock_wait_summary(
+    snapshot: &mcp_agent_mail_core::lock_order::LockActivitySnapshot,
+) -> String {
+    let participant = |value: Option<&mcp_agent_mail_core::lock_order::LockParticipant>| {
+        value.map_or_else(
+            || "unobserved".to_string(),
+            |value| {
+                format!(
+                    "{:?} ({}) at {:?}:{}:{}",
+                    value.thread_name.as_deref().unwrap_or("unnamed"),
+                    value.thread_id,
+                    value.file,
+                    value.line,
+                    value.column,
+                )
+            },
+        )
+    };
+    let mut details = String::new();
+    let mut reported = 0;
+    let blocked = snapshot
+        .locks
+        .iter()
+        .filter(|lock| snapshot.available && lock.waiter_count > 0)
+        .count();
+    for lock in snapshot
+        .locks
+        .iter()
+        .filter(|lock| snapshot.available && lock.waiter_count > 0)
+        .take(DISPATCH_LOCK_SUMMARY_MAX_INSTANCES)
+    {
+        let entry = format!(
+            " [{}#{}: waiters={}, oldest_wait_ms={}, holders={}, owner={}, waiter={}, omitted_participants={}]",
+            lock.lock_name,
+            lock.instance_id,
+            lock.waiter_count,
+            lock.oldest_observed_wait_ns / 1_000_000,
+            lock.holder_count,
+            participant(lock.holders.first()),
+            participant(lock.waiters.first()),
+            lock.omitted_participants,
+        );
+        if details.len().saturating_add(entry.len()) > DISPATCH_LOCK_SUMMARY_MAX_BYTES - 512 {
+            break;
+        }
+        details.push_str(&entry);
+        reported += 1;
+    }
+    format!(
+        "lock_observation_available={}; lock_observation_complete={}; busy_instances={}; omitted_active_instances={}; registrations_dropped={}; observed_blocked_locks={blocked}; summary_omitted_locks={};{details} (process-wide instrumented lock evidence; not request attribution; absent or partial evidence does not establish no blockers)",
+        snapshot.available,
+        snapshot.is_complete(),
+        snapshot.busy_instances,
+        snapshot.omitted_active_instances,
+        snapshot.registrations_dropped,
+        blocked.saturating_sub(reported),
+    )
+}
+
 fn dispatch_timeout_error_text(
     method: &str,
     dispatch_timeout_secs: u64,
     diagnostics: &mcp_agent_mail_core::metrics::TimeoutDiagnosticsSnapshot,
     fence_holder: Option<&mcp_agent_mail_storage::ArchiveFenceHolder>,
+    lock_activity: &mcp_agent_mail_core::lock_order::LockActivitySnapshot,
 ) -> String {
     let dispatch = &diagnostics.blocking_dispatch;
     let fence_holder = fence_holder.map_or_else(|| "none".to_string(), ToString::to_string);
@@ -6137,7 +6822,7 @@ fn dispatch_timeout_error_text(
          path since ack-fast, and archive_commit_queue is enqueue-to-durable \
          queue latency, not pure git work; reservation artifacts are written \
          on the request path and wait for the archive publication fence, \
-         whose oldest live wait is archive_fence_wait_ms.)",
+         whose oldest live wait is archive_fence_wait_ms.) {}",
         diagnostics.stage.as_str(),
         diagnostics.stage_exceeded_budget,
         micros_to_millis_ceil(diagnostics.client_deadline_us),
@@ -6152,10 +6837,15 @@ fn dispatch_timeout_error_text(
         dispatch.zombies,
         dispatch.zombies_expired,
         dispatch.timeouts_total,
+        dispatch_lock_wait_summary(lock_activity),
     )
 }
 
-fn dispatch_timeout_error(method: &str, dispatch_timeout_secs: u64) -> McpError {
+fn dispatch_timeout_error(
+    method: &str,
+    dispatch_timeout_secs: u64,
+    lock_activity: &mcp_agent_mail_core::lock_order::LockActivitySnapshot,
+) -> McpError {
     let client_deadline_us = dispatch_timeout_secs.saturating_mul(1_000_000);
     let diagnostics =
         mcp_agent_mail_core::metrics::timeout_diagnostics_snapshot(client_deadline_us);
@@ -6167,6 +6857,7 @@ fn dispatch_timeout_error(method: &str, dispatch_timeout_secs: u64) -> McpError 
             dispatch_timeout_secs,
             &diagnostics,
             fence_holder.as_ref(),
+            lock_activity,
         ),
     )
 }
@@ -6354,10 +7045,18 @@ where
                             let metrics = mcp_agent_mail_core::metrics::blocking_dispatch_metrics();
                             metrics.inflight.sub_saturating(1);
                             metrics.zombies.add(1);
+                            // Publication of the accounting transition is done.
+                            // Do not retain the permit mutex during diagnostic
+                            // allocation/logging or delay a finishing worker.
+                            drop(guard);
+                            let lock_activity =
+                                mcp_agent_mail_core::lock_order::lock_activity_snapshot();
                             tracing::error!(
                                 method = %grace_method,
                                 grace_secs,
                                 zombies,
+                                lock_activity = ?lock_activity,
+                                lock_observation_complete = lock_activity.is_complete(),
                                 "hard grace timeout: blocking work ignored cancellation; \
                                  accounting it as a zombie that occupies admission capacity \
                                  until its thread exits or the zombie admission TTL elapses \
@@ -6369,17 +7068,24 @@ where
                 })
                 .ok();
 
+            let lock_activity = mcp_agent_mail_core::lock_order::lock_activity_snapshot();
             tracing::error!(
                 method = %method,
                 dispatch_timeout_secs,
                 grace_secs,
+                lock_activity = ?lock_activity,
+                lock_observation_complete = lock_activity.is_complete(),
                 "blocking dispatch timed out; cancellation requested, \
                  permit will be force-released after {grace_secs}s grace"
             );
             mcp_agent_mail_core::metrics::blocking_dispatch_metrics()
                 .timeouts_total
                 .inc();
-            Err(dispatch_timeout_error(&method, dispatch_timeout_secs))
+            Err(dispatch_timeout_error(
+                &method,
+                dispatch_timeout_secs,
+                &lock_activity,
+            ))
         }
     }
 }
@@ -6501,8 +7207,10 @@ pub(crate) struct AtcOperatorSnapshot {
     pub(crate) safe_mode: bool,
     pub(crate) kill_switch_enabled: bool,
     pub(crate) tick_count: u64,
+    /// Current-process liveness feedback, separate from durable observability.
     pub(crate) experiences_open: usize,
     pub(crate) experiences_resolved: u64,
+    pub(crate) experiences_censored: u64,
     pub(crate) policy_revision: u64,
     pub(crate) tracked_agents: Vec<AtcOperatorAgentSnapshot>,
     pub(crate) deadlock_cycles: usize,
@@ -6767,7 +7475,14 @@ fn record_atc_operator_execution(
 }
 
 fn atc_status_consumes_cooldown(status: &str) -> bool {
-    !status.starts_with("failed:") && status != "suppressed:missing_project_precondition"
+    !status.starts_with("failed:")
+        && !matches!(
+            status,
+            "suppressed:missing_project_precondition"
+                | "suppressed:agent_capacity"
+                | "suppressed:conflict_capacity"
+                | "suppressed:agent_coverage_unavailable"
+        )
 }
 
 const ATC_QUEUE_BACKPRESSURE_STATUS: &str = "throttled:pending_queue_capacity";
@@ -8360,6 +9075,13 @@ fn execute_atc_effect(
                 let Some(project_key) = effect.project_key.as_deref() else {
                     return "suppressed:missing_project_precondition".to_string();
                 };
+                // A queued proposal may predate a capacity refusal. Recheck at
+                // execution admission, outside hydration/delivery locks, and
+                // release the engine lock before entering the reservation tool.
+                // A refusal after this boundary does not cancel admitted work.
+                if let Err(reason) = atc::atc_release_capacity_admission() {
+                    return format!("suppressed:{reason}");
+                }
                 let Some(runtime) = runtime else {
                     return "failed:executor_unavailable".to_string();
                 };
@@ -8410,6 +9132,7 @@ fn build_atc_operator_snapshot(
             tick_count: summary.tick_count,
             experiences_open: summary.experiences_open,
             experiences_resolved: summary.experiences_resolved,
+            experiences_censored: summary.experiences_censored,
             policy_revision: summary.policy_revision,
             tracked_agents: summary
                 .tracked_agents
@@ -11343,6 +12066,7 @@ struct HttpState {
     /// Opt-in stateful MCP sessions (GH#279, `MESSAGING_SESSION_IDENTITY`).
     http_sessions: http_sessions::HttpSessionRegistry,
     health_enrichment: Arc<Mutex<HealthEnrichmentCache>>,
+    mail_readiness: Arc<Mutex<MailReadinessCache>>,
     /// Schedules only on the listener's real runtime, retained by the closure.
     health_refresh_scheduler: Option<HealthEnrichmentScheduler>,
     /// Weak self-reference for async blocking dispatch.
@@ -11538,9 +12262,174 @@ impl HttpState {
             probe_rejection_log: HttpProbeRejectionLog::default(),
             http_sessions: http_sessions::HttpSessionRegistry::default(),
             health_enrichment,
+            mail_readiness: Arc::new(Mutex::new(MailReadinessCache::default())),
             health_refresh_scheduler: health_refresh_runtime.map(health_enrichment_scheduler),
             self_ref: std::sync::OnceLock::new(),
         }
+    }
+
+    fn startup_initialization_active(&self, reason: &str) -> bool {
+        match reason {
+            "database_initializing" => STARTUP_DATABASE_INITIALIZERS.load(Ordering::Acquire) > 0,
+            "database_probe_failed" => {
+                // Initial lexical rebuilding can consume the constrained
+                // CPU/I/O budget before a source proof exists. A timed-out
+                // admission probe must not cause a 300s restart loop while
+                // actual owned work is still active. Idle retries alone do
+                // not extend this failure; the global grace remains finite.
+                STARTUP_DATABASE_INITIALIZERS.load(Ordering::Acquire) > 0
+                    || STARTUP_SEARCH_REFRESH_ACTIVE.load(Ordering::Acquire)
+            }
+            "database_probe_pending" | "database_probe_stale" => {
+                lock_mutex(&self.mail_readiness).refreshing
+            }
+            reason if reason.starts_with("lexical_") => {
+                STARTUP_SEARCH_MAINTENANCE_RUNNING.load(Ordering::Acquire)
+                    || lock_mutex(&self.mail_readiness).refreshing
+            }
+            _ => false,
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn mail_readiness(&self) -> MailReadinessSnapshot {
+        let durability_degraded = mcp_agent_mail_storage::durability_degraded();
+        let serving_config = match resolve_serving_config(&self.config) {
+            Ok(config) => config,
+            Err(reason) => {
+                return MailReadinessSnapshot {
+                    database: Err(reason),
+                    lexical: LexicalReadiness::Initializing,
+                    durability_degraded,
+                    disk_full: false,
+                };
+            }
+        };
+        // Shadow indexing is diagnostic; only an effective lexical serving
+        // mode is part of normal request admission.
+        let lexical_required = serving_search_uses_lexical(&serving_config);
+        let disk_full = serving_config.disk_space_monitor_enabled
+            && mcp_agent_mail_core::disk::DiskPressure::from_u64(
+                mcp_agent_mail_core::global_metrics()
+                    .system
+                    .disk_pressure_level
+                    .load(),
+            ) == mcp_agent_mail_core::disk::DiskPressure::Fatal;
+        let unavailable = |reason| MailReadinessSnapshot {
+            database: Err(reason),
+            lexical: if lexical_required {
+                LexicalReadiness::Initializing
+            } else {
+                LexicalReadiness::Disabled
+            },
+            durability_degraded,
+            disk_full,
+        };
+        if startup_readiness_fast_path_active() {
+            return unavailable("database_initializing");
+        }
+
+        let db_config = DbPoolConfig::from_config(&serving_config);
+        let pool = if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(
+            &serving_config.database_url,
+        ) {
+            // Memory databases need the same compatible pool held by mail
+            // handlers. Opening a fresh memory connection proves nothing.
+            mcp_agent_mail_db::pool::get_or_reuse_compatible_memory_pool(&db_config).ok()
+        } else {
+            // Health never starts migrations or recovery on a request thread.
+            // Startup owns initialization through the existing SqliteInitGate.
+            mcp_agent_mail_db::get_cached_pool(&db_config)
+                .filter(mcp_agent_mail_db::DbPool::is_initialized)
+        };
+        let Some(pool) = pool else {
+            return unavailable("database_initializing");
+        };
+        let generation = pool.engine_identity_key();
+        let (mut snapshot, refresh) = {
+            let mut cache = lock_mutex(&self.mail_readiness);
+            if cache.generation.as_ref() != Some(&generation) {
+                cache.generation = Some(generation.clone());
+                cache.sample = None;
+                cache.last_attempt = None;
+            }
+            let refresh = self.health_refresh_scheduler.is_some()
+                && !cache.refreshing
+                && cache
+                    .last_attempt
+                    .is_none_or(|attempt| attempt.elapsed() >= MAIL_READINESS_REFRESH_INTERVAL);
+            if refresh {
+                cache.refreshing = true;
+            }
+            let snapshot = match cache.sample.as_ref() {
+                Some(sample) if sample.observed_at.elapsed() <= MAIL_READINESS_MAX_SAMPLE_AGE => {
+                    MailReadinessSnapshot {
+                        database: sample
+                            .value
+                            .database
+                            .as_ref()
+                            .map(|_| ())
+                            .map_err(|_| "database_probe_failed"),
+                        lexical: sample.value.lexical,
+                        durability_degraded,
+                        disk_full,
+                    }
+                }
+                Some(_) => unavailable("database_probe_stale"),
+                None => unavailable("database_probe_pending"),
+            };
+            (snapshot, refresh)
+        };
+
+        if snapshot.database.is_ok() {
+            if !pool.is_initialized() {
+                snapshot.database = Err("database_initializing");
+            } else if snapshot.lexical.available() {
+                // Revoke a sampled success immediately when a rewrite or
+                // failed/full rebuild makes the index unusable. This is
+                // a process-local check, with no SQL or filesystem inventory.
+                snapshot.lexical = LexicalReadiness::from_index(
+                    mcp_agent_mail_db::search_service::lexical_readiness(&pool),
+                );
+            }
+        }
+
+        if refresh {
+            let guard = MailReadinessRefreshGuard {
+                cache: Arc::clone(&self.mail_readiness),
+                generation,
+            };
+            let schedule = self
+                .health_refresh_scheduler
+                .as_ref()
+                .expect("scheduler checked");
+            schedule(Box::new(move || {
+                let retired_pool = {
+                    let mut cache = lock_mutex(&guard.cache);
+                    if cache.generation.as_ref() != Some(&guard.generation) {
+                        return;
+                    }
+                    cache.pool.replace(pool.clone())
+                };
+                // Native teardown belongs to this owned blocking worker,
+                // outside both the listener path and the admission mutex.
+                drop(retired_pool);
+                // Age the sample from before the work, so a slow probe
+                // cannot make an earlier successful checkout look fresh.
+                let observed_at = Instant::now();
+                let value = probe_serving_mail_pool(&pool, lexical_required);
+                if let Err(error) = &value.database {
+                    tracing::warn!(%error, "serving-pool readiness probe failed");
+                }
+                let mut cache = lock_mutex(&guard.cache);
+                if cache.generation.as_ref() == Some(&guard.generation) {
+                    cache.sample = Some(HealthSample { observed_at, value });
+                }
+                drop(cache);
+                drop(guard);
+            }));
+        }
+        snapshot
     }
 
     fn schedule_health_enrichment_refresh(&self) {
@@ -11719,6 +12608,11 @@ impl HttpState {
         }
 
         let (path, _query) = split_path_query(&req.uri);
+        // This one versioned bootstrap asset contains only embedded public
+        // code. It must load before the browser can attach mailbox credentials.
+        if let Some(resp) = self.handle_embedded_mail_asset(&req, &path) {
+            return resp;
+        }
         // Legacy parity: health routes bypass bearer auth even when configured.
         //
         // Note: the legacy FastAPI stack used a `/health/` prefix check, but this
@@ -11733,7 +12627,7 @@ impl HttpState {
 
         let auth_cx = self.request_cx();
 
-        // Legacy parity: bearer auth applies to all non-health routes (even unknown paths/methods),
+        // Bearer auth applies to all remaining non-health routes (even unknown paths/methods),
         // so missing/invalid auth yields 401 instead of downstream 404/405/400.
         if let Some(resp) = self.check_bearer_auth_with_cx(&auth_cx, &req).await {
             return resp;
@@ -11752,6 +12646,12 @@ impl HttpState {
         // MCP JSON-RPC path uses, so a wedged mail request can only consume a
         // dispatch permit and a worker thread, never the async runtime.
         if path == "/mail" || path.starts_with("/mail/") {
+            if let Some(resp) = self
+                .check_mail_write_access_with_cx(&auth_cx, &req, &path)
+                .await
+            {
+                return resp;
+            }
             return self.dispatch_mail_route_blocking(req, path).await;
         }
 
@@ -11960,6 +12860,38 @@ impl HttpState {
         Some(resp)
     }
 
+    fn handle_embedded_mail_asset(&self, req: &Http1Request, path: &str) -> Option<Http1Response> {
+        if path != templates::MAIL_TAILWIND_ASSET_PATH {
+            return None;
+        }
+        if !matches!(req.method, Http1Method::Get | Http1Method::Head) {
+            let mut resp = self.error_response(req, 405, "Method Not Allowed");
+            resp.headers
+                .push(("allow".to_string(), "GET, HEAD, OPTIONS".to_string()));
+            return Some(resp);
+        }
+        let Some(bytes) =
+            mcp_agent_mail_share::bundle::embedded_viewer_asset("vendor/tailwind.min.js")
+        else {
+            return Some(self.error_response(req, 500, "Embedded asset unavailable"));
+        };
+        let body = if matches!(req.method, Http1Method::Head) {
+            Vec::new()
+        } else {
+            bytes.to_vec()
+        };
+        let mut resp = self.raw_response(req, 200, "text/javascript; charset=utf-8", body);
+        resp.headers.push((
+            "cache-control".to_string(),
+            "public, max-age=31536000, immutable".to_string(),
+        ));
+        resp.headers
+            .push(("content-length".to_string(), bytes.len().to_string()));
+        resp.headers
+            .push(("x-content-type-options".to_string(), "nosniff".to_string()));
+        Some(resp)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn handle_special_routes(&self, req: &Http1Request, path: &str) -> Option<Http1Response> {
         match path {
@@ -11977,40 +12909,19 @@ impl HttpState {
                 if !matches!(req.method, Http1Method::Get) {
                     return Some(self.error_response(req, 405, "Method Not Allowed"));
                 }
-                // Freshly bound listeners should answer quickly even while the
-                // DB warm path is still settling. Report a transient warmup
-                // state instead of blocking readiness probes on immediate pool
-                // initialization right after bind.
-                if startup_readiness_fast_path_active() {
-                    return Some(self.health_json_response(
-                        req,
-                        503,
-                        &serde_json::json!({"status":"warming_up"}),
-                    ));
+                let readiness = self.mail_readiness();
+                let status = if readiness.result().is_ok() { 200 } else { 503 };
+                let mut body = readiness.json();
+                // Optional inventory/sidecar diagnostics never establish
+                // admission and are not scheduled ahead of pool startup.
+                if readiness.database.is_ok() {
+                    self.schedule_health_enrichment_refresh();
                 }
-                if let Err(_err) = readiness_check_request_path(&self.config) {
-                    tracing::warn!(error = %_err, "readiness check failed");
-                    return Some(self.error_response(req, 503, "service unavailable"));
-                }
-                let mut body = serde_json::json!({"status":"ready"});
-                // Enrich readiness response with database identity so
-                // operators can verify the correct DB file is active.
-                self.schedule_health_enrichment_refresh();
                 enrich_readiness_response(&self.config, &self.health_enrichment, &mut body);
-                // Keep generic readiness distinct from the heavier durability
-                // verdict. The dedicated /health/durability route still runs
-                // the mailbox verdict engine, while /health must not join
-                // archive or diagnostic scans and make a live listener look
-                // dead under contention.
-                body["durability_state"] = serde_json::json!("not_probed");
-                // The write-back latch is one atomic load, so it is cheap enough here.
-                // Still 200: the listener is alive and reads still work, and the
-                // archive reconciler lifts the latch once the failed write-backs
-                // are re-archived, so a supervisor restart loop would not help.
-                if mcp_agent_mail_storage::durability_degraded() {
-                    body["writes_refused"] = serde_json::json!("DURABILITY_DEGRADED");
-                }
-                return Some(self.health_json_response(req, 200, &body));
+                // /healthz remains the supervisor's liveness endpoint. A
+                // temporary write refusal or search rebuild must not cause
+                // a transport restart, but cannot advertise full readiness.
+                return Some(self.health_json_response(req, status, &body));
             }
             "/health/durability" => {
                 if !matches!(req.method, Http1Method::Get) {
@@ -12181,6 +13092,53 @@ impl HttpState {
         self.raw_response(req, 403, "application/json", body.into_bytes())
     }
 
+    /// Authorize browser mutations before they can acquire a dispatch permit or
+    /// open the mailbox. Authentication has already run in `handle_inner`.
+    async fn check_mail_write_access_with_cx(
+        &self,
+        cx: &Cx,
+        req: &Http1Request,
+        path: &str,
+    ) -> Option<Http1Response> {
+        if !matches!(req.method, Http1Method::Post) {
+            return None;
+        }
+        // Keep the existing CSRF rejection ahead of role checks, including
+        // when RBAC or authentication is disabled for a local deployment.
+        if let Some(rejection) = self.mail_csrf_rejection(req) {
+            return Some(rejection);
+        }
+        if !self.config.http_rbac_enabled || self.allow_local_unauthenticated(req) {
+            return None;
+        }
+        let Ok((roles, _)) = self.resolve_rbac_identity_with_cx(cx, req, true).await else {
+            return Some(self.error_response(req, 401, "Unauthorized"));
+        };
+        if roles
+            .iter()
+            .any(|role| self.config.http_rbac_writer_roles.contains(role))
+        {
+            return None;
+        }
+
+        tracing::warn!(
+            event = "http_rbac_denied",
+            path,
+            roles = %roles.join(","),
+            required = "writer",
+            "RBAC denied mail mutation"
+        );
+        Some(self.json_response(
+            req,
+            403,
+            &serde_json::json!({
+                "error": "forbidden",
+                "detail": "Mail mutations require a configured writer role.",
+                "required_role": "writer",
+            }),
+        ))
+    }
+
     fn handle_mail_dispatch(&self, req: &Http1Request, path: &str) -> Http1Response {
         let cx = self.request_cx();
         self.handle_mail_dispatch_with_cx(req, path, &cx)
@@ -12214,7 +13172,7 @@ impl HttpState {
         };
         let body_str = std::str::from_utf8(&req.body).unwrap_or("");
         let is_api = Self::is_mail_json_route(path, method_str);
-        match mail_ui::dispatch_with_cx(path, query_str, method_str, body_str, cx) {
+        match mail_ui::dispatch_live_with_cx(path, query_str, method_str, body_str, cx) {
             Ok(Some(body)) => {
                 let content_type = if is_api {
                     "application/json"
@@ -12250,14 +13208,12 @@ impl HttpState {
     /// cancellable blocking-dispatch pool with the request timeout, keeping
     /// async workers free.
     ///
-    /// The mail UI layer is synchronous (per-request pool access, DB queries,
-    /// template rendering) and — on a large, long-lived mailbox — its pool
-    /// bootstrap can take tens of seconds or block outright against the live
-    /// pool's engine-level coordination. Inline execution on an async worker
-    /// starved the accept loop and timers, permanently wedging `/mcp` for all
-    /// agents after a single browser `GET /mail`. Here the worst case is a
-    /// consumed dispatch permit + one blocking thread, and the client gets a
-    /// 503 when the request times out.
+    /// The mail UI uses the initialized serving pool; startup alone owns its
+    /// bootstrap. Queries and template rendering are still synchronous and
+    /// can be expensive on a large mailbox. Keeping them off async workers
+    /// protects the accept loop and timers. The worst case is a consumed
+    /// dispatch permit + one blocking thread, and the client gets a 503 when
+    /// the request times out.
     async fn dispatch_mail_route_blocking(&self, req: Http1Request, path: String) -> Http1Response {
         let Some(arc_self) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
             // self_ref not set or HttpState already dropped — fall back to the
@@ -12862,6 +13818,12 @@ to skip auth for local requests.</p>
         if per_minute == 0 {
             return true;
         }
+        // Tool names and JWT subjects are supplied by clients. Bound retained
+        // keys before either backend allocates its own copy; truncating them
+        // would merge unrelated clients' quotas.
+        if key.len() > RATE_LIMIT_MAX_KEY_BYTES {
+            return false;
+        }
 
         let now = rate_limit_now();
         let budget = if self.request_timeout_secs == 0 {
@@ -12874,7 +13836,6 @@ to skip auth for local requests.</p>
         let cx = runtime_request_cx(budget);
 
         let redis = self.rate_limit_redis_client(&cx).await;
-        let has_redis = redis.is_some();
 
         if let Some(redis) = redis
             && let Ok(allowed) =
@@ -12882,11 +13843,10 @@ to skip auth for local requests.</p>
         {
             return allowed;
         }
-        // Legacy parity: if Redis is configured, periodic cleanup is disabled even when
-        // a specific Redis call fails and we fall back to memory.
-
+        // A ready Redis client can keep failing commands for an entire outage.
+        // Its fallback needs the same bounded retention as a memory-only server.
         self.rate_limiter
-            .allow_memory(key, per_minute, burst, now, !has_redis)
+            .allow_memory(key, per_minute, burst, now, true)
     }
 
     #[cfg(test)]
@@ -12900,15 +13860,15 @@ to skip auth for local requests.</p>
             .await
     }
 
-    async fn check_rbac_and_rate_limit_with_cx(
+    async fn resolve_rbac_identity_with_cx(
         &self,
         cx: &Cx,
         req: &Http1Request,
-        json_rpc: &JsonRpcRequest,
-    ) -> Option<Http1Response> {
-        let (kind, tool_name) = classify_request(json_rpc);
+        allow_browser_query_token: bool,
+    ) -> Result<(Vec<String>, Option<String>), ()> {
         let is_local_ok = self.allow_local_unauthenticated(req);
-        let has_static_bearer = self.has_expected_bearer_header(req);
+        let has_static_bearer = self.has_expected_bearer_header(req)
+            || (allow_browser_query_token && self.has_expected_query_token(req));
         let local_bypass_jwt_sub = if self.config.http_rate_limit_enabled
             && is_local_ok
             && self.config.http_jwt_enabled
@@ -12935,15 +13895,29 @@ to skip auth for local requests.</p>
             if has_static_bearer {
                 (self.static_bearer_rbac_roles(), None)
             } else {
-                match self.decode_jwt_with_cx(cx, req).await {
-                    Ok(ctx) => (ctx.roles, ctx.sub),
-                    Err(()) => return Some(self.error_response(req, 401, "Unauthorized")),
-                }
+                let ctx = self.decode_jwt_with_cx(cx, req).await?;
+                (ctx.roles, ctx.sub)
             }
         } else if has_static_bearer {
             (self.static_bearer_rbac_roles(), None)
         } else {
             (self.unauthenticated_default_rbac_roles(req), None)
+        };
+        Ok((roles, jwt_sub))
+    }
+
+    async fn check_rbac_and_rate_limit_with_cx(
+        &self,
+        cx: &Cx,
+        req: &Http1Request,
+        json_rpc: &JsonRpcRequest,
+    ) -> Option<Http1Response> {
+        let (kind, tool_name) = classify_request(json_rpc);
+        let is_local_ok = self.allow_local_unauthenticated(req);
+        // Query-token authentication is deliberately limited to browser
+        // routes; it must not grant MCP calls a static token's writer role.
+        let Ok((roles, jwt_sub)) = self.resolve_rbac_identity_with_cx(cx, req, false).await else {
+            return Some(self.error_response(req, 401, "Unauthorized"));
         };
 
         // RBAC (mirrors legacy python behavior)
@@ -13239,13 +14213,11 @@ to skip auth for local requests.</p>
 
                 // Emit tool-call-start panel if console tool logging is enabled.
                 let call_start = if tool_call_console_enabled {
-                    let args = params
-                        .arguments
-                        .clone()
-                        .unwrap_or_else(|| serde_json::json!({}));
+                    let empty_args = serde_json::json!({});
+                    let args = params.arguments.as_ref().unwrap_or(&empty_args);
                     let panel_lines = console::render_tool_call_start(
                         &tool_name,
-                        &args,
+                        args,
                         project_hint.as_deref(),
                         agent_hint.as_deref(),
                     );
@@ -13404,7 +14376,7 @@ to skip auth for local requests.</p>
                 // Emit tool-call-end panel
                 if let Some(start) = call_start {
                     let dur_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    let result_preview = serde_json::to_string(&value).ok();
+                    let result_preview = serde_json::to_string(&console::mask_json(&value)).ok();
                     let panel_lines = console::render_tool_call_end(
                         &tool_name,
                         dur_ms,
@@ -16374,6 +17346,13 @@ fn readiness_check(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
     readiness_check_with_integrity(config, true)
 }
 
+fn readiness_check_with_startup_control(
+    config: &mcp_agent_mail_core::Config,
+    control: &StartupWorkerControl,
+) -> Result<(), String> {
+    readiness_check_with_integrity_and_startup_control(config, true, Some(control))
+}
+
 #[cfg(test)]
 fn readiness_check_quick(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
     let is_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
@@ -16424,6 +17403,94 @@ fn readiness_check_quick(config: &mcp_agent_mail_core::Config) -> Result<(), Str
     readiness_check_cached_semantic_status(config, &conn)
 }
 
+fn probe_serving_mail_pool(
+    pool: &mcp_agent_mail_db::DbPool,
+    lexical_required: bool,
+) -> MailReadinessProbe {
+    let started = Instant::now();
+    let cx =
+        runtime_request_cx(Budget::new().with_timeout(wall_now(), MAIL_READINESS_PROBE_BUDGET));
+    // This is the same nonblocking activity admission used by normal mail
+    // operations. A healthy connection cannot bypass an exclusive recovery
+    // owner. Retain the guard through the lexical source observation as well.
+    let activity = if pool.sqlite_path() == ":memory:" {
+        Ok(None)
+    } else {
+        acquire_mailbox_activity_lock_for_sqlite_path(
+            Path::new(pool.sqlite_path()),
+            MailboxActivityLockMode::Shared,
+        )
+        .map_err(|error| error.to_string())
+    };
+    let database = (|| {
+        let _admitted = activity.as_ref().map_err(Clone::clone)?;
+        let acquired = block_on(async {
+            timeout(wall_now(), MAIL_READINESS_PROBE_BUDGET, pool.acquire(&cx)).await
+        });
+        let conn = match acquired {
+            Ok(asupersync::Outcome::Ok(conn)) => conn,
+            Ok(asupersync::Outcome::Err(error)) => return Err(error.to_string()),
+            Ok(asupersync::Outcome::Cancelled(_)) => {
+                return Err("serving-pool readiness cancelled".to_string());
+            }
+            Ok(asupersync::Outcome::Panicked(error)) => {
+                return Err(format!(
+                    "serving-pool readiness panicked: {}",
+                    error.message()
+                ));
+            }
+            Err(_) => return Err("serving-pool readiness acquisition timed out".to_string()),
+        };
+        readiness_check_schema_status(&*conn)?;
+        conn.query_sync(
+            "SELECT id, project_id, sender_id FROM messages ORDER BY id DESC LIMIT 1",
+            &[],
+        )
+        .map_err(|error| format!("serving mail query failed: {error}"))?;
+        cx.checkpoint()
+            .map_err(|_| "serving-pool readiness expired".to_string())?;
+        if started.elapsed() > MAIL_READINESS_PROBE_BUDGET || !pool.is_initialized() {
+            return Err("serving-pool readiness expired or generation retired".to_string());
+        }
+        Ok(())
+    })();
+
+    let lexical = if !lexical_required {
+        LexicalReadiness::Disabled
+    } else if database.is_err() {
+        LexicalReadiness::Initializing
+    } else {
+        // The connection above has been returned before this acquisition.
+        // Validate source revision/coverage through the actual pool; this
+        // never starts a file-backed index rebuild or an archive scan.
+        let remaining = MAIL_READINESS_PROBE_BUDGET.saturating_sub(started.elapsed());
+        let observed = block_on(async {
+            timeout(
+                wall_now(),
+                remaining,
+                mcp_agent_mail_db::search_service::probe_lexical_readiness(&cx, pool),
+            )
+            .await
+        });
+        match observed {
+            Ok(asupersync::Outcome::Ok(state))
+                if started.elapsed() <= MAIL_READINESS_PROBE_BUDGET =>
+            {
+                LexicalReadiness::from_index(state)
+            }
+            Ok(asupersync::Outcome::Err(error)) => {
+                tracing::debug!(%error, "lexical readiness proof unavailable");
+                LexicalReadiness::Unverified
+            }
+            _ => LexicalReadiness::Unverified,
+        }
+    };
+    MailReadinessProbe { database, lexical }
+}
+
+// Retain the guarded raw opener regression separately from production
+// admission. A schema-only read-only connection cannot establish readiness.
+#[cfg(test)]
 fn readiness_check_request_path(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
     let is_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
     let sqlite_path = if is_memory {
@@ -16582,11 +17649,9 @@ fn readiness_check_schema_status(
 
 /// Emit a prominent startup log line showing which database file is active.
 ///
-/// This makes it trivially easy for operators to verify the correct DB when
-/// tailing logs after a restart or deployment. It also emits a best-effort
-/// warning when the canonical archive inventory is ahead of the SQLite index,
-/// which usually means the DB was recreated or left stale without a matching
-/// archive restore/reconcile.
+/// This only reports configuration metadata. Archive consistency checks are
+/// owned by startup preflight and the advisory worker; repeating a full archive
+/// inventory here can delay listener bind by minutes on a large mailbox.
 fn log_active_database(config: &mcp_agent_mail_core::Config) {
     let db_display: std::borrow::Cow<'_, str> =
         match resolve_server_database_url_sqlite_path(&config.database_url) {
@@ -16605,28 +17670,6 @@ fn log_active_database(config: &mcp_agent_mail_core::Config) {
         storage_root = %config.storage_root.display(),
         "Active database"
     );
-
-    // Best-effort warning: archive inventory is ahead of the live SQLite index.
-    if let Some(sqlite_path) = resolve_server_database_url_sqlite_path(&config.database_url)
-        && let Some(observed) =
-            dashboard_open_connection(&config.database_url, config.storage_root.as_path())
-        && let Ok(Some(drift)) =
-            inspect_archive_db_drift(&config.storage_root, &sqlite_path, observed.conn())
-    {
-        tracing::warn!(
-            database = %db_display,
-            storage_root = %config.storage_root.display(),
-            archive_projects = drift.archive_projects,
-            archive_agents = drift.archive_agents,
-            archive_messages = drift.archive_messages,
-            db_projects = drift.db_projects,
-            db_agents = drift.db_agents,
-            db_messages = drift.db_messages,
-            missing_archive_projects = ?drift.missing_archive_projects,
-            "Canonical archive inventory is ahead of the SQLite index — \
-             the DB may have been recreated or left stale without archive restore/reconcile"
-        );
-    }
 }
 
 /// The mailbox verdict cannot see the write-back latch (#122), which refuses
@@ -16813,6 +17856,10 @@ fn enrich_readiness_response(
     body: &mut serde_json::Value,
 ) {
     body["version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+    body["atc_population_hydration"] = serde_json::json!(atc::atc_population_health_snapshot(
+        config.atc_enabled,
+        mcp_agent_mail_core::timestamps::now_micros(),
+    ));
     let cache = lock_mutex(cache);
     body["database_path"] = cache.database_path.clone();
     let is_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
@@ -16850,6 +17897,20 @@ fn readiness_check_with_integrity(
     config: &mcp_agent_mail_core::Config,
     run_integrity_check: bool,
 ) -> Result<(), String> {
+    readiness_check_with_integrity_and_startup_control(config, run_integrity_check, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn readiness_check_with_integrity_and_startup_control(
+    config: &mcp_agent_mail_core::Config,
+    run_integrity_check: bool,
+    control: Option<&StartupWorkerControl>,
+) -> Result<(), String> {
+    let _initializing = StartupDatabaseInitialization::begin();
+    let checkpoint = || control.map_or(Ok(()), StartupWorkerControl::checkpoint);
+    checkpoint()?;
+    let serving_config = resolve_serving_config(config).map_err(str::to_string)?;
+    let db_config = DbPoolConfig::from_config(&serving_config);
     let is_memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url);
     let sqlite_path = if is_memory {
         None
@@ -16871,6 +17932,7 @@ fn readiness_check_with_integrity(
     {
         let storage_root = std::path::Path::new(&config.storage_root);
         if !sqlite_path.exists() {
+            checkpoint()?;
             let recovery_res = if storage_root.is_dir() {
                 mcp_agent_mail_db::ensure_sqlite_file_healthy_with_archive(
                     sqlite_path,
@@ -16885,37 +17947,23 @@ fn readiness_check_with_integrity(
         }
     }
 
-    let pool_timeout_ms = if run_integrity_check {
-        config.database_pool_timeout.map_or(
-            mcp_agent_mail_db::pool::DEFAULT_POOL_TIMEOUT_MS,
-            mcp_agent_mail_db::pool::pool_timeout_ms_from_setting,
-        )
-    } else {
-        // Quick check: use a much shorter timeout (2s) to avoid delaying startup
-        // if the DB is busy with a long backfill or migration.
-        2000
-    };
-    // Keep readiness initialization intentionally minimal: we only need one
-    // successful acquire/query path to force migration initialization. Building
-    // a large auto-sized pool here causes avoidable startup churn on big hosts.
-    let db_config = DbPoolConfig {
-        database_url: config.database_url.clone(),
-        storage_root: Some(config.storage_root.clone()),
-        min_connections: 1,
-        max_connections: 1,
-        acquire_timeout_ms: pool_timeout_ms,
-        max_lifetime_ms: mcp_agent_mail_db::pool::DEFAULT_POOL_RECYCLE_MS,
-        run_migrations: true,
-        warmup_connections: 0,
-        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
-    };
+    // Pool construction is lazy; this checkout owns the existing SqliteInitGate
+    // for the actual request shape selected above. A separate one-connection
+    // pool could finish while the serving pool still needed initialization.
 
-    // Borrow the runtime-backed ambient Cx<cap::All> that `Runtime::block_on`
-    // installs (INFINITE budget) rather than the test-only `Cx::for_testing()`
-    // constructor, which is gated behind `test-internals`.
-    let cx = block_on(async {
-        Cx::current().expect("Runtime::block_on installs an ambient Cx for the polled future")
+    // Keep a request context whose cancellation registry outlives checkout.
+    // An ambient root Cx escaped from a completed block_on has already had
+    // its wakers retired, so shutdown cannot wake a later pending acquire.
+    // A quick probe limits its request, not the shared pool configuration.
+    let cx = runtime_request_cx(if run_integrity_check {
+        Budget::INFINITE
+    } else {
+        Budget::new().with_timeout(wall_now(), Duration::from_secs(2))
     });
+    let _context_guard = control
+        .map(|control| control.bind_native_context(&cx))
+        .transpose()?;
+    checkpoint()?;
     let pool = create_pool(&db_config).map_err(|e| e.to_string())?;
     let conn = match block_on(pool.acquire(&cx)) {
         asupersync::Outcome::Ok(c) => c,
@@ -16934,6 +17982,7 @@ fn readiness_check_with_integrity(
         }
     };
 
+    checkpoint()?;
     if let Err(e) = conn.query_sync("SELECT 1", &[]) {
         let error = e.to_string();
         if run_integrity_check && mcp_agent_mail_db::is_corruption_error_message(&error) {
@@ -16944,6 +17993,7 @@ fn readiness_check_with_integrity(
         return Err(error);
     }
 
+    checkpoint()?;
     let startup_integrity_fingerprint = sqlite_startup_fingerprint(&conn, &config.database_url);
     drop(conn);
 
@@ -16954,6 +18004,7 @@ fn readiness_check_with_integrity(
                 startup_integrity_cache_is_fresh(config, sqlite_path, *fingerprint)
             });
     if run_integrity_check && config.integrity_check_on_startup && !is_memory {
+        checkpoint()?;
         if skip_startup_integrity {
             tracing::debug!(
                 "startup integrity quick-check skipped (schema fingerprint unchanged and cache is fresh)"
@@ -16962,6 +18013,7 @@ fn readiness_check_with_integrity(
             // Note: If we just recovered above, this is redundant but extremely fast and safe.
             pool.run_startup_integrity_check()
                 .map_err(|e| format!("startup integrity check failed: {e}"))?;
+            checkpoint()?;
             // The guard's first cycle would repeat this quick-check at once; on
             // a large mailbox one costs seconds and a burst of engine threads.
             integrity_guard::note_startup_integrity_probe_completed();
@@ -17242,9 +18294,72 @@ async fn consume_rate_limit_redis(
     Ok(allowed)
 }
 
+// At most 16 MiB of key bytes per server, plus bounded map/entry overhead.
+// Preserve existing quotas at capacity: evicting active buckets would let key
+// churn replenish exhausted clients' bursts.
+const RATE_LIMIT_MAX_BUCKETS: usize = 16_384;
+const RATE_LIMIT_MAX_KEY_BYTES: usize = 1_024;
+const RATE_LIMIT_CAPACITY_CLEANUP_INTERVAL_SECS: f64 = 1.0;
+
+#[derive(Clone, Copy, Debug)]
+struct RateLimitBucket {
+    tokens: f64,
+    observed_at: f64,
+    rate_per_sec: f64,
+    burst: f64,
+}
+
+impl RateLimitBucket {
+    fn new(per_minute: u32, burst: u32, now: f64) -> Self {
+        Self {
+            tokens: f64::from(burst.max(1)),
+            observed_at: now,
+            rate_per_sec: f64::from(per_minute) / 60.0,
+            burst: f64::from(burst.max(1)),
+        }
+    }
+
+    fn refilled_tokens(self, now: f64) -> f64 {
+        (self.tokens + (now - self.observed_at).max(0.0) * self.rate_per_sec).min(self.burst)
+    }
+
+    fn fully_refilled(self, now: f64) -> bool {
+        now >= self.observed_at && self.refilled_tokens(now) >= self.burst
+    }
+
+    fn consume(&mut self, per_minute: u32, burst: u32, now: f64) -> bool {
+        // A backwards clock must not move the refill origin backwards, which
+        // would mint tokens when the clock returns to its previous value.
+        let now = now.max(self.observed_at);
+        let burst = f64::from(burst.max(1));
+        let refilled = self.refilled_tokens(now);
+        // Refill elapsed time under the policy that governed that interval.
+        // An updated policy can replace a fully restored bucket, just as if it
+        // had been reclaimed; an outstanding debit survives policy changes.
+        let mut tokens = if refilled >= self.burst {
+            burst
+        } else {
+            refilled.min(burst)
+        };
+        let allowed = tokens >= 1.0;
+        if allowed {
+            tokens -= 1.0;
+        }
+        *self = Self {
+            tokens,
+            observed_at: now,
+            rate_per_sec: f64::from(per_minute) / 60.0,
+            burst,
+        };
+        allowed
+    }
+}
+
 struct RateLimiter {
-    buckets: Mutex<HashMap<String, (f64, f64)>>,
+    buckets: Mutex<HashMap<String, RateLimitBucket>>,
     last_cleanup: Mutex<f64>,
+    last_capacity_cleanup: Mutex<Option<f64>>,
+    capacity: usize,
 }
 
 impl RateLimiter {
@@ -17253,6 +18368,8 @@ impl RateLimiter {
         Self {
             buckets: Mutex::new(HashMap::new()),
             last_cleanup: Mutex::new(now),
+            last_capacity_cleanup: Mutex::new(None),
+            capacity: RATE_LIMIT_MAX_BUCKETS,
         }
     }
 
@@ -17267,8 +18384,9 @@ impl RateLimiter {
         if per_minute == 0 {
             return true;
         }
-        let rate_per_sec = f64::from(per_minute) / 60.0;
-        let burst = f64::from(burst.max(1));
+        if key.len() > RATE_LIMIT_MAX_KEY_BYTES || !now.is_finite() {
+            return false;
+        }
 
         if do_cleanup {
             self.cleanup(now);
@@ -17279,27 +18397,37 @@ impl RateLimiter {
                 .buckets
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let (tokens0, ts) = buckets.get(key).copied().unwrap_or((burst, now));
-            let elapsed = (now - ts).max(0.0);
-            let mut tokens = (tokens0 + elapsed * rate_per_sec).min(burst);
-
-            let allowed = tokens >= 1.0;
-            if allowed {
-                tokens -= 1.0;
+            if let Some(bucket) = buckets.get_mut(key) {
+                return bucket.consume(per_minute, burst, now);
+            }
+            if buckets.len() >= self.capacity {
+                // Reclaim only quotas that have completely recovered. Rate
+                // limit the bounded scan too: a stream of unknown keys must
+                // not cause an O(capacity) scan on every denied request.
+                let mut last = self
+                    .last_capacity_cleanup
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if last.is_none_or(|last| now - last >= RATE_LIMIT_CAPACITY_CLEANUP_INTERVAL_SECS) {
+                    buckets.retain(|_, bucket| !bucket.fully_refilled(now));
+                    *last = Some(now);
+                }
+                if buckets.len() >= self.capacity {
+                    return false;
+                }
             }
 
-            let new_state = (tokens, now);
-            if let Some(entry) = buckets.get_mut(key) {
-                *entry = new_state;
-            } else {
-                buckets.insert(key.to_string(), new_state);
-            }
-
+            let mut bucket = RateLimitBucket::new(per_minute, burst, now);
+            let allowed = bucket.consume(per_minute, burst, now);
+            buckets.insert(key.to_string(), bucket);
             allowed
         }
     }
 
     fn cleanup(&self, now: f64) {
+        if !now.is_finite() {
+            return;
+        }
         {
             let mut last = self
                 .last_cleanup
@@ -17316,7 +18444,9 @@ impl RateLimiter {
             .buckets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        buckets.retain(|_, (_, ts)| *ts >= cutoff);
+        // An idle hour does not repay a large, slow-refilling burst. Forgetting
+        // that debt would grant more requests than the configured quota.
+        buckets.retain(|_, bucket| bucket.observed_at >= cutoff || !bucket.fully_refilled(now));
     }
 }
 
@@ -18138,6 +19268,8 @@ const fn http_error_status(
 
 #[cfg(test)]
 mod tests {
+    mod issue374_http;
+
     use super::*;
     use asupersync::http::h1::types::Version as Http1Version;
     use chrono::Utc;
@@ -18652,6 +19784,126 @@ mod tests {
 
     struct NoopTool;
 
+    struct DiagnosticPayloadProbeTool {
+        expected: serde_json::Value,
+        reject: bool,
+    }
+
+    impl fastmcp::ToolHandler for DiagnosticPayloadProbeTool {
+        fn definition(&self) -> Tool {
+            fastmcp::ToolHandler::definition(&NoopTool)
+        }
+
+        fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            assert_eq!(
+                arguments, self.expected,
+                "diagnostics must not change tool inputs"
+            );
+            if self.reject {
+                Err(mcp_agent_mail_tools::tool_util::legacy_tool_error(
+                    "CONTACT_REQUIRED",
+                    "controlled refusal",
+                    false,
+                    serde_json::json!({}),
+                ))
+            } else {
+                Ok(vec![Content::Text {
+                    text: serde_json::json!({
+                        "api_key": "original-result-credential",
+                        "body": "unmodified result body".repeat(128),
+                    })
+                    .to_string(),
+                }])
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostic_dispatch_bounds_ordinary_and_rejected_calls_without_changing_payloads() {
+        let _guard = TUI_STATE_TEST_LOCK.lock().unwrap();
+        let previous = tui_state_handle();
+        let state = tui_bridge::TuiSharedState::with_event_capacity(
+            &mcp_agent_mail_core::Config::default(),
+            32,
+        );
+        set_tui_state_handle(Some(state.clone()));
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        for asynchronous in [false, true] {
+            for reject in [false, true] {
+                let arguments = serde_json::json!({
+                    "project_key": "p".repeat(16 * 1024),
+                    "agent_name": "DiagnosticBoundaryAgent",
+                    "body_md": "é".repeat(32 * 1024),
+                    "sender_token": "original-request-credential",
+                });
+                let tool = InstrumentedTool {
+                    tool_index: mcp_agent_mail_tools::tool_index("send_message").unwrap(),
+                    tool_name: "send_message",
+                    inner: DiagnosticPayloadProbeTool {
+                        expected: arguments.clone(),
+                        reject,
+                    },
+                };
+                let result = if asynchronous {
+                    match block_on(tool.call_async(&ctx, arguments)) {
+                        fastmcp_core::Outcome::Ok(contents) => Ok(contents),
+                        fastmcp_core::Outcome::Err(error) => Err(error),
+                        other => panic!("unexpected diagnostic test outcome: {other:?}"),
+                    }
+                } else {
+                    tool.call(&ctx, arguments)
+                };
+                assert_eq!(result.is_err(), reject);
+                if let Ok(contents) = result {
+                    let Content::Text { text } = &contents[0] else {
+                        panic!("text result")
+                    };
+                    assert!(text.contains("original-result-credential"));
+                    assert!(text.len() > 2048, "response to caller remains complete");
+                }
+            }
+        }
+        let events = state.recent_events(32);
+        assert_eq!(events.len(), 8);
+        for event in &events {
+            assert!(event.retained_bytes() < tui_events::MAX_EVENT_RETAINED_BYTES);
+            match event {
+                tui_events::MailEvent::ToolCallStart {
+                    params_json,
+                    project,
+                    agent,
+                    ..
+                } => {
+                    assert!(project.is_none());
+                    assert_eq!(agent.as_deref(), Some("DiagnosticBoundaryAgent"));
+                    let preview = params_json.to_string();
+                    assert!(preview.contains("truncated"));
+                    assert!(!preview.contains("original-request-credential"));
+                }
+                tui_events::MailEvent::ToolCallEnd {
+                    result_preview,
+                    project,
+                    ..
+                } => {
+                    assert!(project.is_none());
+                    if let Some(preview) = result_preview {
+                        assert!(preview.len() <= 200);
+                        assert!(!preview.contains("original-result-credential"));
+                    }
+                }
+                other => panic!("unexpected diagnostic event: {other:?}"),
+            }
+        }
+        let calls = mcp_agent_mail_tools::recent_calls_since(0);
+        let ours: Vec<_> = calls
+            .iter()
+            .filter(|call| call.agent.as_deref() == Some("DiagnosticBoundaryAgent"))
+            .collect();
+        assert_eq!(ours.len(), 4);
+        assert!(ours.iter().all(|call| call.project.is_none()));
+        set_tui_state_handle(previous);
+    }
+
     impl fastmcp::ToolHandler for NoopTool {
         fn definition(&self) -> Tool {
             Tool {
@@ -19152,7 +20404,13 @@ mod tests {
             },
         };
 
-        let text = dispatch_timeout_error_text("send_message", 30, &diagnostics, None);
+        let text = dispatch_timeout_error_text(
+            "send_message",
+            30,
+            &diagnostics,
+            None,
+            &mcp_agent_mail_core::lock_order::LockActivitySnapshot::default(),
+        );
         assert!(text.contains("stage=blocking_dispatch_unattributed"));
         assert!(text.contains("stage_exceeded_budget=false"));
         assert!(text.contains("pool_acquire_p99_ms=9"));
@@ -19162,6 +20420,9 @@ mod tests {
         assert!(text.contains("blocking_dispatch_zombies_expired=0"));
         assert!(text.contains("p99_window_secs=600"));
         assert!(text.contains("off the request path since ack-fast"));
+        assert!(text.contains("lock_observation_available=false"));
+        assert!(text.contains("lock_observation_complete=false"));
+        assert!(text.contains("not request attribution"));
         assert!(!text.contains("database may be under heavy contention"));
     }
 
@@ -19195,8 +20456,13 @@ mod tests {
             held_for: Duration::from_millis(29_500),
         };
 
-        let text =
-            dispatch_timeout_error_text("file_reservation_paths", 30, &diagnostics, Some(&holder));
+        let text = dispatch_timeout_error_text(
+            "file_reservation_paths",
+            30,
+            &diagnostics,
+            Some(&holder),
+            &mcp_agent_mail_core::lock_order::LockActivitySnapshot::default(),
+        );
         assert!(text.contains("stage=archive_publication_fence"), "{text}");
         assert!(text.contains("archive_fence_wait_ms=29400"), "{text}");
         assert!(
@@ -19210,6 +20476,63 @@ mod tests {
             !text.contains("archive lag cannot cause a tool timeout"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn dispatch_lock_wait_summary_bounds_evidence_and_discloses_omissions() {
+        use mcp_agent_mail_core::lock_order::{
+            LockAccess, LockActivity, LockActivitySnapshot, LockParticipant,
+        };
+
+        let participant = LockParticipant {
+            thread_id: "ThreadId(27)".into(),
+            thread_name: Some("archive-worker".into()),
+            access: LockAccess::Mutex,
+            file: "crates/mcp-agent-mail-storage/src/lib.rs".into(),
+            line: 17,
+            column: 9,
+            elapsed_ns: 31_000_000_000,
+            labels_truncated: false,
+        };
+        let mut snapshot = LockActivitySnapshot {
+            available: true,
+            locks: (1..=8)
+                .map(|instance_id| LockActivity {
+                    instance_id,
+                    lock_name: "StorageCommitQueue".into(),
+                    rank: 60,
+                    holder_count: 1,
+                    waiter_count: 1,
+                    oldest_observed_wait_ns: 31_000_000_000,
+                    holders: vec![participant.clone()],
+                    waiters: vec![participant.clone()],
+                    omitted_participants: 0,
+                })
+                .collect(),
+            ..LockActivitySnapshot::default()
+        };
+        let summary = dispatch_lock_wait_summary(&snapshot);
+        assert!(summary.len() <= DISPATCH_LOCK_SUMMARY_MAX_BYTES);
+        assert!(summary.contains("observed_blocked_locks=8"));
+        assert!(summary.contains("summary_omitted_locks=4"));
+        assert!(summary.contains("StorageCommitQueue#1"));
+        assert!(!summary.contains("StorageCommitQueue#5"));
+        assert!(summary.contains("archive-worker"));
+        assert!(summary.contains("oldest_wait_ms=31000"));
+        assert!(summary.contains("not request attribution"));
+
+        // Even an unexpected overlong public value cannot expand a timeout
+        // response beyond its independent budget; the full snapshot is logged.
+        snapshot.locks[0].lock_name = "large".repeat(DISPATCH_LOCK_SUMMARY_MAX_BYTES);
+        let bounded = dispatch_lock_wait_summary(&snapshot);
+        assert!(bounded.len() <= DISPATCH_LOCK_SUMMARY_MAX_BYTES);
+        assert!(bounded.contains("summary_omitted_locks=8"));
+        snapshot.available = false;
+        let unavailable = dispatch_lock_wait_summary(&snapshot);
+        assert!(unavailable.contains("lock_observation_available=false"));
+        assert!(unavailable.contains("lock_observation_complete=false"));
+        assert!(!unavailable.contains("archive-worker"));
+        assert!(unavailable.contains("does not establish no blockers"));
     }
 
     #[test]
@@ -19829,6 +21152,159 @@ mod tests {
         assert!(message.contains("run repair"), "got: {message}");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stdio_shutdown_notifies_sleeping_services_before_waiting_for_operator_lock() {
+        const TEST: &str =
+            "tests::stdio_shutdown_notifies_sleeping_services_before_waiting_for_operator_lock";
+        fn live_services() -> std::collections::BTreeSet<String> {
+            std::fs::read_dir("/proc/self/task")
+                .expect("inspect real server threads")
+                .filter_map(|entry| {
+                    let entry = entry.expect("read server thread entry");
+                    let name = std::fs::read_to_string(entry.path().join("comm"));
+                    if name
+                        .as_ref()
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        return None;
+                    }
+                    let name = name.expect("read server thread name");
+                    [
+                        "integrity-guard",
+                        "disk-monitor",
+                        "archive-mainten",
+                        "retention-quota",
+                        "active-lease",
+                        "degraded-acknow",
+                        "degraded-releas",
+                        "degraded-replay",
+                    ]
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+                    .then(|| entry.file_name().into_string().expect("numeric thread ID"))
+                })
+                .collect()
+        }
+
+        struct StopServices<'a>(&'a mcp_agent_mail_core::Config);
+        impl Drop for StopServices<'_> {
+            fn drop(&mut self) {
+                shutdown_runtime_services(self.0);
+            }
+        }
+
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        let config = prepared_http_test_config();
+        let _cleanup = StopServices(&config);
+        integrity_guard::start(&config);
+        disk_monitor::start(&config);
+        maintenance::start(&config);
+        retention::start(&config);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while live_services().len() != 8 {
+            assert!(
+                Instant::now() < deadline,
+                "all eight real service workers must start"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        std::thread::scope(|scope| {
+            // Hold the actual first shutdown lock. Without early notifications,
+            // the other services keep sleeping until this lock is released.
+            let operator = lock_mutex(&ATC_OPERATOR_RUNTIME);
+            let shutdown = scope.spawn(|| shutdown_runtime_services(&config));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !live_services().is_empty() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let stopped_before_release = live_services().is_empty();
+            let waiting_for_operator = !shutdown.is_finished();
+            // Release before joining or asserting, including on a failed control.
+            drop(operator);
+            shutdown.join().expect("join shared shutdown");
+            assert!(
+                waiting_for_operator,
+                "shared shutdown must wait for its owner"
+            );
+            assert!(
+                stopped_before_release,
+                "sleeping services did not stop while the operator lock was held"
+            );
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stdio_shutdown_joins_all_retention_workers_before_closing_mailbox() {
+        const TEST: &str =
+            "tests::stdio_shutdown_joins_all_retention_workers_before_closing_mailbox";
+        fn live_retention_workers() -> std::collections::BTreeSet<String> {
+            std::fs::read_dir("/proc/self/task")
+                .expect("inspect real server threads")
+                .filter_map(|entry| {
+                    let entry = entry.expect("read server thread entry");
+                    let name = std::fs::read_to_string(entry.path().join("comm"));
+                    if name
+                        .as_ref()
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        return None;
+                    }
+                    let name = name.expect("read server thread name");
+                    [
+                        "retention-quota",
+                        "active-lease",
+                        "degraded-ack",
+                        "degraded-releas",
+                        "degraded-replay",
+                    ]
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+                    .then(|| entry.file_name().into_string().expect("numeric thread ID"))
+                })
+                .collect()
+        }
+
+        struct StopRetention;
+        impl Drop for StopRetention {
+            fn drop(&mut self) {
+                retention::shutdown();
+            }
+        }
+
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        let config = prepared_http_test_config();
+        assert!(live_retention_workers().is_empty());
+        let _cleanup = StopRetention;
+        retention::start(&config);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while live_retention_workers().len() != 5 {
+            assert!(
+                Instant::now() < deadline,
+                "all five real workers must start"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        shutdown_runtime_services(&config);
+        // A joined thread's procfs entry may briefly outlive its user code.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !live_retention_workers().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "shared shutdown left retention workers alive: {:?}",
+                live_retention_workers()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn stdio_database_bootstrap_installs_schema_before_background_workers() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -19901,7 +21377,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("primary after refusal"), before);
     }
 
-    fn run_prepared_http_test_in_child(test_name: &str) -> bool {
+    pub fn run_prepared_http_test_in_child(test_name: &str) -> bool {
         const CHILD_TEST: &str = "AM_PREPARED_HTTP_STARTUP_TEST_CHILD";
         if std::env::var(CHILD_TEST).as_deref() == Ok(test_name) {
             return false;
@@ -19938,6 +21414,8 @@ mod tests {
             "isolated {test_name} did not pass exactly one test: {stdout}\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        print!("{stdout}");
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
         true
     }
 
@@ -19983,6 +21461,8 @@ mod tests {
         let mut config = prepared_http_test_config();
         let expected_storage = config.storage_root.clone();
         let (control_tx, control_rx) = mpsc::channel(1);
+        let watchdog_control = control_tx.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let observed = Arc::new(std::sync::Mutex::new(None));
         let callback_observed = Arc::clone(&observed);
         startup_checks::take_startup_work_counts();
@@ -19993,23 +21473,52 @@ mod tests {
                 let connected =
                     std::net::TcpStream::connect((bound.http_host.as_str(), bound.http_port))
                         .is_ok();
-                *callback_observed.lock().expect("callback result") =
-                    Some((bound.storage_root.clone(), bound.http_port, connected));
+                let admitted = resolve_serving_config(bound).is_ok_and(|actual| {
+                    mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_config(&actual))
+                        .is_some_and(|pool| {
+                            let probe = probe_serving_mail_pool(
+                                &pool,
+                                serving_search_uses_lexical(&actual),
+                            );
+                            pool.is_initialized()
+                                && probe.database.is_ok()
+                                && probe.lexical.failure().is_none()
+                        })
+                });
+                *callback_observed.lock().expect("callback result") = Some((
+                    bound.storage_root.clone(),
+                    bound.http_port,
+                    connected,
+                    admitted,
+                ));
+                let _ = ready_tx.send(());
                 let _ = control_tx.try_send(tui_bridge::ServerControlMsg::Shutdown);
             });
         assert_eq!(startup_checks::take_startup_work_counts(), [1, 1, 1, 1]);
         // Mutation of the caller's config cannot retarget an existing token.
         config.storage_root = dir.path().join("different-archive");
         config.http_host = "invalid.invalid".to_string();
-        startup
-            .run_with_control(control_rx)
-            .expect("serve and drain");
+        std::thread::scope(|threads| {
+            let watchdog = threads.spawn(move || {
+                if ready_rx.recv_timeout(Duration::from_secs(30)).is_err() {
+                    let _ = watchdog_control.try_send(tui_bridge::ServerControlMsg::Shutdown);
+                }
+            });
+            let result = startup.run_with_control(control_rx);
+            watchdog.join().expect("join readiness watchdog");
+            result.expect("serve and drain");
+        });
         assert_eq!(startup_checks::take_startup_work_counts(), [0; 4]);
         let observation = observed.lock().expect("callback result");
-        let (storage, port, connected) = observation.as_ref().expect("ready callback ran");
+        let (storage, port, connected, admitted) =
+            observation.as_ref().expect("ready callback ran");
         assert_eq!(storage, &expected_storage);
         assert_ne!(*port, 0, "callback must receive actual bound port");
         assert!(*connected, "callback must follow listener bind");
+        assert!(
+            *admitted,
+            "callback must follow real mail and lexical admission"
+        );
         assert!(
             !config.storage_root.exists(),
             "caller mutation must not retarget startup"
@@ -20241,7 +21750,7 @@ mod tests {
             ..mcp_agent_mail_core::Config::default()
         };
 
-        let result = readiness_check(&config);
+        let result = with_health_serving_env(&config, || readiness_check(&config));
         assert!(
             result.is_ok(),
             "missing DB should be auto-initialized/recovered before startup integrity check: {result:?}"
@@ -20263,17 +21772,19 @@ mod tests {
             integrity_check_on_startup: true,
             ..mcp_agent_mail_core::Config::default()
         };
-        let _ = integrity_guard::take_startup_probe_note_for_test();
+        with_health_serving_env(&config, || {
+            let _ = integrity_guard::take_startup_probe_note_for_test();
 
-        readiness_check(&config).expect("first readiness");
-        assert!(
-            integrity_guard::take_startup_probe_note_for_test(),
-            "a startup quick-check that ran must spare the guard's first cycle"
-        );
-        // Unchanged mailbox: the fingerprint cache skips the startup check, so
-        // the guard must run its own first cycle.
-        readiness_check(&config).expect("second readiness");
-        assert!(!integrity_guard::take_startup_probe_note_for_test());
+            readiness_check(&config).expect("first readiness");
+            assert!(
+                integrity_guard::take_startup_probe_note_for_test(),
+                "a startup quick-check that ran must spare the guard's first cycle"
+            );
+            // Unchanged mailbox: the fingerprint cache skips the startup check, so
+            // the guard must run its own first cycle.
+            readiness_check(&config).expect("second readiness");
+            assert!(!integrity_guard::take_startup_probe_note_for_test());
+        });
     }
 
     #[test]
@@ -20408,7 +21919,8 @@ mod tests {
         )
         .expect("acquire exclusive sqlite mailbox lock");
 
-        let error = readiness_check(&config).expect_err("busy mailbox should block readiness init");
+        let error = with_health_serving_env(&config, || readiness_check(&config))
+            .expect_err("busy mailbox should block readiness init");
         assert!(
             error.contains("mailbox activity lock is busy") || error.contains("temporarily busy"),
             "busy readiness error should mention mailbox contention: {error}"
@@ -20951,63 +22463,79 @@ first body
                 ..mcp_agent_mail_core::Config::default()
             };
 
-            let state = build_state(config);
-            let req = make_request(Http1Method::Get, "/health/readiness", &[]);
-            let resp = block_on(state.handle(req));
-            assert_eq!(resp.status, 200);
-            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-            assert_eq!(body["status"], "ready");
-            assert_eq!(body["durability_state"], "not_probed");
-            assert!(body["project_count"].is_null());
-            assert!(body["message_count"].is_null());
+            with_health_serving_env(&config, || {
+                let state = build_state(config.clone());
+                let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+                let resp = block_on(state.handle(req));
+                assert_eq!(resp.status, 503);
+                let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+                assert_eq!(body["status"], "unavailable");
+                assert_eq!(body["reason"], "database_initializing");
+                assert_eq!(body["durability_state"], "not_probed");
+                assert!(body["project_count"].is_null());
+                assert!(body["message_count"].is_null());
 
-            let conn =
-                DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open probed db");
-            let rows = conn
-                .query_sync(
-                    "SELECT \
+                let conn =
+                    DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open probed db");
+                let rows = conn
+                    .query_sync(
+                        "SELECT \
                     (SELECT COUNT(*) FROM projects) AS project_count, \
                     (SELECT COUNT(*) FROM agents) AS agent_count, \
                     (SELECT COUNT(*) FROM messages) AS message_count",
-                    &[],
-                )
-                .expect("query probed inventory");
-            let row = rows.first().expect("inventory row");
-            assert_eq!(row.get_named::<i64>("project_count").unwrap_or(0), 0);
-            assert_eq!(row.get_named::<i64>("agent_count").unwrap_or(0), 0);
-            assert_eq!(row.get_named::<i64>("message_count").unwrap_or(0), 0);
+                        &[],
+                    )
+                    .expect("query probed inventory");
+                let row = rows.first().expect("inventory row");
+                assert_eq!(row.get_named::<i64>("project_count").unwrap_or(0), 0);
+                assert_eq!(row.get_named::<i64>("agent_count").unwrap_or(0), 0);
+                assert_eq!(row.get_named::<i64>("message_count").unwrap_or(0), 0);
+            });
         });
     }
 
     #[test]
     fn health_readiness_fails_fast_when_sqlite_activity_lock_is_exclusive() {
+        if run_prepared_http_test_in_child(
+            "tests::health_readiness_fails_fast_when_sqlite_activity_lock_is_exclusive",
+        ) {
+            return;
+        }
         with_serialized_health_route(|| {
             let temp = tempfile::tempdir().expect("tempdir");
-            let storage_root = temp.path().join("storage");
             let db_path = temp.path().join("locked-health.sqlite3");
-            let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
-            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
-                .expect("init schema");
-            drop(conn);
-
-            let _exclusive = acquire_mailbox_activity_lock_for_sqlite_path(
-                &db_path,
-                MailboxActivityLockMode::Exclusive,
-            )
-            .expect("acquire exclusive sqlite activity lock");
-
             let config = mcp_agent_mail_core::Config {
-                database_url: format!("sqlite:///{}", db_path.display()),
-                storage_root,
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&db_path),
+                storage_root: temp.path().join("storage"),
                 integrity_check_on_startup: false,
                 ..Default::default()
             };
-            let state = build_state(config);
-            let req = make_request(Http1Method::Get, "/health/readiness", &[]);
-            let resp = block_on(state.handle(req));
-            assert_eq!(resp.status, 503);
-            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-            assert_eq!(body["detail"], "service unavailable");
+            with_ready_health_state(config, |state, _archive| {
+                let pool = lock_mutex(&state.mail_readiness).pool.clone().unwrap();
+                let _exclusive = acquire_mailbox_activity_lock_for_sqlite_path(
+                    &db_path,
+                    MailboxActivityLockMode::Exclusive,
+                )
+                .expect("acquire exclusive sqlite activity lock");
+                let observed_at = Instant::now();
+                let value =
+                    probe_serving_mail_pool(&pool, serving_search_uses_lexical(&state.config));
+                assert!(
+                    value.database.is_err(),
+                    "pooled health bypassed recovery admission"
+                );
+                assert!(observed_at.elapsed() < Duration::from_secs(1));
+                lock_mutex(&state.mail_readiness).sample =
+                    Some(HealthSample { observed_at, value });
+
+                let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+                let resp = block_on(state.handle(req));
+                assert_eq!(resp.status, 503);
+                let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+                assert_eq!(body["reason"], "database_probe_failed");
+                let live = block_on(state.handle(make_request(Http1Method::Get, "/healthz", &[])));
+                assert_eq!(live.status, 200);
+            });
         });
     }
 
@@ -21068,11 +22596,371 @@ first body
     }
 
     #[test]
+    fn startup_readiness_shutdown_cancels_pending_native_acquisition_and_retries() {
+        const TEST: &str =
+            "tests::startup_readiness_shutdown_cancels_pending_native_acquisition_and_retries";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        let mut config = prepared_http_test_config();
+        config.integrity_check_on_startup = false;
+        config.database_pool_size = Some(1);
+        config.database_max_overflow = Some(0);
+        with_health_serving_env(&config, || {
+            let pool = create_pool(&DbPoolConfig::from_env())
+                .expect("one-connection serving/readiness pool");
+            let cx = runtime_request_cx(Budget::INFINITE);
+
+            for tui in [false, true] {
+                let held = block_on(pool.acquire(&cx))
+                    .into_result()
+                    .expect("hold the actual readiness pool's sole connection");
+                held.query_sync("SELECT 1 FROM projects LIMIT 0", &[])
+                    .expect("native schema remains usable");
+                let scope = StartupWorkerScope::default();
+                let state = tui_bridge::TuiSharedState::new(&config);
+                if tui {
+                    spawn_tui_readiness_warmup(&config, &state, &scope.workers);
+                } else {
+                    // Exercise the same headless readiness worker after its bind
+                    // wait expires. The production wrapper keeps the 20s default.
+                    run_startup_readiness_with_bind_deadline(
+                        &config,
+                        &scope.workers,
+                        Duration::from_millis(10),
+                    );
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let parked = loop {
+                    pool.sample_pool_stats_now();
+                    if mcp_agent_mail_core::global_metrics()
+                        .db
+                        .pool_pending_requests
+                        .load()
+                        != 0
+                    {
+                        break true;
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                let retained = lock_mutex(&scope.workers.state)
+                    .workers
+                    .iter()
+                    .any(|(_, worker)| !worker.is_finished());
+                let workers = Arc::clone(&scope.workers);
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let (finished_while_held, pending_after_stop) = std::thread::scope(|threads| {
+                    let shutdown = threads.spawn(move || {
+                        if tui {
+                            scope.workers.shutdown();
+                        }
+                        // The headless case exercises the same ownership guard
+                        // used on an early return after the bind wait expired.
+                        drop(scope);
+                        done_tx.send(()).unwrap();
+                    });
+                    let finished = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+                    pool.sample_pool_stats_now();
+                    let pending = mcp_agent_mail_core::global_metrics()
+                        .db
+                        .pool_pending_requests
+                        .load();
+                    // Release and reap even if cancellation is broken, so a
+                    // negative control fails without leaving an orphan waiter.
+                    drop(held);
+                    shutdown.join().expect("join readiness shutdown");
+                    (finished, pending)
+                });
+                assert!(
+                    parked,
+                    "readiness must reach a real pending pool acquisition"
+                );
+                assert!(
+                    retained,
+                    "bind timeout must retain the active readiness worker"
+                );
+                assert!(
+                    finished_while_held,
+                    "shutdown waited for the foreign pool lease"
+                );
+                assert_eq!(pending_after_stop, 0, "cancelled native waiter leaked");
+                assert_eq!(STARTUP_DATABASE_INITIALIZERS.load(Ordering::Acquire), 0);
+                assert!(lock_mutex(&workers.state).workers.is_empty());
+                assert_eq!(state.db_warmup_state(), tui_bridge::DbWarmupState::Pending);
+
+                let retry = StartupWorkerScope::default();
+                let retry_state = tui_bridge::TuiSharedState::new(&config);
+                spawn_tui_readiness_warmup(&config, &retry_state, &retry.workers);
+                let ready = retry_state.wait_for_db_ready(Duration::from_secs(20));
+                retry.workers.shutdown();
+                assert!(ready, "a later startup must acquire the same native pool");
+                let conn = block_on(pool.acquire(&cx))
+                    .into_result()
+                    .expect("pool reusable");
+                conn.query_sync("SELECT 1 FROM messages LIMIT 0", &[])
+                    .expect("mailbox still readable after cancelled readiness");
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn startup_search_delay_is_owned_and_next_startup_indexes_retained_mail() {
+        const TEST: &str =
+            "tests::startup_search_delay_is_owned_and_next_startup_indexes_retained_mail";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        let config = prepared_http_test_config();
+        let path = resolve_server_database_url_sqlite_path(&config.database_url).unwrap();
+        let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(path.display().to_string())
+            .expect("open retained mailbox");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'first', 'first', 1), (2, 'second', 'second', 1); \
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES \
+             (1, 1, 'BlueLake', 'test', 'test', 1, 1), (2, 2, 'RedFox', 'test', 'test', 1, 1); \
+             INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) VALUES \
+             (1, 1, 1, 'retainedstartupmail', 'first project', 1), \
+             (2, 2, 2, 'retainedstartupmail', 'second project', 2);",
+        ).expect("seed retained mail in two projects");
+        drop(conn);
+        let pool = create_pool(&DbPoolConfig::from_env()).expect("actual serving pool");
+        let cx = runtime_request_cx(Budget::INFINITE);
+        drop(
+            block_on(pool.acquire(&cx))
+                .into_result()
+                .expect("initialize serving generation"),
+        );
+        mcp_agent_mail_db::search_v3::init_or_switch_bridge(
+            &config.storage_root.join("search_index"),
+        )
+        .expect("real Tantivy index");
+        let delayed = StartupWorkerScope::default();
+        spawn_startup_search_backfill_after(&config, &delayed.workers, Duration::from_secs(8));
+        assert!(STARTUP_SEARCH_MAINTENANCE_RUNNING.load(Ordering::Acquire));
+        let started = Instant::now();
+        delayed.workers.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown slept through the startup delay"
+        );
+        assert!(!STARTUP_SEARCH_MAINTENANCE_RUNNING.load(Ordering::Acquire));
+        let bridge = mcp_agent_mail_db::search_v3::get_bridge().unwrap();
+        let query =
+            mcp_agent_mail_db::search_planner::SearchQuery::messages("retainedstartupmail", 1);
+        assert!(
+            bridge.search(&query).is_empty(),
+            "cancelled delay must not publish documents"
+        );
+
+        let retry = StartupWorkerScope::default();
+        spawn_startup_search_backfill_after(&config, &retry.workers, Duration::ZERO);
+        let wait_for_verified = || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !mcp_agent_mail_db::search_service::lexical_readiness(&pool).verified {
+                assert!(
+                    Instant::now() < deadline,
+                    "owned maintenance did not certify its source"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait_for_verified();
+        assert!(STARTUP_SEARCH_MAINTENANCE_RUNNING.load(Ordering::Acquire));
+        let first = bridge.search(&query);
+        let second = bridge.search(&mcp_agent_mail_db::search_planner::SearchQuery::messages(
+            "retainedstartupmail",
+            2,
+        ));
+        assert_eq!(first.iter().map(|hit| hit.id).collect::<Vec<_>>(), [1]);
+        assert_eq!(second.iter().map(|hit| hit.id).collect::<Vec<_>>(), [2]);
+
+        // Normal traffic can append after the initial pass without losing
+        // usable generation coverage. A bounded source observation asks the
+        // same owned worker to catch up; no search request performs the repair.
+        let conn = block_on(pool.acquire(&cx))
+            .into_result()
+            .expect("serving append");
+        conn.execute_raw(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+             VALUES (3, 1, 1, 'laterstartupmail', 'appended after readiness', 3);",
+        )
+        .expect("append real message");
+        drop(conn);
+        let appended = block_on(mcp_agent_mail_db::search_service::probe_lexical_readiness(
+            &cx, &pool,
+        ))
+        .into_result()
+        .expect("observe append");
+        assert!(
+            appended.available,
+            "ordinary append must not flap service admission"
+        );
+        assert!(appended.catch_up_required || appended.verified);
+        wait_for_verified();
+        let appended_hits = bridge.search(
+            &mcp_agent_mail_db::search_planner::SearchQuery::messages("laterstartupmail", 1),
+        );
+        assert_eq!(
+            appended_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            [3]
+        );
+
+        let conn = block_on(pool.acquire(&cx))
+            .into_result()
+            .expect("serving rewrite");
+        conn.execute_raw(
+            "UPDATE messages SET subject = 'repairedstartupmail', body_md = 'rewritten body' WHERE id = 1;",
+        ).expect("rewrite real message");
+        drop(conn);
+        let rewritten = block_on(mcp_agent_mail_db::search_service::probe_lexical_readiness(
+            &cx, &pool,
+        ))
+        .into_result()
+        .expect("observe rewrite");
+        assert!(
+            !rewritten.available || rewritten.verified,
+            "known rewrite cannot preserve stale usable coverage"
+        );
+        wait_for_verified();
+        let rewritten_hits = bridge.search(
+            &mcp_agent_mail_db::search_planner::SearchQuery::messages("repairedstartupmail", 1),
+        );
+        assert_eq!(
+            rewritten_hits.iter().map(|hit| hit.id).collect::<Vec<_>>(),
+            [1]
+        );
+        assert!(
+            bridge.search(&query).is_empty(),
+            "old rewritten subject remains visible"
+        );
+
+        let stopped_at = Instant::now();
+        retry.workers.shutdown();
+        assert!(
+            stopped_at.elapsed() < Duration::from_secs(2),
+            "idle maintenance did not wake"
+        );
+        assert!(!STARTUP_SEARCH_MAINTENANCE_RUNNING.load(Ordering::Acquire));
+        assert!(lock_mutex(&retry.workers.state).workers.is_empty());
+    }
+
+    #[test]
+    fn startup_advisory_and_healer_workers_complete_before_scope_release() {
+        const TEST: &str =
+            "tests::startup_advisory_and_healer_workers_complete_before_scope_release";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        let config = prepared_http_test_config();
+        let path = resolve_server_database_url_sqlite_path(&config.database_url).unwrap();
+        let conn =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(path.display().to_string()).unwrap();
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'probe', 'probe', 1); \
+             INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+             VALUES (1, 1, 'BlueLake', 'test', 'test', 1, 1); \
+             INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+             VALUES (1, 1, 1, 'real advisory probe', 'retained body', 1000000);",
+        ).unwrap();
+        drop(conn);
+        let project = config.storage_root.join("projects/probe");
+        std::fs::create_dir_all(&project).unwrap();
+        let stale = project.join("stale.lock");
+        std::fs::write(&stale, b"preserved stale lock evidence").unwrap();
+        let authority =
+            acquire_mailbox_activity_lock_for_sqlite_path(&path, MailboxActivityLockMode::Shared)
+                .unwrap();
+        let scope = StartupWorkerScope::default();
+        start_storage_lock_healing(&config, &scope.workers);
+        start_advisory_consistency_probe(&config, &scope.workers);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let complete = loop {
+            let registry = lock_mutex(&scope.workers.state);
+            let complete = registry.workers.len() == 2
+                && registry
+                    .workers
+                    .iter()
+                    .all(|(_, worker)| worker.is_finished());
+            drop(registry);
+            if complete || Instant::now() >= deadline {
+                break complete;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        scope.workers.shutdown();
+        assert!(complete, "actual one-shot startup work did not finish");
+        assert!(!stale.exists());
+        let evidence = std::fs::read_dir(&project)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("stale.lock.startup-quarantine-")
+            })
+            .expect("healer must preserve the real lock artifact");
+        assert_eq!(
+            std::fs::read(evidence).unwrap(),
+            b"preserved stale lock evidence"
+        );
+        assert_eq!(
+            mcp_agent_mail_core::global_metrics()
+                .storage
+                .needs_reindex_total
+                .load(),
+            1
+        );
+        assert!(lock_mutex(&scope.workers.state).workers.is_empty());
+        std::fs::write(&stale, b"later server owns this artifact").unwrap();
+        start_storage_lock_healing(&config, &scope.workers);
+        start_advisory_consistency_probe(&config, &scope.workers);
+        assert_eq!(
+            std::fs::read(stale).unwrap(),
+            b"later server owns this artifact"
+        );
+        assert!(lock_mutex(&scope.workers.state).workers.is_empty());
+        drop(scope);
+        drop(authority);
+        acquire_mailbox_activity_lock_for_sqlite_path(&path, MailboxActivityLockMode::Exclusive)
+            .expect("mailbox authority can pass to the next owner");
+    }
+
+    #[test]
+    fn deferred_starter_drop_joins_before_first_paint_and_preserves_explicit_detach() {
+        let config = mcp_agent_mail_core::Config::default();
+        for detach in [false, true] {
+            let scope = StartupWorkerScope::default();
+            let state = tui_bridge::TuiSharedState::new(&config);
+            let mut starter =
+                spawn_tui_deferred_background_workers(&config, &state, &scope.workers);
+            let progress = Arc::clone(&starter.progress);
+            if detach {
+                state.request_headless_detach();
+                starter.join();
+                assert!(state.take_headless_detach_requested());
+            }
+            let before_drop = Instant::now();
+            drop(starter);
+            assert!(before_drop.elapsed() < Duration::from_secs(2));
+            assert_eq!(state.is_shutdown_requested(), !detach);
+            assert!(!progress.non_db.load(Ordering::Acquire));
+            assert!(!progress.db.load(Ordering::Acquire));
+            assert!(!progress.advisory.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
     fn init_search_bridge_skips_startup_backfill_for_memory_db() {
         let _guard = TUI_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        STARTUP_SEARCH_BACKFILL_IN_PROGRESS.store(false, Ordering::Release);
+        STARTUP_SEARCH_MAINTENANCE_RUNNING.store(false, Ordering::Release);
 
         let temp = tempfile::tempdir().expect("tempdir");
         let config = mcp_agent_mail_core::Config {
@@ -21081,13 +22969,16 @@ first body
             ..mcp_agent_mail_core::Config::default()
         };
 
-        init_search_bridge(&config);
+        with_health_serving_env(&config, || {
+            let startup_scope = StartupWorkerScope::default();
+            init_search_bridge(&config, &startup_scope.workers);
 
-        assert!(config.storage_root.join("search_index").exists());
-        assert!(
-            !STARTUP_SEARCH_BACKFILL_IN_PROGRESS.load(Ordering::Acquire),
-            "memory-backed startup should not spawn lexical backfill worker"
-        );
+            assert!(config.storage_root.join("search_index").exists());
+            assert!(
+                !STARTUP_SEARCH_MAINTENANCE_RUNNING.load(Ordering::Acquire),
+                "memory-backed startup should not spawn lexical backfill worker"
+            );
+        });
     }
 
     #[test]
@@ -21095,11 +22986,11 @@ first body
         let _guard = TUI_STATE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        STARTUP_SEARCH_BACKFILL_IN_PROGRESS.store(false, Ordering::Release);
+        STARTUP_SEARCH_MAINTENANCE_RUNNING.store(false, Ordering::Release);
 
         let message = startup_search_backfill_spawn_failure_message(&std::io::Error::other("boom"));
         assert!(message.contains("leaving lexical backfill lazy"));
-        assert!(!STARTUP_SEARCH_BACKFILL_IN_PROGRESS.load(Ordering::Acquire));
+        assert!(!STARTUP_SEARCH_MAINTENANCE_RUNNING.load(Ordering::Acquire));
     }
 
     #[test]
@@ -21680,6 +23571,135 @@ first body
         )
     }
 
+    fn with_health_serving_env<T>(
+        config: &mcp_agent_mail_core::Config,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let storage_root = config.storage_root.to_string_lossy().into_owned();
+        let size = config
+            .database_pool_size
+            .map_or_else(String::new, |v| v.to_string());
+        let overflow = config
+            .database_max_overflow
+            .map_or_else(String::new, |v| v.to_string());
+        let timeout = config
+            .database_pool_timeout
+            .map_or_else(String::new, |v| v.to_string());
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", config.database_url.as_str()),
+                ("STORAGE_ROOT", storage_root.as_str()),
+                ("DATABASE_POOL_SIZE", size.as_str()),
+                ("DATABASE_MAX_OVERFLOW", overflow.as_str()),
+                ("DATABASE_POOL_TIMEOUT", timeout.as_str()),
+                ("AM_SEARCH_ENGINE", "lexical"),
+                ("AM_SEARCH_SURFACE_OVERRIDES", ""),
+                ("DISK_SPACE_MONITOR_ENABLED", "false"),
+            ],
+            f,
+        )
+    }
+
+    fn prime_health_admission(state: &HttpState, pool: &mcp_agent_mail_db::DbPool) {
+        let actual = resolve_serving_config(&state.config).expect("matching serving authority");
+        let observed_at = Instant::now();
+        let value = probe_serving_mail_pool(pool, serving_search_uses_lexical(&actual));
+        assert!(
+            value.database.is_ok(),
+            "real serving-pool probe: {:?}",
+            value.database
+        );
+        assert!(
+            matches!(
+                value.lexical,
+                LexicalReadiness::Ready | LexicalReadiness::Disabled
+            ),
+            "real lexical proof: {:?}",
+            value.lexical
+        );
+        let mut cache = lock_mutex(&state.mail_readiness);
+        cache.pool = Some(pool.clone());
+        cache.generation = Some(pool.engine_identity_key());
+        cache.last_attempt = Some(Instant::now());
+        cache.sample = Some(HealthSample { observed_at, value });
+    }
+
+    // The caller must retain with_health_serving_env for the whole state and
+    // worker lifetime: production requests select the process environment.
+    fn build_ready_health_state(config: mcp_agent_mail_core::Config) -> HttpState {
+        let actual = resolve_serving_config(&config).expect("matching serving authority");
+        let memory = mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&actual.database_url);
+        let db_config = DbPoolConfig::from_config(&actual);
+        let pool = if memory {
+            mcp_agent_mail_db::pool::get_or_reuse_compatible_memory_pool(&db_config)
+        } else {
+            create_pool(&db_config)
+        }
+        .expect("real serving pool");
+        let cx = runtime_request_cx(Budget::INFINITE);
+        let conn = block_on(pool.acquire(&cx))
+            .into_result()
+            .expect("initialize actual pool");
+        conn.query_sync("SELECT id FROM messages LIMIT 1", &[])
+            .expect("real mailbox table");
+        drop(conn);
+        if serving_search_uses_lexical(&actual) {
+            if !memory {
+                mcp_agent_mail_db::search_v3::init_or_switch_bridge(
+                    &actual.storage_root.join("search_index"),
+                )
+                .expect("real lexical bridge");
+                mcp_agent_mail_db::search_service::refresh_lexical_index_cancellable(
+                    &pool,
+                    &AtomicBool::new(false),
+                )
+                .expect("real fixture backfill");
+            }
+            // Empty memory is certified from this actual pool. File-backed
+            // fixtures must have completed their real backfill above.
+            let lexical = block_on(mcp_agent_mail_db::search_service::probe_lexical_readiness(
+                &cx, &pool,
+            ))
+            .into_result()
+            .expect("verify actual fixture source");
+            assert!(
+                lexical.verified,
+                "fixture index must cover its own database"
+            );
+        }
+        let state = build_state(config);
+        prime_health_admission(&state, &pool);
+        state
+    }
+
+    fn with_ready_health_state<T>(
+        mut config: mcp_agent_mail_core::Config,
+        f: impl FnOnce(&mut HttpState, &Path) -> T,
+    ) -> T {
+        let archive = tempfile::tempdir().expect("private health archive");
+        if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+            config.storage_root = archive.path().to_path_buf();
+        }
+        config.database_pool_size = Some(1);
+        config.database_max_overflow = Some(0);
+        config.integrity_check_on_startup = false;
+        with_health_serving_env(&config, || {
+            let mut state = build_ready_health_state(config.clone());
+            f(&mut state, archive.path())
+        })
+    }
+
+    fn wait_for_mail_readiness_refresh(state: &HttpState) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock_mutex(&state.mail_readiness).refreshing {
+            assert!(
+                Instant::now() < deadline,
+                "owned readiness probe did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     fn isolated_health_config() -> mcp_agent_mail_core::Config {
         clear_startup_readiness_fast_path();
         mcp_agent_mail_core::Config {
@@ -21708,6 +23728,7 @@ first body
         shutdown: asupersync::server::shutdown::ShutdownSignal,
     ) -> HttpServerInstance {
         HttpServerInstance {
+            state: Arc::new(build_state(mcp_agent_mail_core::Config::default())),
             join,
             connection_manager: asupersync::server::connection::ConnectionManager::new(
                 None,
@@ -23207,6 +25228,79 @@ first body
     }
 
     #[test]
+    fn queued_atc_release_rechecks_capacity_before_dispatch() {
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_POPULATION_LIMIT", "1")],
+            || {
+                atc::reset_global_atc_state_for_test(&config);
+                atc::atc_register_agent("AlphaAgent", "claude-code");
+                let mut effect = sample_probe_effect();
+                effect.kind = "release_reservations_requested".to_string();
+                effect.category = "liveness".to_string();
+                effect.semantics = sample_effect_semantics(
+                    "reservation_release",
+                    "AlphaAgent",
+                    effect.project_key.as_deref(),
+                );
+                let mut ensured_projects = AtcExecutorProjectCache::default();
+                assert_eq!(
+                    execute_atc_effect(None, AtcExecutorMode::Live, &mut ensured_projects, &effect,),
+                    "failed:executor_unavailable",
+                    "a full engine with complete coverage still admits release execution"
+                );
+
+                // The stored effect is unchanged; coverage becomes incomplete
+                // while it waits for the executor, without another planning tick.
+                atc::atc_register_agent("BeyondCapacity", "codex-cli");
+                let mut cooldowns = AtcOperatorCooldowns::new(i64::MAX, 4);
+                let status = cooldowns.execute(
+                    &effect.semantics.cooldown_key,
+                    &effect.semantics.family,
+                    effect.semantics.cooldown_micros,
+                    effect.timestamp_micros,
+                    || {
+                        execute_atc_effect(
+                            None,
+                            AtcExecutorMode::Live,
+                            &mut ensured_projects,
+                            &effect,
+                        )
+                    },
+                );
+                assert_eq!(status, "suppressed:agent_capacity");
+                assert!(cooldowns.last_action_by_key.is_empty());
+                assert!(ensured_projects.projects.is_empty());
+                let capture = atc_execution_capture(&status);
+                assert_eq!(capture.state, ExperienceState::Suppressed);
+                assert_eq!(capture.classification, "policy_suppression");
+                assert!(matches!(
+                    capture.non_execution_reason,
+                    Some(NonExecutionReason::SafetyGate { ref gate_name, .. })
+                        if gate_name == "agent_capacity"
+                ));
+                for (mode, expected) in [
+                    (AtcExecutorMode::Shadow, "suppressed:executor_mode_shadow"),
+                    (AtcExecutorMode::DryRun, "suppressed:executor_mode_dry_run"),
+                    (
+                        AtcExecutorMode::Canary,
+                        "suppressed:executor_mode_canary_release",
+                    ),
+                ] {
+                    assert_eq!(
+                        execute_atc_effect(None, mode, &mut ensured_projects, &effect),
+                        expected
+                    );
+                }
+            },
+        );
+        atc::reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
     fn resolution_anchor_prefers_execution_timestamp() {
         let experience = sample_resolution_experience(
             1_700_000_000_000_000,
@@ -23468,6 +25562,16 @@ first body
         assert!(!atc_status_consumes_cooldown(
             "suppressed:missing_project_precondition"
         ));
+        for status in [
+            "suppressed:agent_capacity",
+            "suppressed:conflict_capacity",
+            "suppressed:agent_coverage_unavailable",
+        ] {
+            assert!(!atc_status_consumes_cooldown(status));
+            let capture = atc_execution_capture(status);
+            assert_eq!(capture.state, ExperienceState::Suppressed);
+            assert_eq!(capture.classification, "policy_suppression");
+        }
     }
 
     #[test]
@@ -24600,6 +26704,702 @@ first body
             resp.status, 401,
             "missing bearer auth must 401 before overseer JSON parsing"
         );
+    }
+
+    fn mail_rbac_test_config() -> mcp_agent_mail_core::Config {
+        mcp_agent_mail_core::Config {
+            http_host: "127.0.0.1".to_string(),
+            http_bearer_token: Some("mail-rbac-static".to_string()),
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("mail-rbac-jwt".to_string()),
+            http_jwt_jwks_url: None,
+            http_jwt_issuer: None,
+            http_jwt_audience: None,
+            http_jwt_algorithms: vec!["HS256".to_string()],
+            http_jwt_role_claim: "role".to_string(),
+            http_rbac_enabled: true,
+            http_rbac_default_role: "reader".to_string(),
+            http_rbac_reader_roles: vec!["reader".to_string()],
+            // A configured role, not a hard-coded spelling of "writer".
+            http_rbac_writer_roles: vec!["mail-operator".to_string()],
+            http_allow_localhost_unauthenticated: false,
+            http_rate_limit_enabled: false,
+            http_cors_origins: Vec::new(),
+            ..mcp_agent_mail_core::Config::from_env()
+        }
+    }
+
+    fn mail_rbac_post(uri: &str, authorization: Option<&str>, body: &str) -> Http1Request {
+        let mut headers = vec![("Content-Type", "application/json")];
+        if let Some(authorization) = authorization {
+            headers.push(("Authorization", authorization));
+        }
+        let mut req = make_request_with_peer_addr(
+            Http1Method::Post,
+            uri,
+            &headers,
+            Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+        );
+        req.body = body.as_bytes().to_vec();
+        req
+    }
+
+    #[test]
+    fn mail_conversations_reject_invalid_auth_before_mailbox_admission() {
+        with_serialized_tool_dispatch_env(&[], |_| {
+            let config = mail_rbac_test_config();
+            let database_path = resolve_server_database_url_sqlite_path(&config.database_url)
+                .expect("fixture database path");
+            let storage_root = config.storage_root.clone();
+            let state = build_state(config);
+            let forged_jwt = format!(
+                "Bearer {}",
+                hs256_token(b"wrong-secret", &serde_json::json!({"role": "reader"}))
+            );
+            for uri in [
+                "/mail/2/threads",
+                "/mail/2/thread?thread_id=shared",
+                "/mail/2/thread/shared",
+                "/mail/2/threads?token=wrong-token",
+                "/mail/2/thread?thread_id=shared&token=wrong-token",
+            ] {
+                for authorization in [None, Some("Bearer wrong-token"), Some(forged_jwt.as_str())] {
+                    let headers: Vec<_> = authorization
+                        .map(|value| ("Authorization", value))
+                        .into_iter()
+                        .collect();
+                    let req = make_request_with_peer_addr(
+                        Http1Method::Get,
+                        uri,
+                        &headers,
+                        Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                    );
+                    let resp = block_on(state.handle(req));
+                    assert_eq!(resp.status, 401, "unauthenticated conversation route {uri}");
+                    assert_eq!(
+                        response_header(&resp, "content-type"),
+                        Some("text/html; charset=utf-8")
+                    );
+                    assert!(
+                        !database_path.exists(),
+                        "refused {uri} must not create the mailbox"
+                    );
+                    assert!(
+                        mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env()).is_none(),
+                        "refused {uri} must not admit a database pool"
+                    );
+                    assert_eq!(
+                        std::fs::read_dir(&storage_root)
+                            .expect("archive directory")
+                            .count(),
+                        0,
+                        "refused {uri} must not create archive artifacts"
+                    );
+                }
+            }
+        });
+    }
+
+    fn with_mail_conversation_http_fixture<F, Fut>(f: F)
+    where
+        F: FnOnce(Arc<HttpState>, mcp_agent_mail_db::DbPool) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        with_serialized_tool_dispatch_env(
+            &[("DATABASE_POOL_SIZE", "1"), ("DATABASE_MAX_OVERFLOW", "0")],
+            |_| {
+                let state = Arc::new(build_state(mail_rbac_test_config()));
+                // Exercise the real bounded HTTP dispatch worker, as serve-http does.
+                let _ = state.self_ref.set(Arc::downgrade(&state));
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("fixture runtime");
+                runtime.block_on(async {
+                    let cx = Cx::current().expect("fixture context");
+                    let pool = mcp_agent_mail_db::get_or_create_pool(&DbPoolConfig::from_env())
+                        .expect("real mailbox pool");
+                    let conn = pool.acquire(&cx).await.into_result().expect("seed checkout");
+                    for sql in [
+                        // A numeric slug must not be interpreted as another project's row ID.
+                        "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
+                         (1, '2', '/synthetic/conversations-numeric-slug', 1), \
+                         (2, 'other-project', '/synthetic/conversations-other', 1), \
+                         (3, 'empty-project', '/synthetic/conversations-empty', 1)",
+                        "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                         VALUES (1, 1, 'RedFox', 'test', 'test', 1, 1), \
+                         (2, 2, 'BlueLake', 'test', 'test', 1, 1), \
+                         (3, 1, 'GreenLake', 'test', 'test', 1, 1)",
+                        "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, created_ts) VALUES \
+                         (1, 1, 1, 'shared', 'Numeric slug conversation', 'PRIVATE_NUMERIC_PROJECT_BODY', 1), \
+                         (2, 1, 1, 'shared', 'Numeric slug reply', 'PRIVATE_NUMERIC_REPLY_BODY', 2), \
+                         (3, 2, 2, 'shared', 'Other project conversation', 'PRIVATE_OTHER_PROJECT_BODY', 3), \
+                         (4, 1, 1, '2', 'Literal numeric conversation', 'LITERAL_NUMERIC_THREAD_BODY', 4), \
+                         (5, 1, 1, NULL, 'Standalone conversation', 'STANDALONE_THREAD_BODY', 5), \
+                         (6, 1, 1, 'topic/a+b?c#%2F', 'Encoded identifier conversation', 'ENCODED_THREAD_BODY', 6), \
+                         (7, 1, 1, '.', 'Dot identifier conversation', 'DOT_THREAD_BODY', 7), \
+                         (8, 1, 1, '..', 'Double dot conversation', 'DOUBLE_DOT_THREAD_BODY', 8)",
+                        "INSERT INTO message_recipients (message_id, agent_id) VALUES (1, 3)",
+                    ] {
+                        conn.execute_sync(sql, &[]).expect("seed conversation fixture");
+                    }
+                    drop(conn);
+                    f(state, pool).await;
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn mail_conversations_allow_authenticated_readers_and_isolate_projects() {
+        with_mail_conversation_http_fixture(|state, pool| async move {
+            let reader = format!(
+                "Bearer {}",
+                hs256_token(b"mail-rbac-jwt", &serde_json::json!({"role": "reader"}))
+            );
+            for (uri, authorization, present, absent) in [
+                (
+                    "/mail/2/threads",
+                    Some(reader.as_str()),
+                    "Numeric slug reply",
+                    "Other project conversation",
+                ),
+                (
+                    "/mail/2/threads",
+                    Some("Bearer mail-rbac-static"),
+                    "Numeric slug reply",
+                    "Other project conversation",
+                ),
+                (
+                    "/mail/2/threads?token=mail-rbac-static",
+                    None,
+                    "Numeric slug reply",
+                    "Other project conversation",
+                ),
+                (
+                    "/mail/other-project/threads",
+                    Some(reader.as_str()),
+                    "Other project conversation",
+                    "Numeric slug reply",
+                ),
+                (
+                    "/mail/2/thread?thread_id=shared",
+                    Some(reader.as_str()),
+                    "PRIVATE_NUMERIC_PROJECT_BODY",
+                    "PRIVATE_OTHER_PROJECT_BODY",
+                ),
+                (
+                    "/mail/other-project/thread/shared?token=mail-rbac-static",
+                    None,
+                    "PRIVATE_OTHER_PROJECT_BODY",
+                    "PRIVATE_NUMERIC_PROJECT_BODY",
+                ),
+            ] {
+                let headers: Vec<_> = authorization
+                    .map(|value| ("Authorization", value))
+                    .into_iter()
+                    .collect();
+                let req = make_request_with_peer_addr(
+                    Http1Method::Get,
+                    uri,
+                    &headers,
+                    Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                );
+                let resp = state.handle(req).await;
+                assert_eq!(
+                    resp.status, 200,
+                    "authorized conversation route {uri}: {:?}",
+                    resp.body
+                );
+                assert_eq!(
+                    response_header(&resp, "content-type"),
+                    Some("text/html; charset=utf-8")
+                );
+                let html = std::str::from_utf8(&resp.body).expect("rendered conversation HTML");
+                assert!(html.contains(present), "{uri} must contain {present}");
+                assert!(!html.contains(absent), "{uri} must not leak {absent}");
+                if uri.contains("/threads") {
+                    assert!(html.contains("Project Threads"));
+                    assert!(
+                        !html.contains("PRIVATE_"),
+                        "thread summaries must not load message bodies"
+                    );
+                }
+            }
+            let cx = Cx::current().expect("fixture context");
+            let conn = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("verification checkout");
+            let rows = conn
+                .query_sync(
+                    "SELECT (SELECT COUNT(*) FROM messages) AS messages, \
+                 (SELECT COUNT(*) FROM message_recipients WHERE read_ts IS NOT NULL) AS reads",
+                    &[],
+                )
+                .expect("verify read-only browsing");
+            assert_eq!(
+                rows[0].get_named::<i64>("messages").expect("message count"),
+                8
+            );
+            assert_eq!(rows[0].get_named::<i64>("reads").expect("read count"), 0);
+        });
+    }
+
+    #[test]
+    fn mail_conversations_http_keeps_canonical_keys_and_read_only_routes() {
+        with_mail_conversation_http_fixture(|state, _pool| async move {
+            for (uri, present, absent) in [
+                (
+                    "/mail/2/thread/2",
+                    "LITERAL_NUMERIC_THREAD_BODY",
+                    "PRIVATE_NUMERIC_PROJECT_BODY",
+                ),
+                (
+                    "/mail/2/thread?thread_id=2",
+                    "LITERAL_NUMERIC_THREAD_BODY",
+                    "PRIVATE_NUMERIC_REPLY_BODY",
+                ),
+                (
+                    "/mail/2/thread/5",
+                    "STANDALONE_THREAD_BODY",
+                    "LITERAL_NUMERIC_THREAD_BODY",
+                ),
+                (
+                    "/mail/2/thread?thread_id=topic%2Fa%2Bb%3Fc%23%252F",
+                    "ENCODED_THREAD_BODY",
+                    "STANDALONE_THREAD_BODY",
+                ),
+                (
+                    "/mail/2/thread/topic%2Fa%2Bb%3Fc%23%252F",
+                    "ENCODED_THREAD_BODY",
+                    "STANDALONE_THREAD_BODY",
+                ),
+                (
+                    "/mail/2/thread?thread_id=.",
+                    "DOT_THREAD_BODY",
+                    "DOUBLE_DOT_THREAD_BODY",
+                ),
+                (
+                    "/mail/2/thread?thread_id=..",
+                    "DOUBLE_DOT_THREAD_BODY",
+                    "Encoded identifier conversation",
+                ),
+            ] {
+                let resp = state
+                    .handle(make_request_with_peer_addr(
+                        Http1Method::Get,
+                        uri,
+                        &[("Authorization", "Bearer mail-rbac-static")],
+                        Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                    ))
+                    .await;
+                assert_eq!(
+                    resp.status, 200,
+                    "canonical thread route {uri}: {:?}",
+                    resp.body
+                );
+                let html = std::str::from_utf8(&resp.body).expect("thread HTML");
+                assert!(html.contains(present), "{uri} must resolve {present}");
+                assert!(!html.contains(absent), "{uri} must not merge {absent}");
+            }
+            for (uri, status) in [
+                ("/mail/empty-project/threads", 200),
+                ("/mail/missing-project/threads", 404),
+                ("/mail/other-project/thread/2", 404),
+                ("/mail/2/thread/missing-thread", 404),
+                ("/mail/2/thread?thread_id=missing-thread", 404),
+                ("/mail/2/thread", 400),
+                ("/mail/2/thread?thread_id=", 400),
+            ] {
+                let resp = state
+                    .handle(make_request_with_peer_addr(
+                        Http1Method::Get,
+                        uri,
+                        &[("Authorization", "Bearer mail-rbac-static")],
+                        Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                    ))
+                    .await;
+                assert_eq!(
+                    resp.status, status,
+                    "conversation route {uri}: {:?}",
+                    resp.body
+                );
+            }
+            for uri in [
+                "/mail/2/threads",
+                "/mail/2/thread?thread_id=shared",
+                "/mail/2/thread/shared",
+            ] {
+                let resp = state
+                    .handle(mail_rbac_post(uri, Some("Bearer mail-rbac-static"), "{}"))
+                    .await;
+                assert_eq!(
+                    resp.status, 405,
+                    "conversation browsing must be GET-only: {uri}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn mail_post_rbac_rejects_before_cold_mailbox_admission() {
+        with_serialized_tool_dispatch_env(&[], |_| {
+            let config = mail_rbac_test_config();
+            let database_path = resolve_server_database_url_sqlite_path(&config.database_url)
+                .expect("fixture database path");
+            let storage_root = config.storage_root.clone();
+            let state = build_state(config);
+            assert!(!database_path.exists());
+            assert!(mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env()).is_none());
+
+            for role in ["reader", "unknown", "writer"] {
+                let token = hs256_token(b"mail-rbac-jwt", &serde_json::json!({"role": role}));
+                let auth = format!("Bearer {token}");
+                for (uri, body) in [
+                    ("/mail/p/inbox/BlueLake/mark-read", r#"{"message_ids":[1]}"#),
+                    ("/mail/p/inbox/BlueLake/mark-all-read", "{}"),
+                    (
+                        "/mail/p/overseer/send",
+                        r#"{"intent":"human_overseer_send","recipients":["BlueLake"],"subject":"RBAC","body_md":"Test","reason":"Regression"}"#,
+                    ),
+                    ("/mail/api/projects/1/siblings/2", r#"{"action":"confirm"}"#),
+                ] {
+                    let resp = block_on(state.handle(mail_rbac_post(uri, Some(&auth), body)));
+                    assert_eq!(resp.status, 403, "role={role}, route={uri}");
+                    let payload: serde_json::Value =
+                        serde_json::from_slice(&resp.body).expect("structured mail refusal");
+                    assert_eq!(payload["required_role"], "writer");
+                    assert_eq!(payload["error"], "forbidden");
+                    assert!(
+                        !database_path.exists(),
+                        "a refused {uri} must not create the mailbox"
+                    );
+                    assert!(
+                        mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env()).is_none(),
+                        "a refused {uri} must not admit a database pool"
+                    );
+                    assert_eq!(
+                        std::fs::read_dir(&storage_root)
+                            .expect("archive directory")
+                            .count(),
+                        0,
+                        "a refused {uri} must not create archive or lease artifacts"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn mail_post_rbac_preserves_rows_and_accepts_configured_writers() {
+        async fn snapshot(
+            cx: &Cx,
+            pool: &mcp_agent_mail_db::DbPool,
+        ) -> (i64, i64, i64, i64, String) {
+            let conn = pool
+                .acquire(cx)
+                .await
+                .into_result()
+                .expect("snapshot checkout");
+            let rows = conn
+                .query_sync(
+                    "SELECT (SELECT COUNT(*) FROM messages) AS messages, \
+                     (SELECT COUNT(*) FROM agents) AS agents, \
+                     (SELECT COUNT(*) FROM message_recipients WHERE read_ts IS NOT NULL) AS reads, \
+                     (SELECT COUNT(*) FROM message_recipients) AS recipients, \
+                     (SELECT status FROM project_sibling_suggestions WHERE id = 1) AS sibling",
+                    &[],
+                )
+                .expect("read mutation witnesses");
+            let row = rows.first().expect("snapshot row");
+            (
+                row.get_named("messages").expect("message count"),
+                row.get_named("agents").expect("agent count"),
+                row.get_named("reads").expect("read receipt count"),
+                row.get_named("recipients").expect("recipient count"),
+                row.get_named("sibling").expect("sibling state"),
+            )
+        }
+
+        with_serialized_tool_dispatch_env(
+            &[("DATABASE_POOL_SIZE", "1"), ("DATABASE_MAX_OVERFLOW", "0")],
+            |_| {
+                let config = mail_rbac_test_config();
+                let storage_root = config.storage_root.clone();
+                let state = Arc::new(build_state(config));
+                // The server sets this, and it sends mail posts to a blocking
+                // worker. Inline, the archive scan's blocking task has no
+                // runtime worker to start on.
+                let _ = state.self_ref.set(Arc::downgrade(&state));
+                let runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("fixture runtime");
+                runtime.block_on(async {
+                    let cx = Cx::current().expect("fixture context");
+                    let pool = mcp_agent_mail_db::get_or_create_pool(&DbPoolConfig::from_env())
+                        .expect("real mailbox pool");
+                    let conn = pool.acquire(&cx).await.into_result().expect("seed checkout");
+                    for sql in [
+                        "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
+                         (1, 'p', '/synthetic/mail-rbac', 1), (2, 'q', '/synthetic/mail-rbac-other', 1)",
+                        "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) \
+                         VALUES (1, 1, 'RedFox', 'test', 'test', 1, 1), (2, 1, 'BlueLake', 'test', 'test', 1, 1)",
+                        "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) \
+                         VALUES (1, 1, 1, 'First', 'Body', 1), (2, 1, 1, 'Second', 'Body', 2), \
+                         (3, 1, 1, 'Third', 'Body', 3)",
+                        "INSERT INTO message_recipients (message_id, agent_id) VALUES (1, 2), (2, 2), (3, 2)",
+                        "INSERT INTO project_sibling_suggestions \
+                         (id, project_a_id, project_b_id, score, created_ts, evaluated_ts) \
+                         VALUES (1, 1, 2, 0.9, 1, 1)",
+                    ] {
+                        conn.execute_sync(sql, &[]).expect("seed real mailbox rows");
+                    }
+                    drop(conn);
+                    let before = snapshot(&cx, &pool).await;
+                    assert_eq!(before, (3, 2, 0, 3, "suggested".to_string()));
+                    let archive_entries_before = std::fs::read_dir(&storage_root)
+                        .expect("seeded archive directory")
+                        .count();
+                    let reader = format!(
+                        "Bearer {}",
+                        hs256_token(b"mail-rbac-jwt", &serde_json::json!({"role": "reader"}))
+                    );
+                    let writer = format!(
+                        "Bearer {}",
+                        hs256_token(b"mail-rbac-jwt", &serde_json::json!({"role": "mail-operator"}))
+                    );
+                    let overseer_body = r#"{"intent":"human_overseer_send","recipients":["BlueLake"],"subject":"RBAC","body_md":"Test","reason":"Regression"}"#;
+                    for (uri, body) in [
+                        ("/mail/p/inbox/BlueLake/mark-read", r#"{"message_ids":[1]}"#),
+                        ("/mail/p/inbox/BlueLake/mark-all-read", "{}"),
+                        ("/mail/p/overseer/send", overseer_body),
+                        ("/mail/api/projects/1/siblings/2", r#"{"action":"confirm"}"#),
+                    ] {
+                        let resp = state.handle(mail_rbac_post(uri, Some(&reader), body)).await;
+                        assert_eq!(resp.status, 403, "reader must not mutate {uri}");
+                        assert_eq!(snapshot(&cx, &pool).await, before, "denied route {uri}");
+                    }
+                    assert_eq!(
+                        std::fs::read_dir(&storage_root).expect("archive directory").count(),
+                        archive_entries_before,
+                        "denied requests must not create archive artifacts"
+                    );
+
+                    let get = make_request_with_peer_addr(
+                        Http1Method::Get,
+                        "/mail/api/unified-inbox",
+                        &[("Authorization", reader.as_str())],
+                        Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                    );
+                    assert_eq!(state.handle(get).await.status, 200, "reader GET stays available");
+                    assert_eq!(snapshot(&cx, &pool).await, before);
+
+                    // Exercise the actual write handler for all three accepted
+                    // credentials, including browser-only query authentication.
+                    for (uri, auth, id) in [
+                        ("/mail/p/inbox/BlueLake/mark-read", Some(writer.as_str()), 1),
+                        ("/mail/p/inbox/BlueLake/mark-read", Some("Bearer mail-rbac-static"), 2),
+                        ("/mail/p/inbox/BlueLake/mark-read?token=mail-rbac-static", None, 3),
+                    ] {
+                        let body = format!(r#"{{"message_ids":[{id}]}}"#);
+                        let resp = state.handle(mail_rbac_post(uri, auth, &body)).await;
+                        assert_eq!(resp.status, 200, "authorized route {uri}: {:?}", resp.body);
+                        assert_eq!(snapshot(&cx, &pool).await.2, id);
+                    }
+                    let sent = state.handle(mail_rbac_post(
+                        "/mail/p/overseer/send?token=mail-rbac-static",
+                        Some(&reader),
+                        overseer_body,
+                    )).await;
+                    assert_eq!(sent.status, 200, "browser static token retains writer authority");
+                    assert_eq!(snapshot(&cx, &pool).await, (4, 3, 3, 4, "suggested".to_string()));
+                    let sibling = state.handle(mail_rbac_post(
+                        "/mail/api/projects/1/siblings/2",
+                        Some("Bearer mail-rbac-static"),
+                        r#"{"action":"confirm"}"#,
+                    )).await;
+                    assert_eq!(sibling.status, 200);
+                    let all_read = state.handle(mail_rbac_post(
+                        "/mail/p/inbox/BlueLake/mark-all-read",
+                        Some(&writer),
+                        "{}",
+                    )).await;
+                    assert_eq!(all_read.status, 200);
+                    assert_eq!(snapshot(&cx, &pool).await, (4, 3, 4, 4, "confirmed".to_string()));
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn mail_post_rbac_preserves_auth_csrf_and_local_policy() {
+        with_serialized_tool_dispatch_env(&[], |_| {
+            let config = mail_rbac_test_config();
+            let state = build_state(config.clone());
+            let uri = "/mail/p/overseer/send";
+            let reader = format!(
+                "Bearer {}",
+                hs256_token(b"mail-rbac-jwt", &serde_json::json!({"role": "reader"}))
+            );
+            let writer = format!(
+                "Bearer {}",
+                hs256_token(
+                    b"mail-rbac-jwt",
+                    &serde_json::json!({"role": "mail-operator"})
+                )
+            );
+            let expired = format!(
+                "Bearer {}",
+                hs256_token(
+                    b"mail-rbac-jwt",
+                    &serde_json::json!({"role": "mail-operator", "exp": 1})
+                )
+            );
+            let wrong_secret = format!(
+                "Bearer {}",
+                hs256_token(
+                    b"other-secret",
+                    &serde_json::json!({"role": "mail-operator"})
+                )
+            );
+
+            for auth in [
+                None,
+                Some("Bearer malformed"),
+                Some(expired.as_str()),
+                Some(wrong_secret.as_str()),
+            ] {
+                let mut req = mail_rbac_post(uri, auth, "not json");
+                req.headers.retain(|(name, _)| name != "Content-Type");
+                let resp = block_on(state.handle(req));
+                assert_eq!(resp.status, 401, "authentication precedes CSRF and roles");
+            }
+            let invalid_query = block_on(state.handle(mail_rbac_post(
+                "/mail/p/overseer/send?token=wrong-token",
+                None,
+                "not json",
+            )));
+            assert_eq!(invalid_query.status, 401);
+
+            let mut non_json = mail_rbac_post(uri, Some(&reader), "not json");
+            non_json.headers.retain(|(name, _)| name != "Content-Type");
+            let resp = block_on(state.handle(non_json));
+            assert_eq!(resp.status, 403);
+            let payload: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+            assert_eq!(
+                payload["detail"],
+                "mutating mail requests require Content-Type: application/json"
+            );
+            assert!(
+                payload.get("required_role").is_none(),
+                "CSRF refusal stays first"
+            );
+            let mut cross_origin = mail_rbac_post(uri, Some(&writer), "not json");
+            cross_origin.headers.extend([
+                ("Host".to_string(), "mail.example.test".to_string()),
+                (
+                    "Origin".to_string(),
+                    "https://other.example.test".to_string(),
+                ),
+            ]);
+            let resp = block_on(state.handle(cross_origin));
+            assert_eq!(resp.status, 403);
+            let payload: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+            assert_eq!(payload["detail"], "cross-origin request rejected");
+
+            // Query tokens authenticate the browser only. A valid reader JWT
+            // must not gain writer privileges by adding the same token to MCP.
+            let mut mcp = mail_rbac_post("/api?token=mail-rbac-static", Some(&reader), "");
+            mcp.body = serde_json::to_vec(&JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({"name": "send_message", "arguments": {}})),
+                1_i64,
+            ))
+            .unwrap();
+            assert_eq!(block_on(state.handle(mcp)).status, 403);
+            assert_eq!(
+                block_on(state.handle(mail_rbac_post(
+                    "/api?token=mail-rbac-static",
+                    None,
+                    "not json",
+                )))
+                .status,
+                401
+            );
+
+            // These permitted requests reach the real handler's JSON parser;
+            // the deliberately invalid body keeps the policy controls read-only.
+            let disabled = build_state(mcp_agent_mail_core::Config {
+                http_rbac_enabled: false,
+                ..config.clone()
+            });
+            assert_eq!(
+                block_on(disabled.handle(mail_rbac_post(uri, Some(&reader), "not json"))).status,
+                400
+            );
+            assert_eq!(
+                block_on(disabled.handle(mail_rbac_post(uri, Some(&expired), "not json"))).status,
+                401
+            );
+
+            let static_only = build_state(mcp_agent_mail_core::Config {
+                http_jwt_enabled: false,
+                ..config.clone()
+            });
+            for (path, auth) in [
+                (uri, Some("Bearer mail-rbac-static")),
+                ("/mail/p/overseer/send?token=mail-rbac-static", None),
+            ] {
+                assert_eq!(
+                    block_on(static_only.handle(mail_rbac_post(path, auth, "not json"))).status,
+                    400,
+                    "static credentials retain writer roles with JWT disabled"
+                );
+            }
+
+            let local = build_state(mcp_agent_mail_core::Config {
+                http_allow_localhost_unauthenticated: true,
+                ..config.clone()
+            });
+            for auth in [None, Some("Bearer malformed")] {
+                let mut req = mail_rbac_post(uri, auth, "not json");
+                req.peer_addr = Some(SocketAddr::from(([127, 0, 0, 1], 1234)));
+                assert_eq!(
+                    block_on(local.handle(req)).status,
+                    400,
+                    "explicit local bypass remains complete"
+                );
+            }
+            let mut forwarded = mail_rbac_post(uri, Some(&reader), "not json");
+            forwarded.peer_addr = Some(SocketAddr::from(([127, 0, 0, 1], 1234)));
+            forwarded
+                .headers
+                .push(("X-Forwarded-For".to_string(), "10.0.0.1".to_string()));
+            assert_eq!(
+                block_on(local.handle(forwarded)).status,
+                403,
+                "forwarding disables local bypass"
+            );
+
+            let no_auth = build_state(mcp_agent_mail_core::Config {
+                http_bearer_token: None,
+                http_jwt_enabled: false,
+                ..config
+            });
+            let mut loopback = mail_rbac_post(uri, None, "not json");
+            loopback.peer_addr = Some(SocketAddr::from(([127, 0, 0, 1], 1234)));
+            assert_eq!(
+                block_on(no_auth.handle(loopback)).status,
+                400,
+                "direct no-auth loopback keeps writer access"
+            );
+            assert_eq!(
+                block_on(no_auth.handle(mail_rbac_post(uri, None, "not json"))).status,
+                403,
+                "remote no-auth clients keep the default reader role"
+            );
+        });
     }
 
     #[test]
@@ -26565,7 +29365,7 @@ first body
                             "now": now,
                             "expected_allowed": exp,
                             "actual_allowed": allowed,
-                            "bucket_state": state.map(|(tokens, ts)| serde_json::json!({"tokens": tokens, "ts": ts})),
+                            "bucket_state": state.map(|bucket| serde_json::json!({"tokens": bucket.tokens, "ts": bucket.observed_at})),
                             "key": key,
                         }),
                     );
@@ -26753,6 +29553,12 @@ first body
             ..Default::default()
         };
         let state = build_state(config);
+        let now = rate_limit_now();
+        state.rate_limiter.buckets.lock().unwrap().insert(
+            "expired-fallback-client".to_string(),
+            RateLimitBucket::new(60, 1, now - 7200.0),
+        );
+        *state.rate_limiter.last_cleanup.lock().unwrap() = now - 61.0;
 
         let params = serde_json::json!({ "name": "health_check", "arguments": {} });
         let json_rpc = JsonRpcRequest::new("tools/call", Some(params), 1);
@@ -26760,6 +29566,15 @@ first body
 
         let req1 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
         assert!(block_on(state.check_rbac_and_rate_limit(&req1, &json_rpc)).is_none());
+        assert!(
+            !state
+                .rate_limiter
+                .buckets
+                .lock()
+                .unwrap()
+                .contains_key("expired-fallback-client"),
+            "Redis command failures must not disable memory fallback cleanup"
+        );
 
         let req2 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
         let resp = block_on(state.check_rbac_and_rate_limit(&req2, &json_rpc))
@@ -26860,6 +29675,218 @@ first body
     }
 
     #[test]
+    fn rate_limiter_key_churn_preserves_existing_quotas_at_capacity() {
+        let limiter = RateLimiter {
+            capacity: 4,
+            ..RateLimiter::new()
+        };
+        let now = 1000.0;
+        for key in ["a", "b", "c", "d"] {
+            assert!(limiter.allow_memory(key, 60, 2, now, false));
+        }
+        for index in 0..1000 {
+            assert!(!limiter.allow_memory(&format!("churn-{index}"), 60, 2, now, false));
+        }
+        assert_eq!(limiter.buckets.lock().unwrap().len(), 4);
+        assert!(limiter.allow_memory("a", 60, 2, now, false));
+        assert!(!limiter.allow_memory("a", 60, 2, now, false));
+        assert!(!limiter.allow_memory("new", 60, 2, now + 0.999, false));
+
+        // b/c/d have restored their whole burst; a has only one token back.
+        // A new identity can enter without forgetting a's remaining debit.
+        assert!(limiter.allow_memory("new", 60, 2, now + 1.0, false));
+        assert!(limiter.allow_memory("a", 60, 2, now + 1.0, false));
+        assert!(!limiter.allow_memory("a", 60, 2, now + 1.0, false));
+        assert!(limiter.buckets.lock().unwrap().len() <= 4);
+    }
+
+    #[test]
+    fn rate_limiter_long_refill_debt_survives_idle_cleanup_and_capacity_pressure() {
+        let now = rate_limit_now();
+        let limiter = RateLimiter {
+            capacity: 2,
+            ..RateLimiter::new()
+        };
+        for _ in 0..100 {
+            assert!(limiter.allow_memory("slow", 1, 100, now, false));
+        }
+        assert!(!limiter.allow_memory("slow", 1, 100, now, false));
+        assert!(limiter.allow_memory("fast", 60, 1, now, false));
+
+        // One idle hour replenishes only 60 of the slow bucket's 100 tokens.
+        limiter.cleanup(now + 3601.0);
+        {
+            let buckets = limiter.buckets.lock().unwrap();
+            assert!(buckets.contains_key("slow"));
+            assert!(!buckets.contains_key("fast"));
+        }
+        assert!(limiter.allow_memory("new", 1, 1, now + 3601.0, false));
+        assert!(!limiter.allow_memory("overflow", 1, 1, now + 3601.0, false));
+        for _ in 0..60 {
+            assert!(limiter.allow_memory("slow", 1, 100, now + 3601.0, false));
+        }
+        assert!(!limiter.allow_memory("slow", 1, 100, now + 3601.0, false));
+    }
+
+    #[test]
+    fn rate_limiter_bounds_key_bytes_and_rejects_nonfinite_time_without_allocation() {
+        let limiter = RateLimiter::new();
+        let now = 1000.0;
+        let max_key = "é".repeat(RATE_LIMIT_MAX_KEY_BYTES / 2);
+        assert!(limiter.allow_memory(&max_key, 60, 1, now, false));
+        assert!(!limiter.allow_memory(&format!("{max_key}x"), 60, 1, now, false));
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(!limiter.allow_memory("invalid-clock", 60, 1, invalid, true));
+        }
+        assert_eq!(limiter.buckets.lock().unwrap().len(), 1);
+        assert!(!limiter.allow_memory(&max_key, 60, 1, now, false));
+        assert!(limiter.allow_memory(&format!("{max_key}x"), 0, 0, now, true));
+        assert_eq!(limiter.buckets.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rate_limiter_policy_change_retains_debt_and_uses_the_new_refill_horizon() {
+        let limiter = RateLimiter {
+            capacity: 1,
+            ..RateLimiter::new()
+        };
+        let now = 1000.0;
+        assert!(limiter.allow_memory("agent", 60, 2, now, false));
+        assert!(limiter.allow_memory("agent", 60, 2, now, false));
+        // Slowing refill and increasing the burst must not grant new tokens.
+        assert!(!limiter.allow_memory("agent", 1, 100, now, false));
+        assert!(!limiter.allow_memory("new", 60, 1, now + 2.0, false));
+        assert!(limiter.allow_memory("agent", 1, 100, now + 60.0, false));
+        assert!(!limiter.allow_memory("agent", 1, 100, now + 60.0, false));
+        assert!(!limiter.allow_memory("new", 60, 1, now + 3601.0, false));
+        assert!(limiter.allow_memory("new", 60, 1, now + 6060.0, false));
+    }
+
+    #[test]
+    fn rate_limiter_concurrent_new_keys_cannot_exceed_capacity() {
+        let limiter = Arc::new(RateLimiter {
+            capacity: 4,
+            ..RateLimiter::new()
+        });
+        let allowed = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for index in 0..32 {
+                let limiter = &limiter;
+                let allowed = &allowed;
+                scope.spawn(move || {
+                    if limiter.allow_memory(&format!("agent-{index}"), 1, 1, 1000.0, false) {
+                        allowed.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        assert_eq!(allowed.load(Ordering::Relaxed), 4);
+        assert_eq!(limiter.buckets.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn http_rate_limit_capacity_preserves_clients_with_memory_and_redis_fallback() {
+        for backend in [
+            mcp_agent_mail_core::RateLimitBackend::Memory,
+            mcp_agent_mail_core::RateLimitBackend::Redis,
+        ] {
+            let config = mcp_agent_mail_core::Config {
+                http_bearer_token: Some("capacity-secret".to_string()),
+                http_allow_localhost_unauthenticated: false,
+                http_rate_limit_enabled: true,
+                http_rate_limit_backend: backend,
+                http_rate_limit_redis_url: Some("not-a-url".to_string()),
+                http_rate_limit_tools_per_minute: 1,
+                http_rate_limit_tools_burst: 2,
+                ..Default::default()
+            };
+            let mut state = build_state(config);
+            state.rate_limiter = Arc::new(RateLimiter {
+                capacity: 2,
+                ..RateLimiter::new()
+            });
+            let request = |host, id| {
+                let mut req = make_request_with_peer_addr(
+                    Http1Method::Post,
+                    "/api",
+                    &[("Authorization", "Bearer capacity-secret")],
+                    Some(SocketAddr::from(([10, 0, 0, host], 1234))),
+                );
+                req.body = serde_json::to_vec(&JsonRpcRequest::new("tools/list", None, id))
+                    .expect("serialize tool-list request");
+                req
+            };
+            assert_eq!(block_on(state.handle(request(1, 1_i64))).status, 200);
+            assert_eq!(block_on(state.handle(request(2, 2_i64))).status, 200);
+            for host in 3..32 {
+                let response = block_on(state.handle(request(host, i64::from(host))));
+                assert_jsonrpc_error_response(
+                    &response,
+                    429,
+                    serde_json::json!(host),
+                    fastmcp_server::rate_limiting::RATE_LIMIT_ERROR_CODE,
+                    "Rate limit exceeded",
+                );
+            }
+            for host in [1, 2] {
+                assert_eq!(block_on(state.handle(request(host, 100_i64))).status, 200);
+                assert_eq!(block_on(state.handle(request(host, 101_i64))).status, 429);
+            }
+            assert_eq!(state.rate_limiter.buckets.lock().unwrap().len(), 2);
+            if backend == mcp_agent_mail_core::RateLimitBackend::Redis {
+                assert!(matches!(
+                    &*state.rate_limit_redis.lock().unwrap(),
+                    RateLimitRedisState::Failed
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn http_rate_limit_rejects_oversized_tool_and_jwt_subject_without_retaining_them() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("bounded-rate-key".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            http_rate_limit_enabled: true,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let oversized = "é".repeat(RATE_LIMIT_MAX_KEY_BYTES);
+        for (tool, subject) in [
+            (oversized.as_str(), "ordinary-subject"),
+            ("health_check", oversized.as_str()),
+        ] {
+            let token = hs256_token(
+                b"bounded-rate-key",
+                &serde_json::json!({"sub": subject, "role": "writer"}),
+            );
+            let auth = format!("Bearer {token}");
+            let mut req = make_request_with_peer_addr(
+                Http1Method::Post,
+                "/api",
+                &[("Authorization", &auth)],
+                Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+            );
+            req.body = serde_json::to_vec(&JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({"name": tool, "arguments": {}})),
+                1_i64,
+            ))
+            .expect("serialize oversized-key request");
+            let response = block_on(state.handle(req));
+            assert_jsonrpc_error_response(
+                &response,
+                429,
+                serde_json::json!(1),
+                fastmcp_server::rate_limiting::RATE_LIMIT_ERROR_CODE,
+                "Rate limit exceeded",
+            );
+            assert!(state.rate_limiter.buckets.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn rate_limiter_cleanup_eviction_after_one_hour() {
         let limiter = RateLimiter::new();
         let now = rate_limit_now();
@@ -26870,8 +29897,8 @@ first body
                 .buckets
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            buckets.insert("old".to_string(), (1.0, cutoff - 1.0));
-            buckets.insert("new".to_string(), (1.0, cutoff + 1.0));
+            buckets.insert("old".to_string(), RateLimitBucket::new(60, 1, cutoff - 1.0));
+            buckets.insert("new".to_string(), RateLimitBucket::new(60, 1, cutoff + 1.0));
         }
         {
             let mut last = limiter
@@ -26955,6 +29982,8 @@ first body
         assert!(limiter.allow_memory(key, 60, 1, t0, false));
         assert!(!limiter.allow_memory(key, 60, 1, t0, false));
         assert!(!limiter.allow_memory(key, 60, 1, t0 - 30.0, false));
+        assert!(!limiter.allow_memory(key, 60, 1, t0, false));
+        assert!(!limiter.allow_memory(key, 60, 1, t0 + 0.5, false));
         assert!(limiter.allow_memory(key, 60, 1, t0 + 1.0, false));
     }
 
@@ -26969,7 +29998,10 @@ first body
                 .buckets
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            buckets.insert("old".to_string(), (1.0, cutoff - 10.0));
+            buckets.insert(
+                "old".to_string(),
+                RateLimitBucket::new(60, 1, cutoff - 10.0),
+            );
         }
         {
             let mut last = limiter
@@ -27005,8 +30037,14 @@ first body
                 .buckets
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            buckets.insert("stale".to_string(), (1.0, cutoff - 5.0));
-            buckets.insert("fresh".to_string(), (1.0, cutoff + 5.0));
+            buckets.insert(
+                "stale".to_string(),
+                RateLimitBucket::new(60, 1, cutoff - 5.0),
+            );
+            buckets.insert(
+                "fresh".to_string(),
+                RateLimitBucket::new(60, 1, cutoff + 5.0),
+            );
         }
         {
             let mut last = limiter
@@ -27397,7 +30435,10 @@ first body
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for i in 0..10 {
-                buckets.insert(format!("stale_{i}"), (1.0, cutoff - f64::from(i) - 1.0));
+                buckets.insert(
+                    format!("stale_{i}"),
+                    RateLimitBucket::new(60, 1, cutoff - f64::from(i) - 1.0),
+                );
             }
         }
         {
@@ -27514,7 +30555,10 @@ first body
                 .buckets
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            buckets.insert("stale_key".to_string(), (1.0, cutoff - 10.0));
+            buckets.insert(
+                "stale_key".to_string(),
+                RateLimitBucket::new(60, 1, cutoff - 10.0),
+            );
         }
         {
             let mut last = limiter
@@ -30117,44 +33161,603 @@ first body
     }
 
     #[test]
+    #[allow(deprecated)]
+    fn health_readiness_uses_effective_search_backend() {
+        use mcp_agent_mail_core::config::SearchEngine;
+        let mut config = mcp_agent_mail_core::Config::default();
+        for (engine, semantic_enabled, requires_index) in [
+            (SearchEngine::Legacy, false, false),
+            (SearchEngine::Shadow, false, false),
+            (SearchEngine::parse("legacy"), false, true),
+            (SearchEngine::parse("sqlite"), false, true),
+            (SearchEngine::Lexical, false, true),
+            (SearchEngine::Hybrid, true, true),
+            (SearchEngine::Auto, true, true),
+            (SearchEngine::Semantic, false, true),
+            (SearchEngine::Semantic, true, false),
+        ] {
+            config.search_rollout.engine = engine;
+            config.search_rollout.semantic_enabled = semantic_enabled;
+            assert_eq!(
+                serving_search_uses_lexical(&config),
+                requires_index,
+                "{engine:?}"
+            );
+        }
+        config.search_rollout.engine = SearchEngine::Shadow;
+        config
+            .search_rollout
+            .surface_overrides
+            .insert("search_messages".to_string(), SearchEngine::Lexical);
+        assert!(serving_search_uses_lexical(&config));
+        assert_eq!(
+            LexicalReadiness::from_index(
+                mcp_agent_mail_db::search_service::LexicalReadiness::default(),
+            ),
+            LexicalReadiness::Unavailable,
+            "a compiled-out index cannot authorize configured lexical search"
+        );
+    }
+
+    #[test]
+    fn startup_readiness_notifications_bound_owned_warmup_grace() {
+        const TEST: &str = "tests::startup_readiness_notifications_bound_owned_warmup_grace";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        for (elapsed, extension) in [
+            (Duration::ZERO, Some(15_000_000)),
+            (Duration::from_secs(695), Some(15_000_000)),
+            (
+                MAIL_STARTUP_NOTIFY_GRACE
+                    .checked_sub(Duration::from_secs(2))
+                    .expect("startup grace exceeds two seconds"),
+                Some(2_000_000),
+            ),
+            (MAIL_STARTUP_NOTIFY_GRACE, None),
+        ] {
+            let payload = startup_readiness_notify_payload("lexical_initializing", elapsed, true);
+            assert!(payload.starts_with("STATUS=Waiting for mailbox admission: "));
+            assert!(
+                !payload.contains("READY=1"),
+                "a timeout extension is not readiness"
+            );
+            match extension {
+                Some(micros) => assert!(payload.contains(&format!("EXTEND_TIMEOUT_USEC={micros}"))),
+                None => assert!(!payload.contains("EXTEND_TIMEOUT_USEC")),
+            }
+        }
+        let stopped = startup_readiness_notify_payload(
+            "database_initializing",
+            Duration::from_secs(100),
+            false,
+        );
+        assert!(
+            !stopped.contains("EXTEND_TIMEOUT_USEC"),
+            "cancelled work cannot extend startup"
+        );
+
+        let state = build_state(mcp_agent_mail_core::Config::from_env());
+        assert!(!state.startup_initialization_active("database_probe_failed"));
+        {
+            let _database = StartupDatabaseInitialization::begin();
+            assert!(state.startup_initialization_active("database_probe_failed"));
+        }
+        assert!(!state.startup_initialization_active("database_probe_failed"));
+        {
+            let _refresh = StartupSearchRefreshGuard::begin();
+            let active = state.startup_initialization_active("database_probe_failed");
+            assert!(active);
+            let payload = startup_readiness_notify_payload(
+                "database_probe_failed",
+                Duration::from_secs(695),
+                active,
+            );
+            assert!(payload.contains("EXTEND_TIMEOUT_USEC=15000000"));
+        }
+        assert!(!state.startup_initialization_active("database_probe_failed"));
+        // A surviving idle maintenance owner cannot extend a failed database
+        // admission indefinitely between actual work attempts.
+        STARTUP_SEARCH_MAINTENANCE_RUNNING.store(true, Ordering::Release);
+        assert!(!state.startup_initialization_active("database_probe_failed"));
+        STARTUP_SEARCH_MAINTENANCE_RUNNING.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn health_readiness_requires_serving_pool_initialization() {
+        with_serialized_health_route(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let path = temp.path().join("schema-only.sqlite3");
+            let conn = DbConn::open_file(path.to_str().unwrap()).expect("fixture database");
+            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("valid mail schema");
+            mcp_agent_mail_db::close_db_conn(conn, "schema-only health fixture");
+            let config = mcp_agent_mail_core::Config {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&path),
+                storage_root: temp.path().join("archive"),
+                database_pool_size: Some(1),
+                database_max_overflow: Some(0),
+                integrity_check_on_startup: false,
+                http_bearer_token: Some("private".to_string()),
+                ..Default::default()
+            };
+            with_health_serving_env(&config, || {
+                let pool_config = DbPoolConfig::from_env();
+                let state = build_state(config.clone());
+                for lazy_pool in [false, true] {
+                    let owner = lazy_pool.then(|| create_pool(&pool_config).expect("lazy pool"));
+                    if let Some(pool) = owner.as_ref() {
+                        assert!(!pool.is_initialized(), "construction is not admission");
+                    } else {
+                        assert!(mcp_agent_mail_db::get_cached_pool(&pool_config).is_none());
+                    }
+                    let started = Instant::now();
+                    for route in ["/health", "/health/readiness"] {
+                        let response =
+                            block_on(state.handle(make_request(Http1Method::Get, route, &[])));
+                        assert_eq!(
+                            response.status, 503,
+                            "a schema-only connection is not ready"
+                        );
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&response.body).unwrap();
+                        assert_eq!(body["reason"], "database_initializing");
+                        assert_eq!(body["capabilities"]["mail_read"], false);
+                        assert_eq!(body["capabilities"]["mail_write"], false);
+                    }
+                    assert!(
+                        started.elapsed() < Duration::from_secs(1),
+                        "health joined initialization"
+                    );
+                    let live =
+                        block_on(state.handle(make_request(Http1Method::Get, "/healthz", &[])));
+                    assert_eq!(
+                        live.status, 200,
+                        "liveness and auth bypass remain independent"
+                    );
+                    assert!(lock_mutex(&state.mail_readiness).sample.is_none());
+                    if let Some(pool) = owner {
+                        assert!(
+                            !pool.is_initialized(),
+                            "health must not initialize a file mailbox"
+                        );
+                    }
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn mail_routes_refuse_uninitialized_serving_pool_without_starting_recovery() {
+        with_serialized_health_route(|| {
+            let temp = tempfile::tempdir().expect("private mailbox");
+            let path = temp.path().join("storage.sqlite3");
+            let conn = DbConn::open_file(path.to_str().unwrap()).expect("fixture database");
+            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("valid mail schema");
+            mcp_agent_mail_db::close_db_conn(conn, "cold mail-route fixture");
+            let config = mcp_agent_mail_core::Config {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&path),
+                storage_root: temp.path().join("archive"),
+                database_pool_size: Some(1),
+                database_max_overflow: Some(0),
+                integrity_check_on_startup: false,
+                http_bearer_token: Some("private".to_string()),
+                http_rbac_default_role: "writer".to_string(),
+                ..Default::default()
+            };
+            with_health_serving_env(&config, || {
+                let pool_config = DbPoolConfig::from_env();
+                let state = build_state(config.clone());
+                let names = || {
+                    std::fs::read_dir(temp.path())
+                        .unwrap()
+                        .map(|entry| entry.unwrap().file_name())
+                        .collect::<std::collections::BTreeSet<_>>()
+                };
+                for published_pool in [false, true] {
+                    let owner = published_pool
+                        .then(|| create_pool(&pool_config).expect("publish lazy pool"));
+                    if let Some(pool) = owner.as_ref() {
+                        assert!(!pool.is_initialized());
+                    } else {
+                        assert!(mcp_agent_mail_db::get_cached_pool(&pool_config).is_none());
+                    }
+                    let before_names = names();
+                    let before_bytes = std::fs::read(&path).unwrap();
+                    let started = Instant::now();
+                    for (method, route) in [
+                        (Http1Method::Get, "/mail"),
+                        (Http1Method::Get, "/mail/api/unified-inbox"),
+                        (Http1Method::Post, "/mail/demo/overseer/send"),
+                    ] {
+                        let response = block_on(state.handle(make_request(
+                            method,
+                            route,
+                            &[
+                                ("Authorization", "Bearer private"),
+                                ("Content-Type", "application/json"),
+                                ("Host", "localhost:8765"),
+                                ("Origin", "http://localhost:8765"),
+                            ],
+                        )));
+                        assert_eq!(response.status, 503, "{route}");
+                        let body: serde_json::Value = serde_json::from_slice(&response.body)
+                            .expect("HTML and API refusals must both be valid JSON");
+                        assert_eq!(
+                            body["detail"],
+                            "Database is initializing or unavailable; retry shortly"
+                        );
+                    }
+                    assert!(
+                        started.elapsed() < Duration::from_secs(1),
+                        "mail requests joined initialization"
+                    );
+                    assert_eq!(names(), before_names, "request created recovery artifacts");
+                    assert_eq!(std::fs::read(&path).unwrap(), before_bytes);
+                    if let Some(pool) = owner.as_ref() {
+                        assert!(!pool.is_initialized(), "request initialized the lazy pool");
+                    } else {
+                        assert!(mcp_agent_mail_db::get_cached_pool(&pool_config).is_none());
+                    }
+                    let liveness =
+                        block_on(state.handle(make_request(Http1Method::Get, "/healthz", &[])));
+                    assert_eq!(liveness.status, 200);
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn mail_routes_reuse_initialized_pool_without_waiting_for_search_readiness() {
+        with_serialized_health_route(|| {
+            let temp = tempfile::tempdir().expect("private mailbox");
+            let config = mcp_agent_mail_core::Config {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(
+                    &temp.path().join("storage.sqlite3"),
+                ),
+                storage_root: temp.path().join("archive"),
+                database_pool_size: Some(1),
+                database_max_overflow: Some(0),
+                integrity_check_on_startup: false,
+                http_bearer_token: Some("private".to_string()),
+                ..Default::default()
+            };
+            with_health_serving_env(&config, || {
+                let pool = create_pool(&DbPoolConfig::from_env()).expect("serving pool");
+                let cx = runtime_request_cx(Budget::INFINITE);
+                let project = block_on(mcp_agent_mail_db::queries::ensure_project(
+                    &cx,
+                    &pool,
+                    "/mail-startup-ready-project",
+                ))
+                .into_result()
+                .expect("initialize mailbox and project");
+                assert!(pool.is_initialized());
+                let generation = pool.engine_identity_key();
+                let state = build_state(config.clone());
+                assert!(lock_mutex(&state.mail_readiness).sample.is_none());
+                for route in [
+                    "/mail/projects",
+                    "/mail/api/unified-inbox?include_projects=true",
+                ] {
+                    let response = block_on(state.handle(make_request(
+                        Http1Method::Get,
+                        route,
+                        &[("Authorization", "Bearer private")],
+                    )));
+                    assert_eq!(response.status, 200, "{route}");
+                    assert!(String::from_utf8_lossy(&response.body).contains(&project.slug));
+                }
+                assert_eq!(
+                    mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env())
+                        .expect("original serving pool remains cached")
+                        .engine_identity_key(),
+                    generation
+                );
+                assert!(
+                    lock_mutex(&state.mail_readiness).sample.is_none(),
+                    "ordinary mail reads must not require a lexical/readiness probe"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn health_readiness_fails_closed_on_pending_pool_acquisition() {
+        const TEST: &str = "tests::health_readiness_fails_closed_on_pending_pool_acquisition";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        with_serialized_health_route(|| {
+            with_ready_health_state(isolated_health_config(), |state, _archive| {
+                let pool = lock_mutex(&state.mail_readiness)
+                    .pool
+                    .clone()
+                    .expect("serving pool");
+                let runtime = RuntimeBuilder::new()
+                    .worker_threads(1)
+                    .blocking_threads(1, 1)
+                    .build()
+                    .expect("owned readiness runtime");
+                state.health_refresh_scheduler =
+                    Some(health_enrichment_scheduler(runtime.handle()));
+                let cx = runtime_request_cx(Budget::INFINITE);
+                let held = block_on(pool.acquire(&cx))
+                    .into_result()
+                    .expect("hold sole live lease");
+                let old = Instant::now()
+                    .checked_sub(MAIL_READINESS_MAX_SAMPLE_AGE + Duration::from_secs(1))
+                    .unwrap();
+                {
+                    let mut cache = lock_mutex(&state.mail_readiness);
+                    cache.sample.as_mut().unwrap().observed_at = old;
+                    cache.last_attempt = Some(old);
+                }
+                let started = Instant::now();
+                let response =
+                    block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                assert_eq!(response.status, 503);
+                assert!(
+                    started.elapsed() < Duration::from_millis(500),
+                    "probe waited for the lease"
+                );
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    pool.sample_pool_stats_now();
+                    if mcp_agent_mail_core::global_metrics()
+                        .db
+                        .pool_pending_requests
+                        .load()
+                        > 0
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "probe never queued on the actual pool"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::scope(|threads| {
+                    for _ in 0..16 {
+                        threads.spawn(|| assert!(state.mail_readiness().result().is_err()));
+                    }
+                });
+                pool.sample_pool_stats_now();
+                assert!(
+                    mcp_agent_mail_core::global_metrics()
+                        .db
+                        .pool_pending_requests
+                        .load()
+                        <= 1,
+                    "repeated health calls created duplicate admission work"
+                );
+                let live = block_on(state.handle(make_request(Http1Method::Get, "/healthz", &[])));
+                assert_eq!(live.status, 200);
+                wait_for_mail_readiness_refresh(state);
+                assert!(
+                    lock_mutex(&state.mail_readiness)
+                        .sample
+                        .as_ref()
+                        .unwrap()
+                        .value
+                        .database
+                        .is_err(),
+                    "a timed-out acquisition refreshed a successful sample"
+                );
+                let response =
+                    block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                assert_eq!(response.status, 503);
+                assert_eq!(body["reason"], "database_probe_failed");
+                drop(held);
+                lock_mutex(&state.mail_readiness).last_attempt = None;
+                assert!(state.mail_readiness().result().is_err());
+                wait_for_mail_readiness_refresh(state);
+                let response =
+                    block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                assert_eq!(
+                    response.status, 200,
+                    "released serving pool must recover readiness"
+                );
+                state.health_refresh_scheduler = None;
+                assert!(runtime.shutdown_timeout(Duration::from_secs(5)));
+            });
+        });
+    }
+
+    #[test]
+    fn health_readiness_invalidates_another_pool_generation() {
+        const TEST: &str = "tests::health_readiness_invalidates_another_pool_generation";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        with_serialized_health_route(|| {
+            let mut config = prepared_http_test_config();
+            config.database_pool_size = Some(1);
+            config.database_max_overflow = Some(0);
+            config.integrity_check_on_startup = false;
+            let state = with_health_serving_env(&config, || {
+                let state = build_ready_health_state(config.clone());
+                assert!(state.mail_readiness().result().is_ok());
+                state
+            });
+            let first = lock_mutex(&state.mail_readiness).pool.clone().unwrap();
+            // Requests currently select their pool shape from the environment.
+            // A bound Config-only sizing override cannot authorize an old
+            // engine's proof for the different actual request pool.
+            let mut next_config = config;
+            next_config.database_pool_size = Some(2);
+            with_health_serving_env(&next_config, || {
+                let second = create_pool(&DbPoolConfig::from_env()).expect("next serving pool");
+                let cx = runtime_request_cx(Budget::INFINITE);
+                drop(
+                    block_on(second.acquire(&cx))
+                        .into_result()
+                        .expect("initialize next engine"),
+                );
+                assert_ne!(first.engine_identity_key(), second.engine_identity_key());
+                assert_eq!(state.config.database_pool_size, Some(1));
+                let response =
+                    block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                assert_eq!(response.status, 503);
+                assert_eq!(body["reason"], "database_probe_pending");
+                assert!(lock_mutex(&state.mail_readiness).sample.is_none());
+                prime_health_admission(&state, &second);
+                let response =
+                    block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                assert_eq!(response.status, 200);
+            });
+        });
+    }
+
+    #[test]
+    fn health_readiness_refuses_mismatched_serving_configuration() {
+        const TEST: &str = "tests::health_readiness_refuses_mismatched_serving_configuration";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        with_serialized_health_route(|| {
+            let temp = tempfile::tempdir().expect("private mismatched authority");
+            let bound_path = temp.path().join("bound.sqlite3");
+            let serving_path = temp.path().join("serving.sqlite3");
+            let bound = mcp_agent_mail_core::Config {
+                database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&bound_path),
+                storage_root: temp.path().join("bound-archive"),
+                integrity_check_on_startup: false,
+                ..Default::default()
+            };
+            let mut actual = bound.clone();
+            actual.database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&serving_path);
+            with_health_serving_env(&actual, || {
+                let state = build_state(bound.clone());
+                let response =
+                    block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                assert_eq!(response.status, 503);
+                assert_eq!(body["reason"], "database_configuration_mismatch");
+                assert!(
+                    readiness_check_with_integrity_and_startup_control(&bound, false, None)
+                        .unwrap_err()
+                        .contains("database_configuration_mismatch")
+                );
+                assert!(mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env()).is_none());
+                assert!(!bound_path.exists() && !serving_path.exists());
+            });
+            actual.database_url = bound.database_url.clone();
+            actual.storage_root = temp.path().join("serving-archive");
+            with_health_serving_env(&actual, || {
+                let state = build_state(bound.clone());
+                let response =
+                    block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                assert_eq!(response.status, 503);
+                assert_eq!(body["reason"], "storage_configuration_mismatch");
+                assert!(mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env()).is_none());
+                assert!(!bound_path.exists() && !serving_path.exists());
+            });
+        });
+    }
+
+    #[test]
+    fn health_readiness_reflects_real_archive_write_failure() {
+        const TEST: &str = "tests::health_readiness_reflects_real_archive_write_failure";
+        if run_prepared_http_test_in_child(TEST) {
+            return;
+        }
+        with_serialized_health_route(|| {
+            with_ready_health_state(isolated_health_config(), |state, archive| {
+                let pool = lock_mutex(&state.mail_readiness).pool.clone().unwrap();
+                assert!(state.mail_readiness().result().is_ok());
+                let blocked_root = archive.join("not-a-directory");
+                std::fs::write(&blocked_root, b"block archive creation").expect("real I/O failure");
+                let mut failing_config = state.config.clone();
+                failing_config.storage_root = blocked_root;
+                mcp_agent_mail_storage::wbq_start();
+                assert!(matches!(
+                    mcp_agent_mail_storage::wbq_enqueue(
+                        mcp_agent_mail_storage::WriteOp::AgentProfile {
+                            project_slug: "failed-archive".to_string(),
+                            config: failing_config,
+                            agent_json: serde_json::json!({
+                                "name": "BlueLake", "program": "test", "model": "test"
+                            }),
+                        }
+                    ),
+                    mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
+                ));
+                assert!(matches!(
+                    mcp_agent_mail_storage::wbq_flush_status(),
+                    mcp_agent_mail_storage::WbqFlushOutcome::Drained
+                ));
+                mcp_agent_mail_storage::wbq_shutdown();
+                assert!(mcp_agent_mail_storage::durability_degraded());
+                // Re-probe reads so a slow CI filesystem cannot turn this into
+                // a sample-expiry test. This never clears the real write latch.
+                prime_health_admission(state, &pool);
+                let response =
+                    block_on(state.handle(make_request(Http1Method::Get, "/health", &[])));
+                let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                assert_eq!(response.status, 503);
+                assert_eq!(body["reason"], "durability_degraded");
+                assert_eq!(body["writes_refused"], "DURABILITY_DEGRADED");
+                assert_eq!(body["capabilities"]["mail_read"], true);
+                assert_eq!(body["capabilities"]["mail_write"], false);
+                assert_eq!(body["capabilities"]["lexical_search"], true);
+                let live = block_on(state.handle(make_request(Http1Method::Get, "/healthz", &[])));
+                assert_eq!(
+                    live.status, 200,
+                    "write refusal must not restart the listener"
+                );
+            });
+        });
+    }
+
+    #[test]
     fn health_readiness_returns_ready_json() {
+        if run_prepared_http_test_in_child("tests::health_readiness_returns_ready_json") {
+            return;
+        }
         with_serialized_health_route(|| {
             let config = isolated_health_config();
-            let state = build_state(config);
-            let req = make_request(Http1Method::Get, "/health/readiness", &[]);
-            let resp = block_on(state.handle(req));
-            assert_eq!(resp.status, 200);
-            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-            assert_eq!(body["status"], "ready");
-            // Enriched identity fields are present.
-            assert!(
-                body.get("version").is_some(),
-                "version field must be present"
-            );
-            assert!(
-                body.get("database_path").is_some(),
-                "database_path field must be present"
-            );
-            assert!(
-                body.get("project_count").is_some(),
-                "project_count field must be present"
-            );
-            assert!(
-                body.get("message_count").is_some(),
-                "message_count field must be present"
-            );
-            assert_eq!(body["atc_experience_store"]["storage"], "in_memory");
-            assert_eq!(body["atc_experience_store"]["write_mode"], "off");
-            assert_eq!(
-                body["atc_experience_store"]["row_cap"],
-                serde_json::json!(50_000)
-            );
-            assert_eq!(
-                body["atc_experience_store"]["row_cap_enforced"],
-                serde_json::json!(false)
-            );
-            assert_eq!(body["database_path"], ":memory:");
-            assert_eq!(body["durability_state"], "not_probed");
+            with_ready_health_state(config, |state, _archive| {
+                let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+                let resp = block_on(state.handle(req));
+                assert_eq!(resp.status, 200);
+                let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+                assert_eq!(body["status"], "ready");
+                // Enriched identity fields are present.
+                assert!(
+                    body.get("version").is_some(),
+                    "version field must be present"
+                );
+                assert!(
+                    body.get("database_path").is_some(),
+                    "database_path field must be present"
+                );
+                assert!(
+                    body.get("project_count").is_some(),
+                    "project_count field must be present"
+                );
+                assert!(
+                    body.get("message_count").is_some(),
+                    "message_count field must be present"
+                );
+                assert_eq!(body["atc_experience_store"]["storage"], "in_memory");
+                assert_eq!(body["atc_experience_store"]["write_mode"], "off");
+                assert_eq!(
+                    body["atc_experience_store"]["row_cap"],
+                    serde_json::json!(50_000)
+                );
+                assert_eq!(
+                    body["atc_experience_store"]["row_cap_enforced"],
+                    serde_json::json!(false)
+                );
+                assert_eq!(body["database_path"], ":memory:");
+                assert_eq!(body["durability_state"], "not_probed");
+            });
         });
     }
 
@@ -30207,6 +33810,11 @@ first body
     #[test]
     #[allow(clippy::too_many_lines)]
     fn health_enrichment_cold_and_expired_requests_do_not_wait_for_runtime_probe() {
+        if run_prepared_http_test_in_child(
+            "tests::health_enrichment_cold_and_expired_requests_do_not_wait_for_runtime_probe",
+        ) {
+            return;
+        }
         with_serialized_health_route(|| {
             let dir = tempfile::tempdir().expect("tempdir");
             let config = health_enrichment_fixture(dir.path());
@@ -30219,122 +33827,127 @@ first body
                 .handle()
                 .blocking_handle()
                 .expect("owned blocking pool");
-            let mut state = build_state(config);
-            state.health_refresh_scheduler = Some(health_enrichment_scheduler(runtime.handle()));
+            with_ready_health_state(config, |state, _archive| {
+                state.health_refresh_scheduler =
+                    Some(health_enrichment_scheduler(runtime.handle()));
+                let serving_pool = lock_mutex(&state.mail_readiness).pool.clone().unwrap();
 
-            for expired in [false, true] {
-                if expired {
-                    let primary =
-                        resolve_server_database_url_sqlite_path(&state.config.database_url)
-                            .expect("primary path");
-                    let sidecar_path =
-                        mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(primary.to_str().unwrap());
-                    let sidecar = mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar_path)
-                        .expect("reopen sidecar");
-                    sidecar
-                        .execute_raw("INSERT INTO atc_experiences (state) VALUES ('second');")
-                        .expect("second observation");
-                    drop(sidecar);
-                    let old = Instant::now()
-                        .checked_sub(HEALTH_ENRICHMENT_CACHE_TTL + Duration::from_secs(1))
-                        .expect("expired sample time");
-                    let mut cache = lock_mutex(&state.health_enrichment);
-                    cache.last_attempt = Some(old);
-                    cache.counts.as_mut().expect("first counts").observed_at = old;
-                    cache
-                        .atc
-                        .as_mut()
-                        .expect("first sidecar sample")
-                        .observed_at = old;
-                }
-
-                // Occupy the actual runtime pool, not a substitute probe. A
-                // refresh must remain queued until these requests finish.
-                let (started_tx, started_rx) = std::sync::mpsc::channel();
-                let (release_tx, release_rx) = std::sync::mpsc::channel();
-                let blocker = runtime
-                    .handle()
-                    .spawn_blocking(move || {
-                        let _ = started_tx.send(());
-                        let _ = release_rx.recv_timeout(Duration::from_secs(15));
-                    })
-                    .expect("occupy owned pool");
-                started_rx
-                    .recv_timeout(Duration::from_secs(5))
-                    .expect("blocker started");
-                std::thread::scope(|scope| {
-                    for _ in 0..8 {
-                        scope.spawn(|| state.schedule_health_enrichment_refresh());
-                    }
-                });
-                assert_eq!(
-                    pool.pending_count(),
-                    1,
-                    "concurrent callers share one refresh"
-                );
-                for path in [
-                    "/health",
-                    "/health/readiness",
-                    "/health",
-                    "/health/readiness",
-                ] {
-                    let started = Instant::now();
-                    let response =
-                        block_on(state.handle(make_request(Http1Method::Get, path, &[])));
-                    assert_eq!(response.status, 200);
-                    assert!(
-                        started.elapsed() < Duration::from_secs(2),
-                        "readiness waited on optional enrichment"
-                    );
-                    let body: serde_json::Value =
-                        serde_json::from_slice(&response.body).expect("health JSON");
-                    assert_eq!(body["enrichment_refresh_in_flight"], true);
-                    assert_eq!(body["durability_state"], "not_probed");
+                for expired in [false, true] {
+                    prime_health_admission(state, &serving_pool);
                     if expired {
-                        assert_eq!(body["project_count"], 1);
-                        assert_eq!(body["counts_sample_stale"], true);
-                        assert_eq!(body["atc_experience_store"]["raw_row_count"], 1);
-                        assert_eq!(body["atc_experience_store"]["sample_stale"], true);
-                    } else {
-                        assert!(body["project_count"].is_null());
-                        assert!(body["counts_sample_age_ms"].is_null());
-                        assert!(body["atc_experience_store"]["raw_row_count"].is_null());
-                        assert!(body["atc_experience_store"]["sample_age_ms"].is_null());
+                        let primary =
+                            resolve_server_database_url_sqlite_path(&state.config.database_url)
+                                .expect("primary path");
+                        let sidecar_path = mcp_agent_mail_db::pool::atc_sidecar_sqlite_path(
+                            primary.to_str().unwrap(),
+                        );
+                        let sidecar = mcp_agent_mail_db::CanonicalDbConn::open_file(&sidecar_path)
+                            .expect("reopen sidecar");
+                        sidecar
+                            .execute_raw("INSERT INTO atc_experiences (state) VALUES ('second');")
+                            .expect("second observation");
+                        drop(sidecar);
+                        let old = Instant::now()
+                            .checked_sub(HEALTH_ENRICHMENT_CACHE_TTL + Duration::from_secs(1))
+                            .expect("expired sample time");
+                        let mut cache = lock_mutex(&state.health_enrichment);
+                        cache.last_attempt = Some(old);
+                        cache.counts.as_mut().expect("first counts").observed_at = old;
+                        cache
+                            .atc
+                            .as_mut()
+                            .expect("first sidecar sample")
+                            .observed_at = old;
                     }
+
+                    // Occupy the actual runtime pool, not a substitute probe. A
+                    // refresh must remain queued until these requests finish.
+                    let (started_tx, started_rx) = std::sync::mpsc::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel();
+                    let blocker = runtime
+                        .handle()
+                        .spawn_blocking(move || {
+                            let _ = started_tx.send(());
+                            let _ = release_rx.recv_timeout(Duration::from_secs(15));
+                        })
+                        .expect("occupy owned pool");
+                    started_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("blocker started");
+                    std::thread::scope(|scope| {
+                        for _ in 0..8 {
+                            scope.spawn(|| state.schedule_health_enrichment_refresh());
+                        }
+                    });
                     assert_eq!(
                         pool.pending_count(),
                         1,
-                        "one refresh despite repeated requests"
+                        "concurrent callers share one refresh"
                     );
+                    for path in [
+                        "/health",
+                        "/health/readiness",
+                        "/health",
+                        "/health/readiness",
+                    ] {
+                        let started = Instant::now();
+                        let response =
+                            block_on(state.handle(make_request(Http1Method::Get, path, &[])));
+                        assert_eq!(response.status, 200);
+                        assert!(
+                            started.elapsed() < Duration::from_secs(2),
+                            "readiness waited on optional enrichment"
+                        );
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&response.body).expect("health JSON");
+                        assert_eq!(body["enrichment_refresh_in_flight"], true);
+                        assert_eq!(body["durability_state"], "not_probed");
+                        if expired {
+                            assert_eq!(body["project_count"], 1);
+                            assert_eq!(body["counts_sample_stale"], true);
+                            assert_eq!(body["atc_experience_store"]["raw_row_count"], 1);
+                            assert_eq!(body["atc_experience_store"]["sample_stale"], true);
+                        } else {
+                            assert!(body["project_count"].is_null());
+                            assert!(body["counts_sample_age_ms"].is_null());
+                            assert!(body["atc_experience_store"]["raw_row_count"].is_null());
+                            assert!(body["atc_experience_store"]["sample_age_ms"].is_null());
+                        }
+                        assert_eq!(
+                            pool.pending_count(),
+                            1,
+                            "one refresh despite repeated requests"
+                        );
+                        assert!(
+                            !blocker.is_done(),
+                            "requests completed while the real pool was blocked"
+                        );
+                    }
+                    release_tx.send(()).expect("release pool");
+                    assert!(blocker.wait_timeout(Duration::from_secs(5)));
+                    wait_for_health_enrichment(state);
+                    let mut body = serde_json::json!({});
+                    enrich_readiness_response(&state.config, &state.health_enrichment, &mut body);
+                    assert_eq!(body["project_count"], 1);
+                    assert_eq!(body["message_count"], 0);
+                    assert_eq!(body["counts_sample_stale"], false);
+                    let atc = &body["atc_experience_store"];
+                    assert_eq!(atc["raw_row_count"], if expired { 2 } else { 1 });
+                    assert_eq!(atc["storage"], "sidecar");
+                    assert_eq!(atc["quick_check"], "ok");
+                    assert_eq!(atc["write_mode"], "live");
+                    assert_eq!(atc["row_cap"], 2);
+                    assert_eq!(atc["row_cap_enforced"], true);
+                    assert_eq!(atc["sample_stale"], false);
+                    assert!(atc["sample_age_ms"].as_u64().is_some());
                     assert!(
-                        !blocker.is_done(),
-                        "requests completed while the real pool was blocked"
+                        atc["size_share_basis_points"]
+                            .as_u64()
+                            .is_some_and(|share| share > 0)
                     );
+                    assert_eq!(pool.pending_count(), 0);
                 }
-                release_tx.send(()).expect("release pool");
-                assert!(blocker.wait_timeout(Duration::from_secs(5)));
-                wait_for_health_enrichment(&state);
-                let mut body = serde_json::json!({});
-                enrich_readiness_response(&state.config, &state.health_enrichment, &mut body);
-                assert_eq!(body["project_count"], 1);
-                assert_eq!(body["message_count"], 0);
-                assert_eq!(body["counts_sample_stale"], false);
-                let atc = &body["atc_experience_store"];
-                assert_eq!(atc["raw_row_count"], if expired { 2 } else { 1 });
-                assert_eq!(atc["storage"], "sidecar");
-                assert_eq!(atc["quick_check"], "ok");
-                assert_eq!(atc["write_mode"], "live");
-                assert_eq!(atc["row_cap"], 2);
-                assert_eq!(atc["row_cap_enforced"], true);
-                assert_eq!(atc["sample_stale"], false);
-                assert!(atc["sample_age_ms"].as_u64().is_some());
-                assert!(
-                    atc["size_share_basis_points"]
-                        .as_u64()
-                        .is_some_and(|share| share > 0)
-                );
-                assert_eq!(pool.pending_count(), 0);
-            }
+            });
         });
     }
 
@@ -30511,26 +34124,55 @@ first body
     }
 
     #[test]
+    fn health_readiness_exposes_disabled_atc_population_without_changing_admission() {
+        if run_prepared_http_test_in_child(
+            "tests::health_readiness_exposes_disabled_atc_population_without_changing_admission",
+        ) {
+            return;
+        }
+        with_serialized_health_route(|| {
+            let config = mcp_agent_mail_core::Config {
+                atc_enabled: false,
+                ..isolated_health_config()
+            };
+            with_ready_health_state(config, |state, _archive| {
+                let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+                let response = block_on(state.handle(req));
+                assert_eq!(response.status, 200);
+                let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                assert_eq!(body["status"], "ready");
+                assert_eq!(body["atc_population_hydration"]["status"], "disabled");
+                assert!(body["atc_population_hydration"]["progress"].is_null());
+                assert!(body["atc_population_hydration"]["backlog_age_ms"].is_null());
+            });
+        });
+    }
+
+    #[test]
     fn health_root_alias_returns_ready_json() {
+        if run_prepared_http_test_in_child("tests::health_root_alias_returns_ready_json") {
+            return;
+        }
         with_serialized_health_route(|| {
             let config = isolated_health_config();
-            let state = build_state(config);
-            let req = make_request(Http1Method::Get, "/health", &[]);
-            let resp = block_on(state.handle(req));
-            assert_eq!(resp.status, 200);
-            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-            assert_eq!(body["status"], "ready");
-            // Enriched identity fields are present.
-            assert!(
-                body.get("version").is_some(),
-                "version field must be present"
-            );
-            assert!(
-                body.get("database_path").is_some(),
-                "database_path field must be present"
-            );
-            assert_eq!(body["database_path"], ":memory:");
-            assert_eq!(body["durability_state"], "not_probed");
+            with_ready_health_state(config, |state, _archive| {
+                let req = make_request(Http1Method::Get, "/health", &[]);
+                let resp = block_on(state.handle(req));
+                assert_eq!(resp.status, 200);
+                let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+                assert_eq!(body["status"], "ready");
+                // Enriched identity fields are present.
+                assert!(
+                    body.get("version").is_some(),
+                    "version field must be present"
+                );
+                assert!(
+                    body.get("database_path").is_some(),
+                    "database_path field must be present"
+                );
+                assert_eq!(body["database_path"], ":memory:");
+                assert_eq!(body["durability_state"], "not_probed");
+            });
         });
     }
 
@@ -30803,33 +34445,41 @@ first body
 
     #[test]
     fn health_readiness_bypasses_bearer_auth() {
+        if run_prepared_http_test_in_child("tests::health_readiness_bypasses_bearer_auth") {
+            return;
+        }
         with_serialized_health_route(|| {
             let config = mcp_agent_mail_core::Config {
                 http_bearer_token: Some("secret-token".to_string()),
                 ..isolated_health_config()
             };
-            let state = build_state(config);
-            let req = make_request(Http1Method::Get, "/health/readiness", &[]);
-            let resp = block_on(state.handle(req));
-            assert_eq!(resp.status, 200);
-            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-            assert_eq!(body["status"], "ready");
+            with_ready_health_state(config, |state, _archive| {
+                let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+                let resp = block_on(state.handle(req));
+                assert_eq!(resp.status, 200);
+                let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+                assert_eq!(body["status"], "ready");
+            });
         });
     }
 
     #[test]
     fn health_root_alias_bypasses_bearer_auth() {
+        if run_prepared_http_test_in_child("tests::health_root_alias_bypasses_bearer_auth") {
+            return;
+        }
         with_serialized_health_route(|| {
             let config = mcp_agent_mail_core::Config {
                 http_bearer_token: Some("secret-token".to_string()),
                 ..isolated_health_config()
             };
-            let state = build_state(config);
-            let req = make_request(Http1Method::Get, "/health", &[]);
-            let resp = block_on(state.handle(req));
-            assert_eq!(resp.status, 200);
-            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-            assert_eq!(body["status"], "ready");
+            with_ready_health_state(config, |state, _archive| {
+                let req = make_request(Http1Method::Get, "/health", &[]);
+                let resp = block_on(state.handle(req));
+                assert_eq!(resp.status, 200);
+                let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+                assert_eq!(body["status"], "ready");
+            });
         });
     }
 
@@ -36013,7 +39663,8 @@ first body
                 ack_required INTEGER NOT NULL DEFAULT 0,
                 created_ts INTEGER NOT NULL,
                 attachments TEXT NOT NULL DEFAULT '[]',
-                recipients_json TEXT NOT NULL DEFAULT '[]'
+                recipients_json TEXT NOT NULL DEFAULT '[]',
+                archive_metadata_json TEXT
             )",
             &[],
         )
@@ -36111,7 +39762,7 @@ first body
 
         let newest = conn
             .query_sync(
-                "SELECT id, subject, thread_id FROM messages ORDER BY id DESC LIMIT 1",
+                "SELECT id, subject, thread_id, archive_metadata_json FROM messages ORDER BY id DESC LIMIT 1",
                 &[],
             )
             .expect("query newest message")
@@ -36133,6 +39784,23 @@ first body
         );
         assert_eq!(new_subject, "compose subject");
         assert_eq!(new_thread.as_deref(), Some("br-123"));
+        assert_eq!(
+            newest.get_named::<String>("archive_metadata_json").unwrap(),
+            "{}"
+        );
+        let legacy = conn
+            .query_sync(
+                "SELECT archive_metadata_json FROM messages WHERE id = 1",
+                &[],
+            )
+            .expect("query legacy archive authority");
+        assert_eq!(
+            legacy[0]
+                .get_named::<Option<String>>("archive_metadata_json")
+                .unwrap(),
+            None,
+            "compose must not invent reply metadata for pre-existing messages"
+        );
 
         let legacy_recips = conn
             .query_sync(
@@ -36291,7 +39959,7 @@ first body
             mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
         let row = conn
             .query_sync(
-                "SELECT thread_id FROM messages WHERE subject = ?1 LIMIT 1",
+                "SELECT thread_id, archive_metadata_json FROM messages WHERE subject = ?1 LIMIT 1",
                 &[mcp_agent_mail_db::sqlmodel_core::Value::Text(
                     "compose no thread".to_string(),
                 )],
@@ -36306,6 +39974,10 @@ first body
         assert!(
             thread_id.is_none(),
             "thread_id should be NULL when compose envelope omits it"
+        );
+        assert_eq!(
+            row.get_named::<String>("archive_metadata_json").unwrap(),
+            "{}"
         );
     }
 
@@ -37103,6 +40775,86 @@ first body
     }
 
     // ── D3: query-parameter token auth for /mail ─────────────────
+
+    #[test]
+    fn mail_tailwind_asset_serves_embedded_bytes_without_opening_a_mailbox() {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let absent = root.path().join("must-not-be-created");
+        let state = build_state(mcp_agent_mail_core::Config {
+            database_url: "unsupported://asset-must-not-open-db".to_string(),
+            storage_root: absent.clone(),
+            http_bearer_token: Some("private-mailbox-token".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        });
+        let req = make_request(Http1Method::Get, templates::MAIL_TAILWIND_ASSET_PATH, &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body.len(), 407_279);
+        let integrity = format!(
+            "sha256-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&resp.body))
+        );
+        assert_eq!(integrity, templates::MAIL_TAILWIND_INTEGRITY);
+        assert!(resp.headers.iter().any(|(name, value)| {
+            name == "content-type" && value == "text/javascript; charset=utf-8"
+        }));
+        let html = templates::render_template("error.html", serde_json::json!({"message":"test"}))
+            .unwrap()
+            .replace("&#x2f;", "/");
+        assert!(html.contains(&format!("src=\"{}\"", templates::MAIL_TAILWIND_ASSET_PATH)));
+        assert!(html.contains(&format!("integrity=\"{integrity}\"")));
+        assert!(!html.contains("https://cdn.tailwindcss.com"));
+        assert!(
+            !absent.exists(),
+            "static serving must not create mailbox state"
+        );
+    }
+
+    #[test]
+    fn mail_tailwind_asset_only_exposes_the_exact_public_asset() {
+        let state = build_state(mcp_agent_mail_core::Config {
+            http_bearer_token: Some("private-mailbox-token".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        });
+        for path in [
+            "/mail",
+            "/mail/static/vendor_manifest.json",
+            "/mail/static/tailwind-3.4.16.min.js",
+            "/mail/static/../storage.sqlite3",
+            "/mail/static/tailwind-3.4.17.min.js/extra",
+        ] {
+            let resp = block_on(state.handle(make_request(Http1Method::Get, path, &[])));
+            assert_eq!(resp.status, 401, "private or unknown route {path}");
+        }
+        let resp = block_on(state.handle(make_request(
+            Http1Method::Post,
+            templates::MAIL_TAILWIND_ASSET_PATH,
+            &[],
+        )));
+        assert_eq!(resp.status, 405);
+        assert!(
+            resp.headers
+                .iter()
+                .any(|(name, value)| name == "allow" && value == "GET, HEAD, OPTIONS")
+        );
+        let head = block_on(state.handle(make_request(
+            Http1Method::Head,
+            templates::MAIL_TAILWIND_ASSET_PATH,
+            &[],
+        )));
+        assert_eq!(head.status, 200);
+        assert_eq!(head.body, Vec::<u8>::new());
+        assert!(
+            head.headers
+                .iter()
+                .any(|(name, value)| { name == "content-length" && value == "407279" })
+        );
+    }
 
     #[test]
     fn mail_route_accepts_query_token_when_bearer_configured() {

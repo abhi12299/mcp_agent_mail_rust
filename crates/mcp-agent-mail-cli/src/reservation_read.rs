@@ -22,6 +22,7 @@ use crate::{CliError, CliResult};
 // The opt-in snapshot resource proves completeness in one database read scope.
 // Its bounds are shared with the server; independent pages cannot prove this.
 use mcp_agent_mail_db::queries::{
+    FILE_RESERVATION_PAGED_MAX_BYTES, FILE_RESERVATION_PAGED_MAX_ROWS,
     FILE_RESERVATION_SNAPSHOT_MAX_BYTES, FILE_RESERVATION_SNAPSHOT_MAX_ROWS,
 };
 // Older running servers expose only capped resource pages. A short first page
@@ -30,6 +31,33 @@ const LEGACY_RESOURCE_PAGE_MAX: usize = 250;
 const RESOURCE_TIMEOUT_SECONDS: u64 = 30;
 const MAILBOX_PROBE_TIMEOUT_SECONDS: u64 = 2;
 const MAILBOX_CONFIG_RESOURCE: &str = "resource://config/environment";
+const RESOURCE_ERROR_MESSAGE_MAX_CHARS: usize = 1024;
+const PAGED_SNAPSHOT_MAX_PAGES: usize = 1024;
+const PAGED_SNAPSHOT_TIMEOUT_SECONDS: u64 = 300;
+const PAGED_SNAPSHOT_RELEASE_TIMEOUT_SECONDS: u64 = 2;
+
+/// Only an authenticated, well-formed capacity refusal permits negotiation of
+/// a larger snapshot. Other failures retain their original trust boundary.
+#[derive(Debug)]
+struct ResourceReadError {
+    error: CliError,
+    snapshot_limit: bool,
+}
+
+impl From<CliError> for ResourceReadError {
+    fn from(error: CliError) -> Self {
+        Self {
+            error,
+            snapshot_limit: false,
+        }
+    }
+}
+
+impl From<ResourceReadError> for CliError {
+    fn from(error: ResourceReadError) -> Self {
+        error.error
+    }
+}
 
 /// A pinned, authenticated resource authority shared by explicit server reads.
 pub(crate) struct ServerResourceSession {
@@ -38,11 +66,12 @@ pub(crate) struct ServerResourceSession {
     bearer: Option<String>,
     ancestor_resolution: bool,
     inbox_priority_snapshot: bool,
+    search_recipient_kind: bool,
 }
 
 impl ServerResourceSession {
     pub(crate) fn new(config: &Config) -> CliResult<Self> {
-        let server_url = crate::local_server_url(config);
+        let server_url = crate::local_server_url(config)?;
         let bearer = mcp_agent_mail_core::config::env_value("AGENT_MAIL_TOKEN")
             .filter(|token| !token.trim().is_empty())
             .or_else(|| crate::local_server_bearer_token(config))
@@ -65,11 +94,21 @@ impl ServerResourceSession {
             bearer,
             ancestor_resolution: false,
             inbox_priority_snapshot: false,
+            search_recipient_kind: false,
         })
     }
 
     pub(crate) async fn read(&self, uri: &str) -> CliResult<Value> {
-        read_resource_json(&self.client, &self.server_url, self.bearer.as_deref(), uri).await
+        read_resource_json(
+            &self.client,
+            &self.server_url,
+            self.bearer.as_deref(),
+            uri,
+            RESOURCE_TIMEOUT_SECONDS,
+        )
+        .await
+        .map(|(payload, _)| payload)
+        .map_err(CliError::from)
     }
 
     /// Select the daemon only when its authenticated configuration names the
@@ -85,7 +124,7 @@ impl ServerResourceSession {
         if !is_local_mailbox_endpoint(&session.server_url)? {
             return Ok(None);
         }
-        let id = format!("cli-resource-read-{MAILBOX_CONFIG_RESOURCE}");
+        let id = crate::resource_read_request_id(MAILBOX_CONFIG_RESOURCE);
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": &id,
@@ -105,12 +144,18 @@ impl ServerResourceSession {
             Err(error) if crate::server_tool_error_is_unavailable(&error) => return Ok(None),
             Err(error) => return Err(sanitize_transport_error(error)),
         };
-        let payload = validate_resource_response(&response, &id, MAILBOX_CONFIG_RESOURCE)?;
+        let payload = validate_resource_response(
+            &response,
+            &id,
+            MAILBOX_CONFIG_RESOURCE,
+            &[session.bearer.as_deref().unwrap_or(""), &session.server_url],
+        )?;
         if !mailbox_config_matches(&payload, config)? {
             return Ok(None);
         }
         session.ancestor_resolution = supports_ancestor_resolution(&payload)?;
         session.inbox_priority_snapshot = supports_inbox_priority_snapshot(&payload)?;
+        session.search_recipient_kind = supports_search_recipient_kind(&payload)?;
         Ok(Some(session))
     }
 
@@ -122,11 +167,23 @@ impl ServerResourceSession {
         self.inbox_priority_snapshot
     }
 
+    pub(crate) const fn supports_search_recipient_kind(&self) -> bool {
+        self.search_recipient_kind
+    }
+
     pub(crate) async fn verify_local_mailbox(&self, config: &Config) -> CliResult<()> {
-        let payload = self.read(MAILBOX_CONFIG_RESOURCE).await?;
+        let (payload, _) = read_resource_json(
+            &self.client,
+            &self.server_url,
+            self.bearer.as_deref(),
+            MAILBOX_CONFIG_RESOURCE,
+            MAILBOX_PROBE_TIMEOUT_SECONDS,
+        )
+        .await?;
         if !mailbox_config_matches(&payload, config)?
             || (self.ancestor_resolution && !supports_ancestor_resolution(&payload)?)
             || (self.inbox_priority_snapshot && !supports_inbox_priority_snapshot(&payload)?)
+            || (self.search_recipient_kind && !supports_search_recipient_kind(&payload)?)
         {
             return Err(invalid_response(
                 "mailbox identity changed during server read",
@@ -139,6 +196,16 @@ impl ServerResourceSession {
     /// identity checks. Never follow a redirect or reinterpret a rejection as
     /// permission to read a local mailbox.
     pub(crate) async fn call_tool(&self, tool: &str, arguments: Value) -> CliResult<Value> {
+        self.call_tool_with_timeout(tool, arguments, RESOURCE_TIMEOUT_SECONDS)
+            .await
+    }
+
+    pub(crate) async fn call_tool_with_timeout(
+        &self,
+        tool: &str,
+        arguments: Value,
+        timeout_seconds: u64,
+    ) -> CliResult<Value> {
         let id = format!("cli-read-{tool}");
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -150,7 +217,7 @@ impl ServerResourceSession {
             &self.server_url,
             self.bearer.as_deref(),
             &request,
-            RESOURCE_TIMEOUT_SECONDS,
+            timeout_seconds,
             &self.client,
         )
         .await
@@ -222,6 +289,14 @@ fn supports_inbox_priority_snapshot(value: &Value) -> CliResult<bool> {
     }
 }
 
+fn supports_search_recipient_kind(value: &Value) -> CliResult<bool> {
+    match value.get("search_recipient_kind") {
+        None => Ok(false),
+        Some(Value::String(capability)) => Ok(capability == "delivery_v1"),
+        Some(_) => Err(invalid_response("invalid search recipient-kind capability")),
+    }
+}
+
 fn is_local_mailbox_endpoint(endpoint: &str) -> CliResult<bool> {
     let parsed = asupersync::http::h1::ParsedUrl::parse(endpoint)
         .map_err(|_| invalid_response("invalid MCP endpoint URL"))?;
@@ -232,7 +307,7 @@ fn is_local_mailbox_endpoint(endpoint: &str) -> CliResult<bool> {
             .is_ok_and(|address| address.is_loopback()))
 }
 
-fn mailbox_config_matches(value: &Value, config: &Config) -> CliResult<bool> {
+pub(crate) fn mailbox_config_matches(value: &Value, config: &Config) -> CliResult<bool> {
     let database_url = nonempty_text(value, "database_url")?;
     // Older servers do not expose the archive root. They cannot authorize an
     // automatic switch from the selected local mailbox to this endpoint.
@@ -288,10 +363,10 @@ pub(crate) struct ServerReservationRead {
 
 /// Read reservations without admitting a new connection to the local mailbox.
 ///
-/// Always require a complete listing. Independent OFFSET requests are not a
-/// consistent snapshot and may silently skip a live lease as other agents
-/// release reservations. Native CLI ordering and pagination are applied only
-/// after the complete response has been verified.
+/// Always require a complete listing. Large histories may use immutable pages
+/// captured by the server in one database snapshot; independent OFFSET reads
+/// cannot prove completeness. Native CLI ordering and pagination are applied
+/// only after the complete response has been verified.
 pub(crate) fn read_server(
     config: &Config,
     project_key: &str,
@@ -356,32 +431,8 @@ async fn read_reservations_session(
     let (project, before) = read_project_descriptor(session, project_uri, selection).await?;
     let agent_roster = validate_agent_roster(&before, project.id)?;
 
-    let reservation_uri = format!(
-        "resource://file_reservations/{}?snapshot=true&active_only={active_only}&format=json",
-        encode_resource_component(&project.slug)
-    );
-    let payload = session.read(&reservation_uri).await?;
-    let (holder_roster, reservations) = if payload.is_array() {
-        // v0.3.39 ignores the unknown snapshot parameter and returns its
-        // ordinary default page (20 rows). That page is only a protocol
-        // signal, never evidence of a complete listing. Validate it before
-        // negotiating, then discard it and request the explicit page bound
-        // from the same authenticated authority. Do not negotiate after an
-        // HTTP/RPC error, invalid envelope, or malformed snapshot object.
-        validate_legacy_reservation_page(&payload, active_only)?;
-        let legacy_uri = format!(
-            "resource://file_reservations/{}?active_only={active_only}&limit={LEGACY_RESOURCE_PAGE_MAX}&offset=0&format=json",
-            encode_resource_component(&project.slug)
-        );
-        let legacy_payload = session.read(&legacy_uri).await?;
-        let reservations = validate_complete_legacy_reservations(&legacy_payload, active_only)?;
-        // Legacy pages identify holders by name, not ID. Preserve those
-        // names in the rows, while explicit --agent resolution continues
-        // to use the independently verified available-agent directory.
-        (agent_roster.clone(), reservations)
-    } else {
-        validate_snapshot(&payload, &project, active_only)?
-    };
+    let (holder_roster, reservations) =
+        read_reservation_snapshot(session, &project, &agent_roster, active_only).await?;
     if agent_roster
         .iter()
         .any(|agent| holder_roster.binary_search(agent).is_err())
@@ -410,6 +461,128 @@ async fn read_reservations_session(
     })
 }
 
+async fn read_reservation_snapshot(
+    session: &ServerResourceSession,
+    project: &ResolvedProject,
+    agent_roster: &AgentRoster,
+    active_only: bool,
+) -> CliResult<(AgentRoster, Vec<ServerReservation>)> {
+    let reservation_uri = format!(
+        "resource://file_reservations/{}?snapshot=true&active_only={active_only}&format=json",
+        encode_resource_component(&project.slug)
+    );
+    let payload = match read_resource_json(
+        &session.client,
+        &session.server_url,
+        session.bearer.as_deref(),
+        &reservation_uri,
+        RESOURCE_TIMEOUT_SECONDS,
+    )
+    .await
+    {
+        Ok((payload, _)) => payload,
+        Err(error) if error.snapshot_limit && !active_only => {
+            // History-only negotiation after a precise capacity refusal. The
+            // new route retains one immutable DB snapshot, never independent
+            // live pages. Keep the original refusal if negotiation fails.
+            return read_paged_reservation_snapshot(session, project)
+                .await
+                .map_err(|paged_error| {
+                    CliError::Other(format!(
+                        "{}; paged reservation history failed: {paged_error}",
+                        error.error
+                    ))
+                });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if payload.is_array() {
+        // v0.3.39 ignores the unknown snapshot parameter and returns its
+        // ordinary default page (20 rows). That page is only a protocol
+        // signal, never evidence of a complete listing. Validate it before
+        // negotiating, then discard it and request the explicit page bound
+        // from the same authenticated authority. Do not negotiate after an
+        // HTTP/RPC error, invalid envelope, or malformed snapshot object.
+        validate_legacy_reservation_page(&payload, active_only)?;
+        let legacy_uri = format!(
+            "resource://file_reservations/{}?active_only={active_only}&limit={LEGACY_RESOURCE_PAGE_MAX}&offset=0&format=json",
+            encode_resource_component(&project.slug)
+        );
+        let legacy_payload = session.read(&legacy_uri).await?;
+        let reservations = validate_complete_legacy_reservations(&legacy_payload, active_only)?;
+        // Legacy pages identify holders by name, not ID. Preserve those
+        // names in the rows, while explicit --agent resolution continues
+        // to use the independently verified available-agent directory.
+        Ok((agent_roster.clone(), reservations))
+    } else {
+        validate_snapshot(&payload, project, active_only)
+    }
+}
+
+async fn read_paged_reservation_snapshot(
+    session: &ServerResourceSession,
+    project: &ResolvedProject,
+) -> CliResult<(AgentRoster, Vec<ServerReservation>)> {
+    let base_uri = format!(
+        "resource://file_reservations/{}?snapshot_pages=true&active_only=false&format=json",
+        encode_resource_component(&project.slug)
+    );
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(PAGED_SNAPSHOT_TIMEOUT_SECONDS);
+    let mut state = PagedReservationRead::default();
+    let result: CliResult<()> = async {
+        let mut uri = base_uri.clone();
+        for _ in 0..PAGED_SNAPSHOT_MAX_PAGES {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| {
+                    invalid_response("paged reservation snapshot deadline exceeded; retry the read")
+                })?;
+            let (payload, text_bytes) = read_resource_json(
+                &session.client,
+                &session.server_url,
+                session.bearer.as_deref(),
+                &uri,
+                RESOURCE_TIMEOUT_SECONDS.min(remaining.as_secs().max(1)),
+            )
+            .await?;
+            if state.accept_page(&payload, project, text_bytes)? {
+                return Ok(());
+            }
+            uri = format!(
+                "{base_uri}&snapshot_token={}&offset={}",
+                state.token,
+                state.reservations.len()
+            );
+        }
+        Err(invalid_response(
+            "paged reservation snapshot exceeds the page request limit",
+        ))
+    }
+    .await;
+
+    if state.supports_release && !state.token.is_empty() {
+        // Finished and failed reads must not occupy a cache slot for the full
+        // TTL. Release only the original validated identity, and only when
+        // that snapshot advertised the operation: older servers may ignore
+        // unknown query flags. Cleanup cannot change the read's outcome.
+        let release_uri = format!(
+            "{base_uri}&snapshot_token={}&snapshot_release=true",
+            state.token
+        );
+        let _ = read_resource_json(
+            &session.client,
+            &session.server_url,
+            session.bearer.as_deref(),
+            &release_uri,
+            PAGED_SNAPSHOT_RELEASE_TIMEOUT_SECONDS,
+        )
+        .await;
+    }
+    result?;
+    Ok((state.roster, state.reservations))
+}
+
 pub(crate) fn encode_resource_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -427,8 +600,9 @@ async fn read_resource_json(
     server_url: &str,
     bearer: Option<&str>,
     uri: &str,
-) -> CliResult<Value> {
-    let id = format!("cli-resource-read-{uri}");
+    timeout_seconds: u64,
+) -> Result<(Value, usize), ResourceReadError> {
+    let id = crate::resource_read_request_id(uri);
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": &id,
@@ -439,12 +613,72 @@ async fn read_resource_json(
         server_url,
         bearer,
         &request,
-        RESOURCE_TIMEOUT_SECONDS,
+        timeout_seconds,
         client,
     )
     .await
     .map_err(sanitize_transport_error)?;
-    validate_resource_response(&response, &id, uri)
+    validate_resource_response(&response, &id, uri, &[bearer.unwrap_or(""), server_url])
+        .map(|payload| {
+            let text_bytes = response["result"]["contents"][0]["text"]
+                .as_str()
+                .expect("validated resource text")
+                .len();
+            (payload, text_bytes)
+        })
+        .map_err(|error| ResourceReadError {
+            error,
+            snapshot_limit: response.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+                && response.get("id").and_then(Value::as_str) == Some(id.as_str())
+                && response.get("result").is_none()
+                && response
+                    .get("error")
+                    .is_some_and(is_snapshot_limit_rejection),
+        })
+}
+
+fn is_snapshot_limit_rejection(error: &Value) -> bool {
+    if !matches!(
+        error.get("code").and_then(Value::as_i64),
+        Some(-32000 | -32602)
+    ) || error.get("message").and_then(Value::as_str).is_none()
+    {
+        return false;
+    }
+    // v0.3.40 uses the generic INVALID_ARGUMENT envelope for the DB preflight,
+    // and a plain InvalidParams message for JSON escape expansion. Recognize
+    // only its exact capacity reasons, never arbitrary errors mentioning size.
+    let detail = match error.pointer("/data/error/type") {
+        Some(Value::String(kind)) if kind == "FILE_RESERVATION_SNAPSHOT_TOO_LARGE" => {
+            return true;
+        }
+        Some(Value::String(kind))
+            if kind == "INVALID_ARGUMENT"
+                && matches!(
+                    error
+                        .pointer("/data/error/data/field")
+                        .and_then(Value::as_str),
+                    Some("snapshot" | "snapshot_limit")
+                ) =>
+        {
+            error
+                .pointer("/data/error/data/error_detail")
+                .and_then(Value::as_str)
+        }
+        // An explicit authentication, permission, or other semantic refusal
+        // must never be reclassified by capacity-looking text in its message.
+        Some(_) => return false,
+        None => error.get("message").and_then(Value::as_str),
+    };
+    matches!(
+        detail,
+        Some(
+            "complete reservation snapshot exceeds the 10000-row or 4 MiB limit; narrow to active_only=true or use explicit resource pages"
+                | "reservation snapshot byte limit exceeded"
+                | "complete reservation snapshot exceeds the 4 MiB limit"
+                | "complete reservation snapshot exceeds the 4 MiB JSON limit; narrow to active_only=true or use explicit resource pages"
+        )
+    )
 }
 
 fn sanitize_transport_error(error: CliError) -> CliError {
@@ -492,10 +726,52 @@ fn invalid_response(detail: &str) -> CliError {
     ))
 }
 
+/// Preserve an actionable server reason without echoing the selected endpoint,
+/// credential, terminal controls, or arbitrary structured mailbox data.
+fn resource_error_detail(message: &str, secrets: &[&str]) -> String {
+    let mut redacted = message.to_string();
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        redacted = redacted.replace(*secret, "[redacted]");
+        redacted = redacted.replace(&encode_resource_component(secret), "[redacted]");
+    }
+    let mut detail = String::new();
+    // A rejection may reflect a URL with userinfo, query credentials, or a
+    // different spelling of the endpoint. Omit URLs rather than guessing which
+    // URL components are safe to put in a diagnostic.
+    for word in redacted.split_whitespace() {
+        if !detail.is_empty() {
+            detail.push(' ');
+        }
+        if word.contains("://") {
+            detail.push_str("[redacted URL]");
+        } else {
+            for ch in word.chars() {
+                if ch.is_control()
+                    || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+                {
+                    detail.extend(ch.escape_unicode());
+                } else {
+                    detail.push(ch);
+                }
+            }
+        }
+    }
+    if let Some((end, _)) = detail.char_indices().nth(RESOURCE_ERROR_MESSAGE_MAX_CHARS) {
+        detail.truncate(end);
+        detail.push_str(" [truncated]");
+    }
+    detail
+}
+
 /// Validate the transport envelope before interpreting its resource contents.
-/// Never include a peer-supplied body or error message in diagnostics: either
-/// may contain credentials or unrelated mailbox data.
-fn validate_resource_response(response: &Value, id: &str, uri: &str) -> CliResult<Value> {
+/// Rejection messages are bounded and sanitized; response bodies and arbitrary
+/// error.data fields are never copied into diagnostics.
+fn validate_resource_response(
+    response: &Value,
+    id: &str,
+    uri: &str,
+    secrets: &[&str],
+) -> CliResult<Value> {
     if response.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
         || response.get("id").and_then(Value::as_str) != Some(id)
     {
@@ -507,16 +783,29 @@ fn validate_resource_response(response: &Value, id: &str, uri: &str) -> CliResul
                 "both JSON-RPC result and error are present",
             ));
         }
-        let code = response
-            .get("error")
-            .and_then(|error| error.get("code"))
-            .and_then(Value::as_i64);
-        return Err(CliError::Other(match code {
-            Some(code) => format!(
-                "server rejected resource read (JSON-RPC error {code}); verify the project and server authentication"
-            ),
-            None => "server rejected resource read with a malformed JSON-RPC error".to_string(),
-        }));
+        let error = &response["error"];
+        let code = error.get("code").and_then(Value::as_i64);
+        let message = error.get("message").and_then(Value::as_str);
+        let (Some(code), Some(message)) = (code, message) else {
+            return Err(invalid_response("malformed JSON-RPC error"));
+        };
+        let reason = error
+            .pointer("/data/error/type")
+            .and_then(Value::as_str)
+            .filter(|reason| {
+                !reason.is_empty()
+                    && reason.len() <= 80
+                    && reason
+                        .bytes()
+                        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == b'_')
+            })
+            .map_or_else(String::new, |reason| {
+                format!(", {}", resource_error_detail(reason, secrets))
+            });
+        return Err(CliError::Other(format!(
+            "server rejected resource read (JSON-RPC error {code}{reason}): {}",
+            resource_error_detail(message, secrets)
+        )));
     }
     let result = response
         .get("result")
@@ -763,6 +1052,23 @@ fn validate_snapshot(
             "server did not return a valid complete reservation snapshot",
         ));
     }
+    validate_snapshot_rows(
+        value,
+        project,
+        active_only,
+        FILE_RESERVATION_SNAPSHOT_MAX_ROWS,
+    )
+}
+
+/// Shared row and identity validation for a complete response or one page of
+/// an explicitly framed immutable snapshot. Page completeness is checked by
+/// `PagedReservationRead`, never inferred from a short array.
+fn validate_snapshot_rows(
+    value: &Value,
+    project: &ResolvedProject,
+    active_only: bool,
+    holder_limit: usize,
+) -> CliResult<(AgentRoster, Vec<ServerReservation>)> {
     let snapshot_project = validate_project(
         value
             .get("project")
@@ -777,7 +1083,7 @@ fn validate_snapshot(
         .get("agents")
         .and_then(Value::as_array)
         .ok_or_else(|| invalid_response("missing snapshot holder identities"))?;
-    if agents.len() > FILE_RESERVATION_SNAPSHOT_MAX_ROWS {
+    if agents.len() > holder_limit {
         return Err(invalid_response(
             "snapshot holder count exceeds the row limit",
         ));
@@ -825,9 +1131,189 @@ fn validate_snapshot(
     Ok((roster, reservations))
 }
 
+#[derive(Default)]
+struct PagedReservationRead {
+    token: String,
+    supports_release: bool,
+    captured_ts: i64,
+    total_count: usize,
+    text_bytes: usize,
+    roster: AgentRoster,
+    reservations: Vec<ServerReservation>,
+    ids: HashSet<i64>,
+    complete: bool,
+}
+
+impl PagedReservationRead {
+    /// Accept exactly the next page of the same captured state. No caller sees
+    /// accumulated rows until the explicit terminal page proves completeness.
+    fn accept_page(
+        &mut self,
+        value: &Value,
+        project: &ResolvedProject,
+        text_bytes: usize,
+    ) -> CliResult<bool> {
+        if self.complete {
+            return Err(invalid_response(
+                "page received after the snapshot was complete",
+            ));
+        }
+        if value.is_array() {
+            return Err(invalid_response(
+                "server does not support materialized reservation snapshot pages; upgrade and restart the server",
+            ));
+        }
+        if value.get("schema_version").and_then(Value::as_u64) != Some(1)
+            || value.get("consistency").and_then(Value::as_str) != Some("materialized_snapshot")
+            || value.get("active_only").and_then(Value::as_bool) != Some(false)
+            || value
+                .get("complete")
+                .is_some_and(|complete| complete != &Value::Bool(false))
+        {
+            return Err(invalid_response(
+                "invalid materialized reservation snapshot page",
+            ));
+        }
+        let token = required_text(value, "snapshot_token")?;
+        if token.len() != 64
+            || !token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(invalid_response("invalid reservation snapshot token"));
+        }
+        let captured_ts = timestamp(value, "captured_ts")?;
+        let supports_release = match value.get("supports_release") {
+            None | Some(Value::Bool(false)) => false,
+            Some(Value::Bool(true)) => true,
+            Some(_) => {
+                return Err(invalid_response(
+                    "invalid reservation snapshot release capability",
+                ));
+            }
+        };
+        let total_count = page_count(value, "total_count")?;
+        if total_count > FILE_RESERVATION_PAGED_MAX_ROWS {
+            return Err(invalid_response(
+                "paged reservation snapshot exceeds the total row limit",
+            ));
+        }
+        let offset = page_count(value, "offset")?;
+        let count = page_count(value, "count")?;
+        if offset != self.reservations.len() || count > LEGACY_RESOURCE_PAGE_MAX {
+            return Err(invalid_response(
+                "reservation page offset or row bound mismatch",
+            ));
+        }
+        let end = offset
+            .checked_add(count)
+            .filter(|end| *end <= total_count)
+            .ok_or_else(|| {
+                invalid_response("reservation page extends beyond the snapshot total")
+            })?;
+        let terminal = match value.get("next_offset") {
+            Some(Value::Null) if end == total_count => true,
+            Some(next)
+                if count > 0 && end < total_count && next.as_u64() == u64::try_from(end).ok() =>
+            {
+                false
+            }
+            _ => {
+                return Err(invalid_response(
+                    "reservation page has missing, premature, or non-progressing continuation",
+                ));
+            }
+        };
+        self.text_bytes = self
+            .text_bytes
+            .checked_add(text_bytes)
+            .filter(|bytes| *bytes <= FILE_RESERVATION_PAGED_MAX_BYTES)
+            .ok_or_else(|| {
+                invalid_response("paged reservation snapshot exceeds the total byte limit")
+            })?;
+        if text_bytes > FILE_RESERVATION_SNAPSHOT_MAX_BYTES {
+            return Err(invalid_response(
+                "reservation page exceeds the response byte limit",
+            ));
+        }
+        let (roster, reservations) =
+            validate_snapshot_rows(value, project, false, FILE_RESERVATION_PAGED_MAX_ROWS)?;
+        let first_page = self.token.is_empty();
+        if !first_page
+            && (self.token != token
+                || self.supports_release != supports_release
+                || self.captured_ts != captured_ts
+                || self.total_count != total_count
+                || self.roster != roster)
+        {
+            return Err(invalid_response(
+                "reservation snapshot identity changed between pages",
+            ));
+        }
+        let mut previous = self.reservations.last().map(|row| (row.created_ts, row.id));
+        for row in &reservations {
+            let key = (row.created_ts, row.id);
+            if previous.is_some_and(|previous| previous >= key) || !self.ids.insert(row.id) {
+                return Err(invalid_response(
+                    "duplicate or out-of-order reservation across snapshot pages",
+                ));
+            }
+            previous = Some(key);
+        }
+        if first_page {
+            self.token = token.to_string();
+            self.supports_release = supports_release;
+            self.captured_ts = captured_ts;
+            self.total_count = total_count;
+            self.roster = roster;
+        }
+        self.reservations.extend(reservations);
+        self.complete = terminal;
+        Ok(terminal)
+    }
+}
+
+fn page_count(value: &Value, key: &str) -> CliResult<usize> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| invalid_response(&format!("missing or invalid page {key}")))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn resource_request_ids_fit_the_real_protocol_for_long_resource_uris() {
+        let uris = [
+            MAILBOX_CONFIG_RESOURCE.to_string(),
+            format!("resource://project/{}?format=json", "deep%2F".repeat(100)),
+            format!(
+                "resource://thread/{}?include_bodies=true",
+                "日本語🦀".repeat(80)
+            ),
+        ];
+        let mut identities = HashSet::new();
+        for uri in uris {
+            let id = crate::resource_read_request_id(&uri);
+            let encoded = serde_json::to_string(&id).unwrap();
+            assert!(encoded.len() <= fastmcp::MAX_JSONRPC_STRING_ID_ENCODED_BYTES);
+            let decoded: fastmcp::RequestId = serde_json::from_str(&encoded)
+                .expect("the actual FastMCP decoder must accept the generated identity");
+            assert_eq!(decoded, fastmcp::RequestId::String(id.clone()));
+            assert_eq!(crate::resource_read_request_id(&uri), id);
+            assert!(identities.insert(id));
+            if uri.len() > fastmcp::MAX_JSONRPC_STRING_ID_ENCODED_BYTES {
+                let old = serde_json::to_string(&format!("cli-resource-read-{uri}")).unwrap();
+                assert!(
+                    serde_json::from_str::<fastmcp::RequestId>(&old).is_err(),
+                    "the old unbounded ID must fail the same protocol boundary"
+                );
+            }
+        }
+    }
 
     pub(crate) enum TestReply {
         Resource(Value),
@@ -1016,6 +1502,130 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn health_probe_pins_the_mailbox_without_opening_local_storage() {
+        let (result, requests) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(mailbox_payload(config)),
+                    TestReply::Tool(mailbox_payload(config)),
+                    TestReply::Resource(mailbox_payload(config)),
+                ]
+            },
+            crate::probe_local_jsonrpc_health_with_latency,
+        );
+        let (payload, latency) = result.unwrap().expect("verified daemon health");
+        assert!(payload["database_url"].is_string());
+        assert!(latency >= 0.0);
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0]["params"]["uri"], MAILBOX_CONFIG_RESOURCE);
+        assert_eq!(requests[1]["params"]["name"], "health_check");
+        assert_eq!(requests[2]["params"]["uri"], MAILBOX_CONFIG_RESOURCE);
+
+        // Doctor explicitly adopts the daemon's advertised mailbox when its
+        // default XDG mailbox differs. The health probe must use that target.
+        let (result, requests) = with_test_server(
+            |config| {
+                vec![
+                    TestReply::Resource(mailbox_payload(config)),
+                    TestReply::Tool(mailbox_payload(config)),
+                    TestReply::Resource(mailbox_payload(config)),
+                ]
+            },
+            |config| {
+                let mut cli_config = config.clone();
+                cli_config.database_url = "sqlite:////different/xdg/default.db".into();
+                cli_config.storage_root = "/different/xdg/archive".into();
+                crate::robot::live_server_proves_mailbox_healthy(
+                    &cli_config,
+                    &config.database_url,
+                    &config.storage_root,
+                )
+            },
+        );
+        // Minimal peer data proves routing, never a healthy database verdict
+        // or permission to silently fall back after a malformed health reply.
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete health evidence")
+        );
+        assert_eq!(requests.len(), 3, "doctor must probe its selected mailbox");
+    }
+
+    #[test]
+    fn health_probe_refuses_rejections_malformed_replies_and_identity_drift() {
+        for status in [401, 403, 307] {
+            let (result, requests) = with_test_server(
+                |_| {
+                    vec![TestReply::Raw(
+                        status,
+                        serde_json::json!({"error":"private-token"}),
+                    )]
+                },
+                crate::probe_local_jsonrpc_health_with_latency,
+            );
+            let error = result.unwrap_err().to_string();
+            assert!(!error.contains("private-token"));
+            assert_eq!(requests.len(), 1);
+        }
+        for response in [
+            serde_json::json!({"jsonrpc":"2.0","id":"wrong-request","result":{}}),
+            serde_json::json!({"jsonrpc":"1.0","result":{}}),
+            serde_json::json!({"jsonrpc":"2.0","error":{"code":-32603,"message":"private-token"}}),
+            serde_json::json!({"jsonrpc":"2.0","result":{"isError":true,"content":[{"type":"text","text":"{}"}]}}),
+            serde_json::json!({"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"{}"}],"structuredContent":{"different":true}}}),
+            serde_json::json!({"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"x".repeat(FILE_RESERVATION_SNAPSHOT_MAX_BYTES + 1)}]}}),
+        ] {
+            let (result, requests) = with_test_server(
+                |config| {
+                    vec![
+                        TestReply::Resource(mailbox_payload(config)),
+                        TestReply::Raw(200, response),
+                    ]
+                },
+                crate::probe_local_jsonrpc_health_with_latency,
+            );
+            let error = result.unwrap_err().to_string();
+            assert!(!error.contains("private-token"));
+            assert_eq!(requests.len(), 2);
+        }
+        for drift_in_health in [true, false] {
+            let (result, requests) = with_test_server(
+                |config| {
+                    let mut other = mailbox_payload(config);
+                    other["database_url"] = "sqlite:////another/mailbox.db".into();
+                    let mut replies = vec![TestReply::Resource(mailbox_payload(config))];
+                    if drift_in_health {
+                        replies.push(TestReply::Tool(other));
+                    } else {
+                        replies.push(TestReply::Tool(mailbox_payload(config)));
+                        replies.push(TestReply::Resource(other));
+                    }
+                    replies
+                },
+                crate::probe_local_jsonrpc_health_with_latency,
+            );
+            assert!(result.is_err(), "changed mailbox must not permit fallback");
+            assert_eq!(requests.len(), if drift_in_health { 2 } else { 3 });
+        }
+
+        let (result, requests) = with_test_server(
+            |config| {
+                let mut other = mailbox_payload(config);
+                other["storage_root"] = "/other/mailbox".into();
+                vec![TestReply::Resource(other)]
+            },
+            crate::probe_local_jsonrpc_health_with_latency,
+        );
+        assert!(
+            result.unwrap().is_none(),
+            "unselected daemon permits local reads"
+        );
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
     fn automatic_mailbox_selection_requires_both_file_authorities() {
         let (result, requests) = with_test_server(
             |config| vec![TestReply::Resource(mailbox_payload(config))],
@@ -1120,6 +1730,527 @@ pub(crate) mod tests {
             "captured_ts": "2026-10-26T01:15:00Z", "active_only": active_only,
             "count": rows.len(), "reservations": rows,
         })
+    }
+
+    fn snapshot_limit_reply() -> TestReply {
+        TestReply::Raw(
+            200,
+            serde_json::json!({
+                "jsonrpc":"2.0",
+                "error": {
+                    "code": -32602,
+                    "message": "complete reservation snapshot exceeds the 10000-row or 4 MiB limit",
+                    "data": {"error":{"type":"FILE_RESERVATION_SNAPSHOT_TOO_LARGE"}}
+                }
+            }),
+        )
+    }
+
+    fn snapshot_page(rows: Vec<Value>, offset: usize, total: usize) -> Value {
+        let end = offset + rows.len();
+        let mut value = snapshot(rows, false);
+        value.as_object_mut().unwrap().remove("complete");
+        value["consistency"] = "materialized_snapshot".into();
+        value["snapshot_token"] = "a".repeat(64).into();
+        value["offset"] = offset.into();
+        value["total_count"] = total.into();
+        value["next_offset"] = if end < total { end.into() } else { Value::Null };
+        value
+    }
+
+    #[test]
+    fn materialized_history_reads_cross_both_original_snapshot_limits_over_authenticated_http() {
+        let total = 10_001_usize;
+        let (result, requests) = with_test_server(
+            |_| {
+                let mut replies = vec![TestReply::Resource(project()), snapshot_limit_reply()];
+                for offset in (0..total).step_by(LEGACY_RESOURCE_PAGE_MAX) {
+                    let end = (offset + LEGACY_RESOURCE_PAGE_MAX).min(total);
+                    let rows = (offset..end)
+                        .map(|index| {
+                            let mut row = reservation(i64::try_from(index + 1).unwrap());
+                            row["reason"] = "history".repeat(100).into();
+                            row["released_ts"] = "2026-10-26T01:30:00Z".into();
+                            row
+                        })
+                        .collect();
+                    replies.push(TestReply::Resource(snapshot_page(rows, offset, total)));
+                }
+                replies.push(TestReply::Resource(project()));
+                replies
+            },
+            |config| read_server(config, "test-project", false),
+        );
+        let read = result.unwrap();
+        assert_eq!(read.reservations.len(), total);
+        assert!(read.reservations.iter().enumerate().all(|(index, row)| {
+            row.id == i64::try_from(index + 1).unwrap() && row.released_ts.is_some()
+        }));
+        assert_eq!(requests.len(), 44);
+        assert_eq!(
+            requests[2]["params"]["uri"],
+            "resource://file_reservations/test-project?snapshot_pages=true&active_only=false&format=json"
+        );
+        assert!(
+            requests[3]["params"]["uri"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("snapshot_token={}&offset=250", "a".repeat(64)))
+        );
+        assert!(
+            requests[42]["params"]["uri"]
+                .as_str()
+                .unwrap()
+                .ends_with("offset=10000")
+        );
+    }
+
+    #[test]
+    fn materialized_history_pages_cover_empty_exact_and_partial_boundaries() {
+        let project = validate_project(&project(), "test-project").unwrap();
+        for total in [0, 1, 249, 250, 251, 500, 10_000, 10_001] {
+            let mut state = PagedReservationRead::default();
+            if total == 0 {
+                let page = snapshot_page(vec![], 0, 0);
+                assert!(
+                    state
+                        .accept_page(&page, &project, page.to_string().len())
+                        .unwrap()
+                );
+            } else {
+                for offset in (0..total).step_by(LEGACY_RESOURCE_PAGE_MAX) {
+                    let end = (offset + LEGACY_RESOURCE_PAGE_MAX).min(total);
+                    let page = snapshot_page(
+                        (offset..end)
+                            .map(|index| reservation(i64::try_from(index + 1).unwrap()))
+                            .collect(),
+                        offset,
+                        total,
+                    );
+                    assert_eq!(
+                        state
+                            .accept_page(&page, &project, page.to_string().len())
+                            .unwrap(),
+                        end == total
+                    );
+                }
+            }
+            assert_eq!(state.reservations.len(), total);
+            assert_eq!(state.ids.len(), total);
+            assert!(state.complete);
+        }
+
+        // A byte-limited short page is not terminal: follow the explicit
+        // continuation, not the length of the reservation array.
+        let mut state = PagedReservationRead::default();
+        let first = snapshot_page(vec![reservation(1)], 0, 3);
+        assert!(
+            !state
+                .accept_page(&first, &project, first.to_string().len())
+                .unwrap()
+        );
+        let last = snapshot_page(vec![reservation(2), reservation(3)], 1, 3);
+        assert!(
+            state
+                .accept_page(&last, &project, last.to_string().len())
+                .unwrap()
+        );
+        assert_eq!(state.reservations.len(), 3);
+    }
+
+    #[test]
+    fn materialized_history_rejects_gaps_duplicates_and_changed_snapshots() {
+        let project = validate_project(&project(), "test-project").unwrap();
+        for (pointer, replacement) in [
+            ("/offset", serde_json::json!(0)),
+            ("/count", serde_json::json!(0)),
+            ("/total_count", serde_json::json!(3)),
+            ("/snapshot_token", serde_json::json!("b".repeat(64))),
+            ("/captured_ts", serde_json::json!("2026-10-26T01:16:00Z")),
+            ("/consistency", serde_json::json!("independent_pages")),
+            ("/active_only", serde_json::json!(true)),
+            (
+                "/project/created_at",
+                serde_json::json!("2026-10-27T01:00:00Z"),
+            ),
+            ("/agents/0/name", serde_json::json!("ChangedHolder")),
+            ("/reservations/0/id", serde_json::json!(1)),
+            ("/reservations/0/project_id", serde_json::json!(8)),
+            ("/reservations/0/agent_id", serde_json::json!(999)),
+            (
+                "/reservations/0/created_ts",
+                serde_json::json!("2026-10-25T01:00:00Z"),
+            ),
+            ("/next_offset", serde_json::json!(2)),
+        ] {
+            let mut state = PagedReservationRead::default();
+            let first = snapshot_page(vec![reservation(1)], 0, 2);
+            assert!(
+                !state
+                    .accept_page(&first, &project, first.to_string().len())
+                    .unwrap()
+            );
+            let mut second = snapshot_page(vec![reservation(2)], 1, 2);
+            *second.pointer_mut(pointer).unwrap() = replacement;
+            assert!(
+                state
+                    .accept_page(&second, &project, second.to_string().len())
+                    .is_err(),
+                "{pointer}"
+            );
+            assert!(!state.complete);
+        }
+    }
+
+    #[test]
+    fn materialized_history_rejects_empty_nonterminal_premature_terminal_and_unbounded_pages() {
+        let project = validate_project(&project(), "test-project").unwrap();
+        let mut premature = snapshot_page(vec![reservation(1)], 0, 2);
+        premature["next_offset"] = Value::Null;
+        let mut missing = snapshot_page(vec![reservation(1)], 0, 2);
+        missing.as_object_mut().unwrap().remove("next_offset");
+        let mut wrong_next = snapshot_page(vec![reservation(1)], 0, 2);
+        wrong_next["next_offset"] = 2.into();
+        for page in [
+            snapshot_page(vec![], 0, 1),
+            premature,
+            missing,
+            wrong_next,
+            snapshot_page((1..=251).map(reservation).collect(), 0, 251),
+            snapshot_page(vec![reservation(1)], 0, FILE_RESERVATION_PAGED_MAX_ROWS + 1),
+        ] {
+            assert!(
+                PagedReservationRead::default()
+                    .accept_page(&page, &project, page.to_string().len())
+                    .is_err()
+            );
+        }
+        let page = snapshot_page(vec![reservation(1)], 0, 1);
+        assert!(
+            PagedReservationRead::default()
+                .accept_page(&page, &project, FILE_RESERVATION_SNAPSHOT_MAX_BYTES + 1)
+                .is_err()
+        );
+        let mut state = PagedReservationRead {
+            text_bytes: FILE_RESERVATION_PAGED_MAX_BYTES,
+            ..PagedReservationRead::default()
+        };
+        assert!(state.accept_page(&page, &project, 1).is_err());
+    }
+
+    #[test]
+    fn history_pagination_never_negotiates_after_authentication_or_unrelated_rpc_errors() {
+        for status in [200, 401, 403] {
+            let (result, requests) = with_test_server(
+                |_| {
+                    vec![
+                        TestReply::Resource(project()),
+                        TestReply::Raw(
+                            status,
+                            serde_json::json!({
+                                "jsonrpc":"2.0", "error":{"code":-32000,"message":"maintenance window; retry later"}
+                            }),
+                        ),
+                    ]
+                },
+                |config| read_server(config, "test-project", false),
+            );
+            let error = result.unwrap_err().to_string();
+            assert_eq!(requests.len(), 2);
+            if status == 200 {
+                assert!(error.contains("maintenance window"));
+                assert!(!error.contains("authentication"));
+            } else {
+                assert!(error.contains("authentication failed"));
+            }
+        }
+        let (result, requests) = with_test_server(
+            |_| vec![TestReply::Resource(project()), snapshot_limit_reply()],
+            |config| read_server(config, "test-project", true),
+        );
+        assert!(result.unwrap_err().to_string().contains("10000-row"));
+        assert_eq!(
+            requests.len(),
+            2,
+            "active enforcement reads retain the original snapshot limit"
+        );
+    }
+
+    #[test]
+    fn snapshot_capacity_negotiation_requires_an_unambiguous_valid_rejection() {
+        let capacity_message = "complete reservation snapshot exceeds the 4 MiB JSON limit; narrow to active_only=true or use explicit resource pages";
+        let plain = serde_json::json!({"code":-32602,"message":capacity_message});
+        assert!(is_snapshot_limit_rejection(&plain));
+        for kind in [
+            "AUTHENTICATION_FAILED",
+            "PERMISSION_DENIED",
+            "NOT_FOUND",
+            "INVALID_ARGUMENT",
+        ] {
+            let mut error = plain.clone();
+            error["data"] = serde_json::json!({"error":{"type":kind}});
+            assert!(!is_snapshot_limit_rejection(&error));
+        }
+        for error in [
+            serde_json::json!({"code":-32001,"message":capacity_message}),
+            serde_json::json!({"code":"-32602","message":capacity_message}),
+            serde_json::json!({"code":-32602,"message":42}),
+            serde_json::json!({"code":-32602,"message":"reservation snapshot holder identity mismatch"}),
+        ] {
+            assert!(!is_snapshot_limit_rejection(&error));
+        }
+        let (result, requests) = with_test_server(
+            |_| {
+                vec![
+                    TestReply::Resource(project()),
+                    TestReply::Raw(
+                        200,
+                        serde_json::json!({
+                            "jsonrpc":"2.0", "id":"wrong-request",
+                            "error":plain
+                        }),
+                    ),
+                ]
+            },
+            |config| read_server(config, "test-project", false),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("request id mismatch")
+        );
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
+    fn materialized_history_failures_discard_partial_rows_and_preserve_server_rejections() {
+        for status in [200, 401, 403] {
+            let (result, requests) = with_test_server(
+                |_| {
+                    vec![
+                        TestReply::Resource(project()),
+                        snapshot_limit_reply(),
+                        TestReply::Resource(snapshot_page(vec![reservation(1)], 0, 2)),
+                        TestReply::Raw(
+                            status,
+                            serde_json::json!({
+                                "jsonrpc":"2.0", "error":{"code":-32602,"message":"snapshot expired; retry the history read"}
+                            }),
+                        ),
+                    ]
+                },
+                |config| read_server(config, "test-project", false),
+            );
+            let error = result.unwrap_err().to_string();
+            assert_eq!(requests.len(), 4);
+            assert!(error.contains("10000-row"), "initial refusal is retained");
+            if status == 200 {
+                assert!(error.contains("snapshot expired"));
+            } else {
+                assert!(error.contains("authentication failed"));
+            }
+        }
+    }
+
+    fn releasable_snapshot_page(rows: Vec<Value>, offset: usize, total: usize) -> Value {
+        let mut page = snapshot_page(rows, offset, total);
+        page["supports_release"] = true.into();
+        page
+    }
+
+    #[test]
+    fn materialized_history_releases_completed_empty_and_paged_reads() {
+        for total in [0, 2] {
+            let (result, requests) = with_test_server(
+                |_| {
+                    let mut replies = vec![TestReply::Resource(project()), snapshot_limit_reply()];
+                    if total == 0 {
+                        replies.push(TestReply::Resource(releasable_snapshot_page(vec![], 0, 0)));
+                    } else {
+                        for offset in 0..total {
+                            replies.push(TestReply::Resource(releasable_snapshot_page(
+                                vec![reservation(i64::try_from(offset + 1).unwrap())],
+                                offset,
+                                total,
+                            )));
+                        }
+                    }
+                    replies.push(TestReply::Resource(serde_json::json!({
+                        "schema_version":1, "snapshot_token":"a".repeat(64), "released":true
+                    })));
+                    replies.push(TestReply::Resource(project()));
+                    replies
+                },
+                |config| read_server(config, "test-project", false),
+            );
+            assert_eq!(result.unwrap().reservations.len(), total);
+            let release_uri = requests[requests.len() - 2]["params"]["uri"]
+                .as_str()
+                .unwrap();
+            assert_eq!(
+                release_uri,
+                format!(
+                    "resource://file_reservations/test-project?snapshot_pages=true&active_only=false&format=json&snapshot_token={}&snapshot_release=true",
+                    "a".repeat(64)
+                )
+            );
+            assert!(!release_uri.contains("offset="));
+        }
+    }
+
+    #[test]
+    fn materialized_history_release_failure_does_not_replace_a_complete_result() {
+        for status in [200, 401, 403, 503] {
+            let (result, requests) = with_test_server(
+                |_| {
+                    vec![
+                        TestReply::Resource(project()),
+                        snapshot_limit_reply(),
+                        TestReply::Resource(releasable_snapshot_page(vec![reservation(1)], 0, 1)),
+                        TestReply::Raw(
+                            status,
+                            serde_json::json!({
+                                "jsonrpc":"2.0", "error":{"code":-32602,"message":"cleanup unavailable"}
+                            }),
+                        ),
+                        TestReply::Resource(project()),
+                    ]
+                },
+                |config| read_server(config, "test-project", false),
+            );
+            assert_eq!(result.unwrap().reservations.len(), 1);
+            assert_eq!(requests.len(), 5);
+            assert!(
+                requests[3]["params"]["uri"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("snapshot_release=true")
+            );
+        }
+    }
+
+    #[test]
+    fn materialized_history_releases_original_identity_after_continuation_failure() {
+        for failure in ["token", "capability", "authentication"] {
+            let (result, requests) = with_test_server(
+                |_| {
+                    let failed_page = if failure == "authentication" {
+                        TestReply::Raw(401, serde_json::json!({"error":"denied"}))
+                    } else {
+                        let mut page = releasable_snapshot_page(vec![reservation(2)], 1, 2);
+                        if failure == "token" {
+                            page["snapshot_token"] = "b".repeat(64).into();
+                        } else {
+                            page["supports_release"] = false.into();
+                        }
+                        TestReply::Resource(page)
+                    };
+                    vec![
+                        TestReply::Resource(project()),
+                        snapshot_limit_reply(),
+                        TestReply::Resource(releasable_snapshot_page(vec![reservation(1)], 0, 2)),
+                        failed_page,
+                        TestReply::Raw(503, serde_json::json!({"error":"cleanup unavailable"})),
+                    ]
+                },
+                |config| read_server(config, "test-project", false),
+            );
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("10000-row"));
+            assert!(error.contains(if failure == "authentication" {
+                "authentication failed"
+            } else {
+                "snapshot identity changed"
+            }));
+            assert!(!error.contains("cleanup unavailable"));
+            assert_eq!(requests.len(), 5);
+            assert!(
+                requests[4]["params"]["uri"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&format!(
+                        "snapshot_token={}&snapshot_release=true",
+                        "a".repeat(64)
+                    ))
+            );
+        }
+    }
+
+    #[test]
+    fn materialized_history_release_capability_must_be_boolean_and_pinned() {
+        let project = validate_project(&project(), "test-project").unwrap();
+        for capability in [Value::Null, 1.into(), "true".into(), serde_json::json!({})] {
+            let mut state = PagedReservationRead::default();
+            let mut page = snapshot_page(vec![reservation(1)], 0, 1);
+            page["supports_release"] = capability;
+            assert!(
+                state
+                    .accept_page(&page, &project, page.to_string().len())
+                    .is_err()
+            );
+            assert!(!state.supports_release);
+            assert!(state.token.is_empty());
+        }
+        let mut state = PagedReservationRead::default();
+        let unordered = releasable_snapshot_page(vec![reservation(2), reservation(1)], 0, 2);
+        assert!(
+            state
+                .accept_page(&unordered, &project, unordered.to_string().len())
+                .is_err()
+        );
+        assert!(
+            state.token.is_empty(),
+            "a rejected first page grants no cleanup authority"
+        );
+        assert!(!state.supports_release);
+        // The earlier paged protocol did not advertise release. A later page
+        // cannot retroactively authorize a new operation on that token.
+        let mut state = PagedReservationRead::default();
+        let first = snapshot_page(vec![reservation(1)], 0, 2);
+        assert!(
+            !state
+                .accept_page(&first, &project, first.to_string().len())
+                .unwrap()
+        );
+        let second = releasable_snapshot_page(vec![reservation(2)], 1, 2);
+        assert!(
+            state
+                .accept_page(&second, &project, second.to_string().len())
+                .is_err()
+        );
+        assert!(!state.supports_release);
+    }
+
+    #[test]
+    fn older_servers_preserve_capacity_detail_and_require_upgrade_for_large_histories() {
+        let legacy_error = serde_json::json!({
+            "code": -32000, "message":"Invalid argument value: snapshot: complete reservation snapshot exceeds the 10000-row or 4 MiB limit",
+            "data":{"error":{"type":"INVALID_ARGUMENT", "data":{
+                "field":"snapshot", "error_detail":"complete reservation snapshot exceeds the 10000-row or 4 MiB limit; narrow to active_only=true or use explicit resource pages"
+            }}}
+        });
+        assert!(is_snapshot_limit_rejection(&legacy_error));
+        let (result, requests) = with_test_server(
+            |_| {
+                vec![
+                    TestReply::Resource(project()),
+                    TestReply::Raw(
+                        200,
+                        serde_json::json!({
+                            "jsonrpc":"2.0", "error":legacy_error
+                        }),
+                    ),
+                    TestReply::Resource(serde_json::json!([reservation(1)])),
+                ]
+            },
+            |config| read_server(config, "test-project", false),
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("10000-row or 4 MiB"));
+        assert!(error.contains("upgrade and restart"));
+        assert!(!error.contains("authentication"));
+        assert_eq!(requests.len(), 3);
     }
 
     pub(crate) fn reservation_read_fixture() -> (Value, Value) {
@@ -1350,7 +2481,7 @@ pub(crate) mod tests {
         let uri = "resource://file_reservations/test?format=json";
         let value = serde_json::json!([]);
         assert_eq!(
-            validate_resource_response(&response(uri, &value), "request-1", uri).unwrap(),
+            validate_resource_response(&response(uri, &value), "request-1", uri, &[]).unwrap(),
             value
         );
         assert!(validate_reservations(&value, true).unwrap().is_empty());
@@ -1392,21 +2523,38 @@ pub(crate) mod tests {
         value["error"] = serde_json::json!({ "code": -32603, "message": "secret" });
         bad.push(value);
         for value in bad {
-            assert!(validate_resource_response(&value, "request-1", uri).is_err());
+            assert!(validate_resource_response(&value, "request-1", uri, &[]).is_err());
         }
     }
 
     #[test]
-    fn rpc_rejection_does_not_expose_peer_error_message() {
+    fn rpc_rejection_preserves_the_reason_without_credentials_or_terminal_controls() {
         let value = serde_json::json!({
             "jsonrpc": "2.0", "id": "request-1",
-            "error": { "code": -32001, "message": "private-token-and-body" },
+            "error": { "code": -32001,
+                "message": "project is unavailable: read-test-token https://user:secret@example/mcp/ \u{1b}[31m\nretry later",
+                "data": {"private_body":"private-body-must-not-appear"}
+            },
         });
-        let error = validate_resource_response(&value, "request-1", "resource://x")
-            .unwrap_err()
-            .to_string();
+        let error =
+            validate_resource_response(&value, "request-1", "resource://x", &["read-test-token"])
+                .unwrap_err()
+                .to_string();
         assert!(error.contains("-32001"));
-        assert!(!error.contains("private-token-and-body"));
+        assert!(error.contains("project is unavailable"));
+        assert!(error.contains("retry later"));
+        assert!(!error.contains("read-test-token"));
+        assert!(!error.contains("user:secret"));
+        assert!(!error.contains("private-body"));
+        assert!(!error.contains('\u{1b}'));
+        assert!(!error.contains('\n'));
+        assert!(!error.contains("authentication"));
+
+        let bounded = resource_error_detail(&"🦀".repeat(2000), &[]);
+        assert!(bounded.ends_with("[truncated]"));
+        assert!(bounded.chars().count() < RESOURCE_ERROR_MESSAGE_MAX_CHARS + 20);
+        let encoded = encode_resource_component("secret/+value");
+        assert!(!resource_error_detail(&encoded, &["secret/+value"]).contains(&encoded));
     }
 
     #[test]
@@ -1720,6 +2868,6 @@ pub(crate) mod tests {
         let mut oversized = response(uri, &valid);
         oversized["result"]["contents"][0]["text"] =
             serde_json::json!(" ".repeat(FILE_RESERVATION_SNAPSHOT_MAX_BYTES + 1));
-        assert!(validate_resource_response(&oversized, "request-1", uri).is_err());
+        assert!(validate_resource_response(&oversized, "request-1", uri, &[]).is_err());
     }
 }

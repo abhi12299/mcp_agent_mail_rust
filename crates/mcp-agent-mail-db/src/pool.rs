@@ -2,6 +2,11 @@
 //!
 //! Uses `sqlmodel_pool` for efficient connection management.
 
+#[path = "pool/sqlite_init_gate.rs"]
+mod sqlite_init_gate;
+
+use sqlite_init_gate::{SqliteInitGate, SqliteInitGateClaim, SqliteInitGateCompletion};
+
 use crate::DbConn;
 use crate::error::{DbError, DbResult, is_lock_error};
 use crate::integrity;
@@ -32,7 +37,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone)]
@@ -1337,7 +1342,7 @@ fn lock_neutral_sqlite_generation_fingerprint_with_observer(
     let Ok(parent_after) = std::fs::symlink_metadata(parent_path) else {
         return "unreadable".to_string();
     };
-    if !parent_after.file_type().is_dir() {
+    if parent_before.file_type() != parent_after.file_type() {
         return "unreadable".to_string();
     }
     #[cfg(unix)]
@@ -1559,23 +1564,35 @@ where
     primary_anchor.verify_unchanged(action).map_err(|error| {
         AutomaticRecoveryRunError::admission(AutomaticRecoveryAdmissionFailureKind::Other, error)
     })?;
-    let _breaker_file_lock =
-        crate::recovery_breaker::try_acquire_file_lock(primary_path).map_err(|error| {
-            let reason = if error.kind() == std::io::ErrorKind::WouldBlock
-                || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
-            {
-                "another process owns the durable recovery-breaker election lock"
-            } else {
-                "the durable recovery-breaker election lock could not be acquired"
-            };
-            AutomaticRecoveryRunError::admission(
-                AutomaticRecoveryAdmissionFailureKind::Other,
-                SqlError::Custom(format!(
-                    "{action} for {} was deferred because {reason}: {error}",
-                    primary_path.display()
-                )),
+    let breaker_file_lock = {
+        #[cfg(unix)]
+        {
+            crate::recovery_breaker::try_acquire_file_lock_in_parent(
+                primary_path,
+                &primary_anchor.parent_dir,
             )
-        })?;
+        }
+        #[cfg(not(unix))]
+        {
+            crate::recovery_breaker::try_acquire_file_lock(primary_path)
+        }
+    }
+    .map_err(|error| {
+        let reason = if error.kind() == std::io::ErrorKind::WouldBlock
+            || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+        {
+            "another process owns the durable recovery-breaker election lock"
+        } else {
+            "the durable recovery-breaker election lock could not be acquired"
+        };
+        AutomaticRecoveryRunError::admission(
+            AutomaticRecoveryAdmissionFailureKind::Other,
+            SqlError::Custom(format!(
+                "{action} for {} was deferred because {reason}: {error}",
+                primary_path.display()
+            )),
+        )
+    })?;
     primary_anchor.verify_unchanged(action).map_err(|error| {
         AutomaticRecoveryRunError::admission(AutomaticRecoveryAdmissionFailureKind::Other, error)
     })?;
@@ -1588,7 +1605,7 @@ where
     // failures for the same recovery lineage in a sidecar and refuses HERE,
     // before any capture, until the cooldown elapses, completed-attempt content
     // changes, or an operator path runs under RecoveryBreakerBypassGuard.
-    let breaker_prior = match crate::recovery_breaker::load(primary_path) {
+    let breaker_prior = match breaker_file_lock.load() {
         Ok(state) => state,
         Err(error) if breaker_bypass => {
             tracing::warn!(
@@ -1671,7 +1688,7 @@ where
                 error,
             )
         })?;
-        crate::recovery_breaker::store(primary_path, &armed).map_err(|error| {
+        breaker_file_lock.store(&armed).map_err(|error| {
             AutomaticRecoveryRunError::admission(
                 AutomaticRecoveryAdmissionFailureKind::Other,
                 SqlError::Custom(format!(
@@ -1685,6 +1702,21 @@ where
         None
     };
 
+    // Operator bypass only bypasses breaker history, never the election.
+    // Mutation-only admission has no attempt write to perform this check.
+    let revalidate_breaker_election = |context: &str| {
+        breaker_file_lock.revalidate().map_err(|error| {
+            AutomaticRecoveryRunError::admission(
+                AutomaticRecoveryAdmissionFailureKind::Other,
+                SqlError::Custom(format!(
+                    "{action} for {} {context} because durable recovery election authority changed: {error}",
+                    primary_path.display()
+                )),
+            )
+        })
+    };
+    revalidate_breaker_election("was refused before execution")?;
+
     let operation_result = if let Some(mut armed) = armed_attempt {
         // Preserve the original panic payload. Retargeting is best effort:
         // if persistence fails (or the process aborts instead of unwinding),
@@ -1695,7 +1727,7 @@ where
                 if primary_anchor.verify_parent_only(action).is_ok() {
                     armed.db_fingerprint = recovery_breaker_fingerprint(primary_path, None);
                     armed.last_failure_unix = now_unix();
-                    if let Err(error) = crate::recovery_breaker::store(primary_path, &armed) {
+                    if let Err(error) = breaker_file_lock.store(&armed) {
                         tracing::error!(
                             path = %primary_path.display(),
                             %error,
@@ -1709,6 +1741,11 @@ where
     } else {
         operation()
     };
+    let terminal_context = match &operation_result {
+        Ok(_) => "completed but its result was refused".to_string(),
+        Err(error) => format!("failed ({error}) and its result was refused"),
+    };
+    revalidate_breaker_election(&terminal_context)?;
     if outcome_policy == RecoveryAdmissionOutcomePolicy::GuardMutationOnly {
         return operation_result.map_err(AutomaticRecoveryRunError::Operation);
     }
@@ -1725,8 +1762,11 @@ where
                 primary_path,
                 None,
             ));
-            if let Err(error) = crate::recovery_breaker::store(primary_path, &cleared) {
+            if let Err(error) = breaker_file_lock.store(&cleared) {
                 if breaker_bypass {
+                    revalidate_breaker_election(
+                        "completed but its outcome could not be published",
+                    )?;
                     tracing::warn!(
                         path = %primary_path.display(),
                         %error,
@@ -1788,7 +1828,7 @@ where
                         prior
                     },
                 );
-                if let Err(store_error) = crate::recovery_breaker::store(primary_path, &restored) {
+                if let Err(store_error) = breaker_file_lock.store(&restored) {
                     tracing::warn!(
                         path = %primary_path.display(),
                         error = %store_error,
@@ -1819,8 +1859,11 @@ where
                     parked. Intervene with `am doctor repair` / `am doctor reconstruct`."
                 );
             }
-            if let Err(store_error) = crate::recovery_breaker::store(primary_path, &failed) {
+            if let Err(store_error) = breaker_file_lock.store(&failed) {
                 if breaker_bypass {
+                    revalidate_breaker_election(&format!(
+                        "failed ({error}) and its outcome could not be published"
+                    ))?;
                     tracing::warn!(
                         path = %primary_path.display(),
                         error = %store_error,
@@ -2758,10 +2801,10 @@ pub fn evaluate_write_route(
 /// a 16-hour outage was undiagnosable for exactly this reason). 10s leaves the
 /// dispatcher 20s of headroom to surface the attributed failure.
 ///
-/// The timeout bounds only the *wait* for a connection: the
-/// connection-create/init path (migrations, archive reconstruction) is not cut
-/// off by it, so a slow first-time init still completes. Waiters on that init
-/// are bounded separately by [`SqliteInitGate`].
+/// The acquisition deadline includes connection creation and initialization.
+/// A non-preemptible initialization call can run past it, but the pool checks
+/// the deadline before publishing the connection and refuses a late success.
+/// Waiters on another initializer are also bounded by [`SqliteInitGate`].
 ///
 /// Override via `DATABASE_POOL_TIMEOUT` (seconds; values of 1000 or more are read
 /// as milliseconds, see [`pool_timeout_ms_from_setting`]); sizing via
@@ -2888,8 +2931,16 @@ impl DbPoolConfig {
     ///    restore the legacy Python defaults (not recommended for production).
     #[must_use]
     pub fn from_env() -> Self {
-        let core_config = mcp_agent_mail_core::Config::from_env();
+        Self::from_config(&mcp_agent_mail_core::Config::from_env())
+    }
 
+    /// Build the serving pool from an already-resolved mailbox configuration.
+    ///
+    /// Startup and request admission must use the same mailbox authority and
+    /// pool shape. Re-reading ambient configuration during warmup can initialize
+    /// a different pool from the one the listener will actually serve.
+    #[must_use]
+    pub fn from_config(core_config: &mcp_agent_mail_core::Config) -> Self {
         // Config reads DATABASE_URL via infra_env_value (a project-local .env
         // cannot hijack the database path) and, when it is unset, derives the
         // storage-root-relative default.
@@ -2924,7 +2975,7 @@ impl DbPoolConfig {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0)
             .min(min_conn);
-        let storage_root = core_config.storage_root;
+        let storage_root = core_config.storage_root.clone();
         let cache_budget_kb = core_config.database_cache_budget_kb;
 
         Self {
@@ -3267,6 +3318,10 @@ struct MessageIdAllocatorEntry {
 struct PoolMessageIdState {
     allocator: Mutex<Arc<crate::id_floor::MessageIdAllocator>>,
     opened_connection: AtomicBool,
+    /// A full pool checkout, including initialization, validation, and any
+    /// connection retuning, completed successfully for this engine pool.
+    /// Opening a handle alone does not establish this readiness.
+    successful_checkout: AtomicBool,
 }
 
 /// A capability held by the exact pool that claimed its first init gate.
@@ -3391,6 +3446,7 @@ fn shared_message_id_allocator(
     let state = Arc::new(PoolMessageIdState {
         allocator: Mutex::new(allocator),
         opened_connection: AtomicBool::new(false),
+        successful_checkout: AtomicBool::new(false),
     });
     let generation = NEXT_POOL_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
     per_pool_entries.insert(
@@ -4076,6 +4132,22 @@ impl DbPool {
         self.pool.is_closed()
     }
 
+    /// Whether this live engine pool has completed at least one successful
+    /// checkout. Cache publication only constructs a lazy pool; it does not
+    /// imply that startup initialization or recovery has finished.
+    ///
+    /// This is shared across wrappers of the same engine and is not a health
+    /// probe. Recovery retirement closes the engine, making it unready even
+    /// if an earlier generation completed a checkout.
+    #[must_use]
+    pub fn is_initialized(&self) -> bool {
+        !self.pool.is_closed()
+            && self
+                .message_id_state
+                .successful_checkout
+                .load(Ordering::Acquire)
+    }
+
     #[must_use]
     pub fn engine_identity_key(&self) -> String {
         let identity = self.cache_identity_namespace();
@@ -4240,10 +4312,21 @@ impl DbPool {
                         // every other acquire bounds its wait so a wedged or
                         // slow initialization surfaces as an attributed,
                         // retryable error instead of parking this dispatch
-                        // thread forever.
-                        match init_gate.claim_or_wait(SQLITE_INIT_GATE_WAIT_BUDGET) {
-                            SqliteInitGateClaim::Ready => {}
-                            SqliteInitGateClaim::TimedOut => {
+                        // thread forever. A cancelled waiter must also return
+                        // its reserved pool slot while the initializer remains
+                        // active, without resetting that owner's gate.
+                        match init_gate.claim_or_wait_with(SQLITE_INIT_GATE_WAIT_BUDGET, || {
+                            cx2.checkpoint().map_err(|_| {
+                                cx2.cancel_reason().unwrap_or_else(|| {
+                                    asupersync::CancelReason::user(
+                                        "pooled connection initialization wait cancelled",
+                                    )
+                                })
+                            })
+                        }) {
+                            Err(reason) => return Outcome::Cancelled(reason),
+                            Ok(SqliteInitGateClaim::Ready) => {}
+                            Ok(SqliteInitGateClaim::TimedOut) => {
                                 return Outcome::Err(SqlError::Custom(format!(
                                     "database initialization still in progress after {}s; \
                                      the mailbox is warming up or its archive reconcile is \
@@ -4251,7 +4334,7 @@ impl DbPool {
                                     SQLITE_INIT_GATE_WAIT_BUDGET.as_secs()
                                 )));
                             }
-                            SqliteInitGateClaim::Initialize => {
+                            Ok(SqliteInitGateClaim::Initialize) => {
                                 let mut completion = SqliteInitGateCompletion {
                                     gate: &init_gate,
                                     success: false,
@@ -4477,7 +4560,11 @@ impl DbPool {
         let metrics = mcp_agent_mail_core::global_metrics();
         metrics.db.pool_acquires_total.inc();
         metrics.db.pool_acquire_latency_us.record(dur_us);
-        if !matches!(out, Outcome::Ok(_)) {
+        if matches!(out, Outcome::Ok(_)) {
+            self.message_id_state
+                .successful_checkout
+                .store(true, Ordering::Release);
+        } else {
             metrics.db.pool_acquire_errors_total.inc();
         }
 
@@ -5929,6 +6016,17 @@ struct PoolCacheKey {
     max_lifetime_ms: u64,
 }
 
+impl PoolCacheKey {
+    fn same_pool_shape(&self, other: &Self) -> bool {
+        self.sqlite_identity == other.sqlite_identity
+            && self.storage_root_identity == other.storage_root_identity
+            && self.min_connections == other.min_connections
+            && self.max_connections == other.max_connections
+            && self.acquire_timeout_ms == other.acquire_timeout_ms
+            && self.max_lifetime_ms == other.max_lifetime_ms
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SqliteInitGateKey {
     sqlite_identity: Option<PathBuf>,
@@ -5937,8 +6035,66 @@ struct SqliteInitGateKey {
 
 static SQLITE_INIT_GATES: OnceLock<OrderedRwLock<HashMap<SqliteInitGateKey, Arc<SqliteInitGate>>>> =
     OnceLock::new();
-static POOL_CACHE: OnceLock<OrderedRwLock<HashMap<PoolCacheKey, Weak<Pool<DbConn>>>>> =
-    OnceLock::new();
+#[derive(Clone)]
+struct CachedPool {
+    pool: Weak<Pool<DbConn>>,
+    sqlite_authority: Option<Weak<FrozenDirectoryAuthority>>,
+    storage_root_authority: Weak<FrozenDirectoryAuthority>,
+}
+
+impl CachedPool {
+    fn new(pool: &DbPool) -> Self {
+        Self {
+            pool: Arc::downgrade(&pool.pool),
+            sqlite_authority: pool.sqlite_authority.as_ref().map(Arc::downgrade),
+            storage_root_authority: Arc::downgrade(&pool.storage_root_authority),
+        }
+    }
+
+    /// Reuse the original frozen descriptors, including directories latched
+    /// after lazy construction. A freshly resolved wrapper must never forget
+    /// those bindings or mistake their legitimate creation for a new engine.
+    fn bind_authority(&self, requested: &DbPoolAuthority) -> Option<DbPoolAuthority> {
+        let sqlite_authority = match self.sqlite_authority.as_ref() {
+            Some(authority) => Some(authority.upgrade()?),
+            None => None,
+        };
+        let storage_root_authority = self.storage_root_authority.upgrade()?;
+        validate_frozen_sqlite_open_authority_with_descriptor(
+            &requested.sqlite_path,
+            requested.sqlite_identity.as_deref(),
+            sqlite_authority.as_deref(),
+            "cached pool authority",
+        )
+        .ok()?;
+        verify_frozen_storage_root_with_descriptor(
+            &requested.storage_root,
+            &requested.storage_root_alias,
+            &storage_root_authority,
+            "cached pool authority",
+        )
+        .ok()?;
+        if sqlite_authority
+            .as_ref()
+            .map(|authority| authority.materialized_chain_ids())
+            != requested
+                .sqlite_authority
+                .as_ref()
+                .map(|authority| authority.existing_chain_ids())
+            || storage_root_authority.materialized_chain_ids()
+                != requested.storage_root_authority.existing_chain_ids()
+        {
+            return None;
+        }
+        Some(DbPoolAuthority {
+            sqlite_authority,
+            storage_root_authority,
+            ..requested.clone()
+        })
+    }
+}
+
+static POOL_CACHE: OnceLock<OrderedRwLock<HashMap<PoolCacheKey, CachedPool>>> = OnceLock::new();
 /// Strict query-only pools for the live mailbox read lane, held strongly.
 ///
 /// Request-path reads used to build a fresh uncached pool per call, so every
@@ -5969,7 +6125,10 @@ struct LiveQueryOnlyPoolEntry {
 }
 
 fn live_query_only_file_id(sqlite_identity: &Path) -> Option<(u64, u64)> {
-    health_probe_file_stamp(sqlite_identity).map(|(device, file, _, _)| (device, file))
+    health_probe_file_stamp(sqlite_identity)
+        .ok()
+        .flatten()
+        .map(|stamp| stamp.identity)
 }
 /// Upper bound on [`LIVE_QUERY_ONLY_POOL_CACHE`] entries. A server reads one
 /// mailbox, so this only binds processes that touch many mailboxes (a test
@@ -5994,7 +6153,7 @@ fn retire_cached_runtime_state_after_recovery_with_owner(
     trigger: &str,
     initializing_owner: Option<&InitializingPoolOwner>,
 ) {
-    let mut retired_pools = {
+    let (mut retired_pools, initializing_cache_entries) = {
         let cache =
             POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
         let mut guard = cache.write();
@@ -6004,13 +6163,20 @@ fn retire_cached_runtime_state_after_recovery_with_owner(
             .cloned()
             .collect::<Vec<_>>();
         let mut pools = Vec::new();
+        let mut initializing_cache_entries = Vec::new();
         for key in &matching_keys {
-            if let Some(pool) = guard.remove(key).and_then(|weak| weak.upgrade())
-                && !pools
+            if let Some(entry) = guard.remove(key)
+                && let Some(pool) = entry.pool.upgrade()
+            {
+                if initializing_owner.is_some_and(|owner| Arc::ptr_eq(&owner.pool, &pool)) {
+                    initializing_cache_entries.push((key.clone(), entry));
+                }
+                if !pools
                     .iter()
                     .any(|existing: &Arc<Pool<DbConn>>| Arc::ptr_eq(existing, &pool))
-            {
-                pools.push(pool);
+                {
+                    pools.push(pool);
+                }
             }
         }
         drop(guard);
@@ -6031,10 +6197,10 @@ fn retire_cached_runtime_state_after_recovery_with_owner(
                 false
             });
         }
-        pools
+        (pools, initializing_cache_entries)
     };
 
-    let (message_id_allocator_invalidated, retired_generations) = {
+    let (message_id_allocator_invalidated, retired_generations, adopted_initializing_owner) = {
         let registry = MESSAGE_ID_ALLOCATORS.get_or_init(|| Mutex::new(HashMap::new()));
         let guard = registry.lock().unwrap_or_else(PoisonError::into_inner);
         // Match constructor lock order. Retirement and the one permitted
@@ -6048,6 +6214,7 @@ fn retire_cached_runtime_state_after_recovery_with_owner(
         let previous_allocator = previous
             .as_ref()
             .and_then(|entry| entry.allocator.upgrade());
+        let mut adopted_initializing_owner = false;
         if let Some(allocator) = &previous_allocator {
             allocator.retire();
         }
@@ -6106,11 +6273,12 @@ fn retire_cached_runtime_state_after_recovery_with_owner(
                 *allocator = replacement;
                 drop(allocator);
                 retired_pools.retain(|pool| !Arc::ptr_eq(pool, &owner.pool));
+                adopted_initializing_owner = true;
             }
         }
         drop(logical);
         drop(guard);
-        (previous.is_some(), generations)
+        (previous.is_some(), generations, adopted_initializing_owner)
     };
 
     for pool in &retired_pools {
@@ -6134,6 +6302,23 @@ fn retire_cached_runtime_state_after_recovery_with_owner(
         });
         before.saturating_sub(guard.len())
     };
+
+    // Retirement removed the lazy initializer's cache publication along with
+    // old generations. Only the exact owner adopted by this retirement may
+    // regain its former weak entries. A later failed/cancelled initializer
+    // closes that engine; lookup then rejects it. Never replace a cache entry
+    // another caller published after the retirement.
+    if adopted_initializing_owner
+        && let Some(owner) = initializing_owner
+        && !owner.pool.is_closed()
+    {
+        let cache =
+            POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
+        let mut guard = cache.write();
+        for (key, entry) in initializing_cache_entries {
+            guard.entry(key).or_insert(entry);
+        }
+    }
 
     if let Some(cache) = RECENT_RECONSTRUCT_CACHE.get() {
         let mut guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
@@ -6391,6 +6576,7 @@ impl DbPoolAuthority {
 struct FrozenDirectoryAuthority {
     target_path: PathBuf,
     authority_name: &'static str,
+    #[cfg(unix)]
     expect_directory_leaf: bool,
     #[cfg(unix)]
     anchor_dir: std::fs::File,
@@ -6403,7 +6589,37 @@ struct FrozenDirectoryAuthority {
     latched_suffix_dirs: Mutex<Vec<(rustix::fs::Dev, u64)>>,
 }
 
+/// The `(st_dev, st_ino)` identity that frozen directory authorities record and compare.
+// stat field widths differ across Unix targets (macOS st_dev is i32); std's
+// dev() widens with the same `as u64`, so both sides compare alike.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast, clippy::cast_sign_loss)]
+const fn stat_dir_identity(stat: &rustix::fs::Stat) -> (u64, u64) {
+    (stat.st_dev as u64, stat.st_ino as u64)
+}
+
 impl FrozenDirectoryAuthority {
+    #[must_use]
+    fn materialized_chain_ids(&self) -> Vec<(u64, u64)> {
+        let chain = self.existing_chain_ids();
+        #[cfg(unix)]
+        {
+            let mut chain = chain;
+            chain.extend(
+                self.latched_suffix_dirs
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                    .copied(),
+            );
+            chain
+        }
+        #[cfg(not(unix))]
+        {
+            chain
+        }
+    }
+
     #[must_use]
     fn existing_chain_ids(&self) -> Vec<(u64, u64)> {
         #[cfg(unix)]
@@ -6564,8 +6780,7 @@ impl FrozenDirectoryAuthority {
                 ),
             })?;
             let mut anchor_dir = std::fs::File::from(root_fd);
-            let mut ancestor_chain =
-                vec![(PathBuf::from("/"), (root_stat.st_dev, root_stat.st_ino))];
+            let mut ancestor_chain = vec![(PathBuf::from("/"), stat_dir_identity(&root_stat))];
             let mut unresolved_suffix = Vec::new();
             let mut current_path = PathBuf::from("/");
 
@@ -6608,10 +6823,8 @@ impl FrozenDirectoryAuthority {
                                         }
                                     })?;
                                 anchor_dir = resolved_file;
-                                ancestor_chain.push((
-                                    resolved.clone(),
-                                    (resolved_stat.st_dev, resolved_stat.st_ino),
-                                ));
+                                ancestor_chain
+                                    .push((resolved.clone(), stat_dir_identity(&resolved_stat)));
                                 current_path = resolved;
                                 continue;
                             }
@@ -6667,8 +6880,7 @@ impl FrozenDirectoryAuthority {
                             });
                         }
                         anchor_dir = std::fs::File::from(next_fd);
-                        ancestor_chain
-                            .push((current_path.clone(), (next_stat.st_dev, next_stat.st_ino)));
+                        ancestor_chain.push((current_path.clone(), stat_dir_identity(&next_stat)));
                     }
                     Err(rustix::io::Errno::NOENT) => {
                         missing_started = true;
@@ -6700,11 +6912,10 @@ impl FrozenDirectoryAuthority {
 
         #[cfg(not(unix))]
         {
-            let _ = field;
+            let _ = (field, expect_directory_leaf);
             Ok(Self {
                 target_path: target_path.to_path_buf(),
                 authority_name,
-                expect_directory_leaf,
             })
         }
     }
@@ -6759,7 +6970,7 @@ impl FrozenDirectoryAuthority {
             ))
         })?;
         if let Some((_, expected_root)) = self.ancestor_chain.first()
-            && (root_stat.st_dev, root_stat.st_ino) != *expected_root
+            && stat_dir_identity(&root_stat) != *expected_root
         {
             return Err(SqlError::Custom(format!(
                 "{context}: root directory identity changed while verifying {} authority {}; refusing to cross {} authority",
@@ -6842,7 +7053,7 @@ impl FrozenDirectoryAuthority {
                     self.authority_name
                 ))
             })?;
-            if (walk_stat.st_dev, walk_stat.st_ino) != *expected_id {
+            if stat_dir_identity(&walk_stat) != *expected_id {
                 return Err(SqlError::Custom(format!(
                     "{context}: frozen {} ancestor {} was replaced with a different directory inode; refusing to cross {} authority",
                     self.authority_name,
@@ -6950,7 +7161,7 @@ impl FrozenDirectoryAuthority {
                             self.authority_name
                         )));
                     }
-                    let observed_id = (next_stat.st_dev, next_stat.st_ino);
+                    let observed_id = stat_dir_identity(&next_stat);
                     if let Some(expected_id) = latched.get(idx).copied() {
                         if observed_id != expected_id {
                             return Err(SqlError::Custom(format!(
@@ -7385,7 +7596,13 @@ impl FrozenDirectoryAuthority {
             match std::fs::read(&path) {
                 Ok(bytes) => Ok(Some(bytes)),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(error) => Err(DbError::Io(error)),
+                Err(error) => Err(DbError::InvalidArgument {
+                    field: "storage_root",
+                    message: format!(
+                        "{context}: cannot read search_index/{file_name} under {}: {error}; refusing to cross archive authority",
+                        self.target_path.display()
+                    ),
+                }),
             }
         }
     }
@@ -7657,117 +7874,6 @@ fn sqlite_init_gate_key(
 /// [`DbError::ResourceBusy`]. Tied to [`DEFAULT_POOL_TIMEOUT_MS`] so the
 /// bound matches the pool's own acquire budget.
 const SQLITE_INIT_GATE_WAIT_BUDGET: Duration = Duration::from_millis(DEFAULT_POOL_TIMEOUT_MS);
-
-/// Outcome of [`SqliteInitGate::claim_or_wait`].
-enum SqliteInitGateClaim {
-    /// The caller won the initializer role and MUST run initialization, then
-    /// call [`SqliteInitGate::complete`] (or rely on
-    /// [`SqliteInitGateCompletion`]'s drop guard).
-    Initialize,
-    /// Initialization already completed successfully.
-    Ready,
-    /// Another task is still initializing and the wait budget elapsed.
-    TimedOut,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SqliteInitGateState {
-    NotStarted,
-    Running,
-    Done,
-}
-
-/// One-time DB init gate with BOUNDED waiting (GH#245 stall hunt, finding F1).
-///
-/// The previous shape was an `asupersync` `OnceCell<()>`: cancellation-correct,
-/// but every non-initializing caller awaited it with no deadline. When the
-/// initializer wedged (archive reconcile behind the storage publication fence,
-/// a slow migration, a filesystem stall), every DB-needing tool call parked
-/// forever in that await — dispatch threads in `futex_do_wait`, process idle,
-/// every request reported as an unattributed 30s timeout: the GH#245 outage
-/// shape. Now only the initializer runs unboundedly; waiters bound their wait
-/// with [`SQLITE_INIT_GATE_WAIT_BUDGET`] and surface a retryable, ATTRIBUTED
-/// error instead. std sync primitives on purpose: this path runs under
-/// `block_on` on dedicated dispatch threads and must not depend on async
-/// timers (GH#203).
-struct SqliteInitGate {
-    state: Mutex<SqliteInitGateState>,
-    cv: Condvar,
-}
-
-impl SqliteInitGate {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(SqliteInitGateState::NotStarted),
-            cv: Condvar::new(),
-        }
-    }
-
-    /// Claim the initializer role, or wait (bounded) for the current one.
-    ///
-    /// Failure semantics mirror the old `OnceCell::get_or_try_init`: a failed
-    /// or cancelled initialization resets to `NotStarted` (via
-    /// [`Self::complete`]) so a later caller retries it.
-    fn claim_or_wait(&self, budget: Duration) -> SqliteInitGateClaim {
-        let deadline = Instant::now() + budget;
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        loop {
-            match *state {
-                SqliteInitGateState::Done => return SqliteInitGateClaim::Ready,
-                SqliteInitGateState::NotStarted => {
-                    *state = SqliteInitGateState::Running;
-                    return SqliteInitGateClaim::Initialize;
-                }
-                SqliteInitGateState::Running => {
-                    let now = Instant::now();
-                    let Some(remaining) = deadline.checked_duration_since(now) else {
-                        return SqliteInitGateClaim::TimedOut;
-                    };
-                    if remaining.is_zero() {
-                        return SqliteInitGateClaim::TimedOut;
-                    }
-                    let (guard, _) = self
-                        .cv
-                        .wait_timeout(state, remaining)
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    state = guard;
-                }
-            }
-        }
-    }
-
-    /// Publish the initializer's outcome and wake every bounded waiter.
-    fn complete(&self, success: bool) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *state = if success {
-            SqliteInitGateState::Done
-        } else {
-            SqliteInitGateState::NotStarted
-        };
-        drop(state);
-        self.cv.notify_all();
-    }
-}
-
-/// Drop guard so the gate can never be stranded in `Running` — an initializer
-/// that unwinds (or forgets to report) resets the gate to retryable instead of
-/// condemning every future waiter to bounded timeouts with no retry.
-struct SqliteInitGateCompletion<'a> {
-    gate: &'a SqliteInitGate,
-    success: bool,
-}
-
-impl Drop for SqliteInitGateCompletion<'_> {
-    fn drop(&mut self) {
-        self.gate.complete(self.success);
-    }
-}
 
 fn sqlite_init_gate(
     sqlite_identity: Option<&Path>,
@@ -8057,13 +8163,13 @@ async fn run_sqlite_init_once(
     }
 
     // Rebuild inbox_stats from ground truth, drop legacy triggers, and fix
-    // mixed-scale timestamps left by the Python server.
+    // mixed-scale timestamps left by the Python server. A rolled-back repair
+    // preserves the old data, but does not prove that mail is ready to serve.
+    // Keep the initialization gate retryable until the repair really succeeds.
     if let Err(err) = startup_data_repairs(&runtime_conn) {
-        tracing::warn!(
-            path = %sqlite_path,
-            error = %err,
-            "startup data repairs failed; some counters/timestamps may be stale"
-        );
+        return Outcome::Err(SqlError::Custom(format!(
+            "sqlite init stage=startup_data_repairs failed: {err}"
+        )));
     }
 
     drop(runtime_conn);
@@ -8130,76 +8236,81 @@ async fn initialize_in_memory_connection(
 
 /// One-shot data repairs run at startup before pool connections are handed out.
 ///
-/// 1. Drop legacy `inbox_stats` triggers (redundant with explicit rebuilds).
-/// 2. Rebuild `inbox_stats` from ground truth.
-/// 3. Fix mixed-scale timestamps (seconds/millis → microseconds).
+/// Normalize legacy timestamps before rebuilding their derived inbox counters.
+/// Publish the repair atomically: a failed recount must not leave an empty
+/// `inbox_stats` table, partially normalized messages, or removed triggers.
 #[allow(clippy::result_large_err)]
 fn startup_data_repairs(conn: &DbConn) -> Result<(), SqlError> {
-    // ── inbox_stats rebuild ──────────────────────────────────────────
-    let has_inbox_stats = !conn
-        .query_sync(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='inbox_stats'",
-            &[],
-        )?
-        .is_empty();
-
-    if has_inbox_stats {
-        // Drop legacy triggers to prevent double-counting.
-        conn.execute_raw("DROP TRIGGER IF EXISTS trg_inbox_stats_insert")?;
-        conn.execute_raw("DROP TRIGGER IF EXISTS trg_inbox_stats_mark_read")?;
-        conn.execute_raw("DROP TRIGGER IF EXISTS trg_inbox_stats_ack")?;
-
-        // Full rebuild from ground truth.
-        conn.execute_raw("DELETE FROM inbox_stats")?;
-        conn.execute_raw(
-            "INSERT INTO inbox_stats \
-                (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
-            SELECT \
-                r.agent_id, \
-                COUNT(*) AS total_count, \
-                SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
-                SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_pending_count, \
-                MAX(m.created_ts) AS last_message_ts \
-            FROM message_recipients r \
-            JOIN messages m ON m.id = r.message_id \
-            GROUP BY r.agent_id",
-        )?;
+    // A savepoint also preserves any caller-owned transaction. Only release
+    // it after the timestamp and counter views describe the same data.
+    conn.execute_raw("SAVEPOINT am_startup_data_repairs")?;
+    let repaired: Result<(), SqlError> = (|| {
+        let has_messages = !conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'",
+                &[],
+            )?
+            .is_empty();
+        if has_messages {
+            // The Python server occasionally wrote seconds or milliseconds.
+            // Normalize millis [10^12, 10^15), then seconds (0, 10^12), so
+            // inbox_stats.last_message_ts is computed in microseconds too.
+            conn.execute_raw(
+                "UPDATE messages SET created_ts = created_ts * 1000 \
+                 WHERE created_ts >= 1000000000000 AND created_ts < 1000000000000000",
+            )?;
+            conn.execute_raw(
+                "UPDATE messages SET created_ts = created_ts * 1000000 \
+                 WHERE created_ts > 0 AND created_ts < 1000000000000",
+            )?;
+        }
+        let has_inbox_stats = !conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='inbox_stats'",
+                &[],
+            )?
+            .is_empty();
+        if has_inbox_stats {
+            // Drop legacy triggers to prevent double-counting after startup.
+            conn.execute_raw("DROP TRIGGER IF EXISTS trg_inbox_stats_insert")?;
+            conn.execute_raw("DROP TRIGGER IF EXISTS trg_inbox_stats_mark_read")?;
+            conn.execute_raw("DROP TRIGGER IF EXISTS trg_inbox_stats_ack")?;
+            conn.execute_raw("DELETE FROM inbox_stats")?;
+            conn.execute_raw(
+                "INSERT INTO inbox_stats \
+                    (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+                SELECT \
+                    r.agent_id, \
+                    COUNT(*) AS total_count, \
+                    SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
+                    SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_pending_count, \
+                    MAX(m.created_ts) AS last_message_ts \
+                FROM message_recipients r \
+                JOIN messages m ON m.id = r.message_id \
+                GROUP BY r.agent_id",
+            )?;
+        }
+        conn.execute_raw("RELEASE SAVEPOINT am_startup_data_repairs")?;
+        Ok(())
+    })();
+    if let Err(error) = repaired {
+        // Never release after a failed rollback: that could commit precisely
+        // the partial repair we are trying to preserve against. The caller
+        // drops this initialization connection after the returned error.
+        conn.execute_raw("ROLLBACK TO SAVEPOINT am_startup_data_repairs")
+            .map_err(|rollback| {
+                SqlError::Custom(format!(
+                    "startup data repairs failed: {error}; rollback failed: {rollback}"
+                ))
+            })?;
+        conn.execute_raw("RELEASE SAVEPOINT am_startup_data_repairs")
+            .map_err(|release| {
+                SqlError::Custom(format!(
+                    "startup data repairs failed: {error}; savepoint release failed: {release}"
+                ))
+            })?;
+        return Err(error);
     }
-
-    // ── Fix mixed-scale timestamps ───────────────────────────────────
-    // The Python server occasionally wrote created_ts in seconds or
-    // milliseconds instead of microseconds.  Detect and upscale:
-    //   seconds  (< 1e13)  → × 1_000_000
-    //   millis   (< 1e16)  → × 1_000
-    let has_messages = !conn
-        .query_sync(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'",
-            &[],
-        )?
-        .is_empty();
-
-    if has_messages {
-        // Magnitude-based detection (non-overlapping ranges):
-        //   2026 seconds  ≈ 1.77 × 10⁹   →  < 10¹² is definitely seconds
-        //   2026 millis   ≈ 1.77 × 10¹²   →  [10¹², 10¹⁵) is definitely millis
-        //   2026 micros   ≈ 1.77 × 10¹⁵   →  ≥ 10¹⁵ is already correct
-        //
-        // Order matters: handle millis FIRST to avoid seconds check catching
-        // millis values that happen to be < 10¹² (they can't — millis are ≥ 10¹²).
-        // But we still process millis first as a safety measure.
-
-        // Milliseconds → microseconds  [10^12, 10^15)
-        conn.execute_raw(
-            "UPDATE messages SET created_ts = created_ts * 1000 \
-             WHERE created_ts >= 1000000000000 AND created_ts < 1000000000000000",
-        )?;
-        // Seconds → microseconds  (0, 10^12)
-        conn.execute_raw(
-            "UPDATE messages SET created_ts = created_ts * 1000000 \
-             WHERE created_ts > 0 AND created_ts < 1000000000000",
-        )?;
-    }
-
     Ok(())
 }
 
@@ -9033,7 +9144,32 @@ fn ensure_primary_not_multiply_linked(primary_path: &Path, context: &str) -> Res
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    match mcp_agent_mail_core::disk::open_regular_file_no_follow(primary_path) {
+        Ok(file) => {
+            let links =
+                mcp_agent_mail_core::disk::windows_file_link_count(&file).map_err(|error| {
+                    SqlError::Custom(format!(
+                        "{context}: failed to inspect recovery primary {}: {error}",
+                        primary_path.display()
+                    ))
+                })?;
+            if links != 1 {
+                return Err(SqlError::Custom(format!(
+                    "{context}: live database {} has {links} hard links and aliases the live database across multiple pathnames; recovery requires an exclusively owned file generation",
+                    primary_path.display()
+                )));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(SqlError::Custom(format!(
+                "{context}: failed to inspect recovery primary {}: {error}",
+                primary_path.display()
+            )));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = context;
     Ok(())
 }
@@ -14044,13 +14180,28 @@ enum HealthVerdictVariant {
 /// Family metadata that must be unchanged for a healthy verdict to be reused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HealthVerdictFingerprint {
-    /// Main database file: device, inode, length, mtime in nanoseconds.
-    main: (u64, u64, u64, i128),
-    /// Sidecars whose bytes decide the verdict: suffix, length, mtime.
-    content_sidecars: Vec<(&'static str, u64, i128)>,
+    main: HealthProbeFileStamp,
+    /// Sidecars whose bytes decide the verdict, including generation identity.
+    content_sidecars: Vec<(&'static str, HealthProbeFileStamp)>,
     /// Sidecars whose presence and length matter but whose bytes churn with
-    /// every reader (`-shm` read marks, namespace use counters): suffix, length.
-    shape_sidecars: Vec<(&'static str, u64)>,
+    /// every reader. Identity and permissions still belong to the generation;
+    /// only their modification/change times are omitted.
+    shape_sidecars: Vec<(&'static str, HealthProbeFileStamp)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HealthProbeFileStamp {
+    identity: (u64, u64),
+    len: u64,
+    modified_ns: i128,
+    #[cfg(unix)]
+    changed_ns: i128,
+    #[cfg(unix)]
+    owner: (u32, u32),
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    links: u64,
 }
 
 struct HealthVerdictEntry {
@@ -14074,52 +14225,90 @@ fn health_verdict_reuse_window() -> Duration {
     Duration::from_secs(secs.min(HEALTH_VERDICT_REUSE_WINDOW_MAX_SECS))
 }
 
-/// Device/volume, inode/file index, length, and mtime of a regular file.
-/// `None` for missing, nonregular, or unidentifiable files means "never reuse".
-fn health_probe_file_stamp(path: &Path) -> Option<(u64, u64, u64, i128)> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
+/// Read metadata without opening a source descriptor or following a leaf link.
+/// Only absence is `Ok(None)`: unsafe, unreadable or unidentifiable entries
+/// disable reuse for the entire family instead of disappearing from its key.
+fn health_probe_file_stamp(path: &Path) -> std::io::Result<Option<HealthProbeFileStamp>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
     if !metadata.file_type().is_file() {
-        return None;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "health verdict reuse requires regular family members",
+        ));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let mtime =
-            i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec());
-        Some((metadata.dev(), metadata.ino(), metadata.len(), mtime))
+        Ok(Some(HealthProbeFileStamp {
+            identity: (metadata.dev(), metadata.ino()),
+            len: metadata.len(),
+            modified_ns: i128::from(metadata.mtime()) * 1_000_000_000
+                + i128::from(metadata.mtime_nsec()),
+            changed_ns: i128::from(metadata.ctime()) * 1_000_000_000
+                + i128::from(metadata.ctime_nsec()),
+            owner: (metadata.uid(), metadata.gid()),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+        }))
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         // Windows timestamps use 100 ns ticks from its native epoch. Cache
         // entries are process-local, so only exact equality is significant.
-        Some((
-            u64::from(metadata.volume_serial_number()?),
-            metadata.file_index()?,
-            metadata.len(),
-            i128::from(metadata.last_write_time()) * 100,
-        ))
+        let volume = metadata
+            .volume_serial_number()
+            .ok_or_else(|| std::io::Error::other("health file volume identity unavailable"))?;
+        let index = metadata
+            .file_index()
+            .ok_or_else(|| std::io::Error::other("health file identity unavailable"))?;
+        Ok(Some(HealthProbeFileStamp {
+            identity: (u64::from(volume), index),
+            len: metadata.len(),
+            modified_ns: i128::from(metadata.last_write_time()) * 100,
+        }))
     }
     #[cfg(not(any(unix, windows)))]
     {
-        None
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "health file identity unavailable on this platform",
+        ))
     }
 }
 
 fn health_verdict_fingerprint(path: &Path) -> Option<HealthVerdictFingerprint> {
-    let main = health_probe_file_stamp(path)?;
-    let mut content_sidecars = Vec::new();
-    for suffix in ["-wal", "-journal", "-wal-cert", "-wal-cert-head"] {
-        if let Some((_, _, len, mtime)) =
-            health_probe_file_stamp(&sqlite_sidecar_path(path, suffix))
-        {
-            content_sidecars.push((suffix, len, mtime));
-        }
+    let main = health_probe_file_stamp(path).ok().flatten()?;
+    #[cfg(unix)]
+    if main.links != 1 {
+        return None;
     }
+    let mut content_sidecars = Vec::new();
     let mut shape_sidecars = Vec::new();
-    for suffix in ["-shm", "-fsqlite-ns-gate", "-fsqlite-ns-use"] {
-        if let Some((_, _, len, _)) = health_probe_file_stamp(&sqlite_sidecar_path(path, suffix)) {
-            shape_sidecars.push((suffix, len));
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .into_iter()
+        .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES)
+    {
+        if let Some(mut stamp) = health_probe_file_stamp(&sqlite_sidecar_path(path, suffix)).ok()? {
+            #[cfg(unix)]
+            if stamp.links != 1 {
+                return None;
+            }
+            if suffix == "-shm" || FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES.contains(&suffix) {
+                // Coordination updates must not defeat unchanged-family reuse.
+                stamp.modified_ns = 0;
+                #[cfg(unix)]
+                {
+                    stamp.changed_ns = 0;
+                }
+                shape_sidecars.push((suffix, stamp));
+            } else {
+                content_sidecars.push((suffix, stamp));
+            }
         }
     }
     Some(HealthVerdictFingerprint {
@@ -14223,6 +14412,10 @@ pub fn sqlite_compatibility_read_path_is_healthy(path: &Path) -> Result<bool, Sq
 
 #[allow(clippy::result_large_err)]
 pub fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
+    let _ = take_last_unhealthy_reason(path);
+    // A cached canonical identity must not admit a new, symlinked spelling
+    // that staging would refuse. Validate the caller's path before reuse.
+    validate_sqlite_target_path(path, "SQLite health-probe source")?;
     let fingerprint = health_verdict_fingerprint(path);
     if let Some(fingerprint) = &fingerprint
         && healthy_verdict_reusable(path, HealthVerdictVariant::WithFamilyCleanup, fingerprint)
@@ -14264,6 +14457,8 @@ pub fn sqlite_file_is_healthy(path: &Path) -> Result<bool, SqlError> {
 /// refusal to the runtime's first database open.
 #[allow(clippy::result_large_err)]
 pub fn sqlite_file_is_healthy_without_family_cleanup(path: &Path) -> Result<bool, SqlError> {
+    let _ = take_last_unhealthy_reason(path);
+    validate_sqlite_target_path(path, "SQLite health-probe source")?;
     let fingerprint = health_verdict_fingerprint(path);
     if let Some(fingerprint) = &fingerprint
         && healthy_verdict_reusable(
@@ -14289,6 +14484,8 @@ pub fn sqlite_file_is_healthy_without_family_cleanup(path: &Path) -> Result<bool
             HealthVerdictVariant::WithoutFamilyCleanup,
             fingerprint,
         );
+    } else {
+        transfer_unhealthy_reason(&staged.path, path);
     }
     Ok(healthy)
 }
@@ -15246,20 +15443,84 @@ fn lock_holder_pids_via_proc(path: &Path) -> Vec<(u32, bool)> {
     holders.into_iter().collect()
 }
 
-#[cfg(not(target_os = "linux"))]
-fn lock_holder_pids_via_proc(path: &Path) -> Vec<(u32, bool)> {
-    // macOS/BSD do not expose `/proc/locks`.  Treat an Agent Mail process
-    // with the activity-lock file open as a conservative holder candidate;
-    // the caller filters these PIDs through `pid_is_agent_mail`.  This is
-    // intentionally fail-closed: misclassifying an open-but-not-locked Agent
-    // Mail process as live only defers repair, while missing the real holder
-    // can authorize repair/reconstruct against an active database (GH#195).
-    // Without a lock-mode column every candidate is reported as an exclusive
-    // holder for the same fail-closed reason.
-    pids_holding_file_via_lsof(path)
-        .into_iter()
-        .map(|pid| (pid, true))
-        .collect()
+/// Who has the mailbox files locked or open, for [`inspect_mailbox_ownership`].
+///
+/// Linux reads `/proc/locks` and `/proc/*/fd`. Other platforms have only
+/// `lsof`, and `lsof -- <file>` reads the descriptor table of every process on
+/// the host: about 1.2 s of kernel time with ~3,200 processes on macOS. One
+/// inspection asks about three files, and every CLI call that resolves its
+/// server inspects first, including each `am check-inbox` hook, so a busy
+/// agent host spent several cores of kernel time on it (2026-11-11). Ownership
+/// only counts processes that pass [`pid_is_agent_mail`], so this probe lists
+/// those from the process table, once and only when a probed file exists, and
+/// has `lsof` read only their descriptors. When the process table cannot be
+/// read it falls back to every process: slower, but it misses no holder. A
+/// process that starts after the listing is not read, just as one that opens
+/// the file after `lsof` reads it was never seen by the full scan either.
+struct MailboxFileHolders {
+    /// The PIDs whose descriptors are read, listed on first use; `None` reads
+    /// every process.
+    #[cfg(not(target_os = "linux"))]
+    candidates: std::cell::OnceCell<Option<Vec<u32>>>,
+}
+
+impl MailboxFileHolders {
+    #[cfg(target_os = "linux")]
+    const fn probe() -> Self {
+        Self {}
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    const fn probe() -> Self {
+        Self {
+            candidates: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// `(pid, exclusive)` holders of the `flock` on `path`.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::unused_self)] // the non-Linux probe needs its candidate list
+    fn lock_holders(&self, path: &Path) -> Vec<(u32, bool)> {
+        lock_holder_pids_via_proc(path)
+    }
+
+    /// `(pid, exclusive)` holders of the `flock` on `path`.
+    ///
+    /// macOS/BSD do not expose `/proc/locks`.  Treat an Agent Mail process
+    /// with the activity-lock file open as a conservative holder candidate;
+    /// the caller filters these PIDs through `pid_is_agent_mail`.  This is
+    /// intentionally fail-closed: misclassifying an open-but-not-locked Agent
+    /// Mail process as live only defers repair, while missing the real holder
+    /// can authorize repair/reconstruct against an active database (GH#195).
+    /// Without a lock-mode column every candidate is reported as an exclusive
+    /// holder for the same fail-closed reason.
+    #[cfg(not(target_os = "linux"))]
+    fn lock_holders(&self, path: &Path) -> Vec<(u32, bool)> {
+        self.open_holders(path)
+            .into_iter()
+            .map(|pid| (pid, true))
+            .collect()
+    }
+
+    /// PIDs with `path` open.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::unused_self)] // the non-Linux probe needs its candidate list
+    fn open_holders(&self, path: &Path) -> Vec<u32> {
+        pids_holding_file_via_proc(path)
+    }
+
+    /// PIDs with `path` open.
+    #[cfg(not(target_os = "linux"))]
+    fn open_holders(&self, path: &Path) -> Vec<u32> {
+        // A missing file has no holders; skip listing the process table.
+        if !path.exists() {
+            return Vec::new();
+        }
+        let candidates = self
+            .candidates
+            .get_or_init(agent_mail_pids_from_process_table);
+        pids_holding_file_via_lsof(path, candidates.as_deref())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -15328,7 +15589,7 @@ fn pids_holding_file_via_proc(path: &Path) -> Vec<u32> {
 
 #[cfg(not(target_os = "linux"))]
 fn pids_holding_file_via_proc(path: &Path) -> Vec<u32> {
-    pids_holding_file_via_lsof(path)
+    pids_holding_file_via_lsof(path, None)
 }
 
 /// Enumerate PIDs with `path` open on platforms without Linux `/proc`.
@@ -15338,10 +15599,18 @@ fn pids_holding_file_via_proc(path: &Path) -> Vec<u32> {
 /// diagnostics.  Passing `--` prevents a path beginning with `-` from being
 /// interpreted as an option.  Any probe failure returns no evidence; callers
 /// remain read-only and can combine this with other liveness signals.
+///
+/// `among` limits the search to those PIDs (see [`MailboxFileHolders`]);
+/// `None` reads every process's descriptors, which costs about a second of
+/// kernel time on a host with a few thousand processes.
 #[cfg(not(target_os = "linux"))]
-fn pids_holding_file_via_lsof(path: &Path) -> Vec<u32> {
+fn pids_holding_file_via_lsof(path: &Path, among: Option<&[u32]>) -> Vec<u32> {
+    // lsof reports no holder for a file it cannot stat, so skip running it.
+    if among.is_some_and(<[u32]>::is_empty) || !path.exists() {
+        return Vec::new();
+    }
     let Ok(output) = std::process::Command::new("lsof")
-        .args(["-t", "-w", "--"])
+        .args(lsof_holder_args(among))
         .arg(path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -15349,10 +15618,99 @@ fn pids_holding_file_via_lsof(path: &Path) -> Vec<u32> {
     else {
         return Vec::new();
     };
+    // A PID that exits before lsof reads it makes lsof exit 1 even when it
+    // printed the holders it did find, so only empty output means none.
     if !output.status.success() && output.stdout.is_empty() {
         return Vec::new();
     }
     parse_pid_lines(&output.stdout)
+}
+
+/// `lsof` arguments up to the file name: PIDs only (`-t`), no warnings
+/// (`-w`), and with `among`, `-a -p <pids>` so the PID list and the file name
+/// must both match and only those processes are read.
+#[cfg(any(test, not(target_os = "linux")))]
+fn lsof_holder_args(among: Option<&[u32]>) -> Vec<String> {
+    let mut args = vec!["-t".to_string(), "-w".to_string()];
+    if let Some(pids) = among {
+        let pids: Vec<String> = pids.iter().map(u32::to_string).collect();
+        args.extend(["-a".to_string(), "-p".to_string(), pids.join(",")]);
+    }
+    args.push("--".to_string());
+    args
+}
+
+/// PIDs that [`pid_is_agent_mail`] accepts, from two whole-table `ps` reads
+/// of the same `command=` and `comm=` columns it reads one PID at a time.
+/// The reads run side by side. `None` when either fails or omits this
+/// process, so the caller falls back to reading every process.
+#[cfg(not(target_os = "linux"))]
+fn agent_mail_pids_from_process_table() -> Option<Vec<u32>> {
+    let commands = spawn_ps_table("command=");
+    let executables = spawn_ps_table("comm=");
+    // Collect both before `?`, so neither child is left unwaited.
+    let commands = commands.and_then(collect_ps_table);
+    let executables = executables.and_then(collect_ps_table);
+    Some(agent_mail_pids_in_process_table(&commands?, &executables?))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_ps_table(column: &str) -> Option<std::process::Child> {
+    std::process::Command::new("ps")
+        .args(["-ww", "-ax", "-o", &format!("pid=,{column}")])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn collect_ps_table(child: std::process::Child) -> Option<Vec<(u32, String)>> {
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let rows = parse_ps_table(&output.stdout);
+    // A listing that lacks the process reading it was not parsed correctly.
+    let me = std::process::id();
+    rows.iter().any(|(pid, _)| *pid == me).then_some(rows)
+}
+
+/// `(pid, value)` rows of `ps -o pid=,<column>=` output. Rows with an empty
+/// value are dropped, as [`parse_ps_output_value`] treats them as absent.
+#[cfg(any(test, not(target_os = "linux")))]
+fn parse_ps_table(stdout: &[u8]) -> Vec<(u32, String)> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| {
+            let (pid, value) = line.trim_start().split_once(char::is_whitespace)?;
+            let value = value.trim();
+            let pid = pid.parse::<u32>().ok()?;
+            (!value.is_empty()).then(|| (pid, value.to_owned()))
+        })
+        .collect()
+}
+
+/// The rows that pass [`pid_is_agent_mail`]'s two tests: the command line
+/// ([`command_line_is_agent_mail_process`]) or the executable path
+/// ([`executable_path_has_agent_mail_signature`]).
+#[cfg(any(test, not(target_os = "linux")))]
+fn agent_mail_pids_in_process_table(
+    commands: &[(u32, String)],
+    executables: &[(u32, String)],
+) -> Vec<u32> {
+    let by_command = commands
+        .iter()
+        .filter(|(_, command)| command_line_is_agent_mail_process(command));
+    let by_executable = executables
+        .iter()
+        .filter(|(_, executable)| executable_path_has_agent_mail_signature(Path::new(executable)));
+    by_command
+        .chain(by_executable)
+        .map(|(pid, _)| *pid)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 #[cfg(any(test, not(target_os = "linux")))]
@@ -15486,19 +15844,25 @@ fn pid_executable_deleted(pid: u32) -> bool {
 }
 
 fn pid_is_agent_mail(pid: u32) -> bool {
-    pid_command_line(pid).is_some_and(|command| {
-        // Rust binary (argv0 basename) OR a co-resident Python Agent Mail
-        // shadow (interpreter argv0 + agent-mail module). The Python case
-        // is what makes the pre-write mailbox-ownership gate refuse a
-        // concurrent legacy server (br-bvq1x.9.4 / I4).
-        command_line_has_agent_mail_signature(&command)
-            || command_is_python_agent_mail_shadow(&command)
-    }) || pid_executable_path(pid)
-        .and_then(|exe| {
-            exe.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        })
-        .is_some_and(|basename| executable_name_has_agent_mail_signature(&basename))
+    pid_command_line(pid).is_some_and(|command| command_line_is_agent_mail_process(&command))
+        || pid_executable_path(pid)
+            .is_some_and(|executable| executable_path_has_agent_mail_signature(&executable))
+}
+
+/// The command-line test of [`pid_is_agent_mail`]: the Rust binary by its
+/// `argv0` basename, or a co-resident Python Agent Mail shadow (interpreter
+/// `argv0` plus the agent-mail module). The Python case is what makes the
+/// pre-write mailbox-ownership gate refuse a concurrent legacy server
+/// (br-bvq1x.9.4 / I4).
+fn command_line_is_agent_mail_process(command: &str) -> bool {
+    command_line_has_agent_mail_signature(command) || command_is_python_agent_mail_shadow(command)
+}
+
+/// The executable test of [`pid_is_agent_mail`]: the executable's basename.
+fn executable_path_has_agent_mail_signature(executable: &Path) -> bool {
+    executable
+        .file_name()
+        .is_some_and(|name| executable_name_has_agent_mail_signature(&name.to_string_lossy()))
 }
 
 fn add_mailbox_process_surface(
@@ -15716,8 +16080,9 @@ pub fn inspect_mailbox_ownership(
     let storage_lock_path = mailbox_activity_lock_path_for_storage_root(storage_root);
     let sqlite_lock_path = mailbox_activity_lock_path_for_sqlite(primary_path);
 
+    let holders = MailboxFileHolders::probe();
     let mut processes = HashMap::new();
-    for (pid, exclusive) in lock_holder_pids_via_proc(&storage_lock_path) {
+    for (pid, exclusive) in holders.lock_holders(&storage_lock_path) {
         if pid_is_agent_mail(pid) {
             add_mailbox_process_surface(&mut processes, pid, |process| {
                 process.holds_storage_root_lock = true;
@@ -15725,7 +16090,7 @@ pub fn inspect_mailbox_ownership(
             });
         }
     }
-    for (pid, exclusive) in lock_holder_pids_via_proc(&sqlite_lock_path) {
+    for (pid, exclusive) in holders.lock_holders(&sqlite_lock_path) {
         if pid_is_agent_mail(pid) {
             add_mailbox_process_surface(&mut processes, pid, |process| {
                 process.holds_sqlite_lock = true;
@@ -15734,7 +16099,7 @@ pub fn inspect_mailbox_ownership(
         }
     }
     if primary_path.exists() {
-        for pid in pids_holding_file_via_proc(primary_path) {
+        for pid in holders.open_holders(primary_path) {
             if pid_is_agent_mail(pid) {
                 add_mailbox_process_surface(&mut processes, pid, |process| {
                     process.holds_database_file = true;
@@ -20391,15 +20756,8 @@ fn get_or_create_pool_with_authority(
         config.max_lifetime_ms,
     );
 
-    // Fast path: shared read lock for existing live pool (concurrent readers).
-    {
-        let guard = cache.read();
-        if let Some(pool) = guard.get(&cache_key)
-            && let Some(shared_pool) = pool.upgrade()
-            && !shared_pool.is_closed()
-        {
-            return DbPool::from_shared_pool_with_authority(config, shared_pool, false, authority);
-        }
+    if let Some(pool) = cached_pool_with_authority(config, &authority) {
+        return Ok(pool);
     }
 
     // Slow path: create a new pool (rare), or refresh a dead weak entry left
@@ -20422,14 +20780,17 @@ fn get_or_create_pool_with_authority(
     // Double-check after acquiring the write lock — another thread may have
     // won the race while we were bootstrapping. Prefer the published pool so
     // all callers share one instance; ours (unpublished, unused) drops.
-    if let Some(existing) = guard.get(&cache_key)
-        && let Some(shared_pool) = existing.upgrade()
+    if let Some(existing) = guard.get(&cache_key).cloned()
+        && let Some(shared_pool) = existing.pool.upgrade()
         && !shared_pool.is_closed()
     {
         drop(guard);
-        return DbPool::from_shared_pool_with_authority(config, shared_pool, false, authority);
+        let bound = existing.bind_authority(&authority).ok_or_else(|| {
+            DbError::ResourceBusy("cached pool frozen authority is unavailable or changed".into())
+        })?;
+        return DbPool::from_shared_pool_with_authority(config, shared_pool, false, bound);
     }
-    guard.insert(cache_key, Arc::downgrade(&pool.pool));
+    guard.insert(cache_key, CachedPool::new(&pool));
     drop(guard);
     Ok(pool)
 }
@@ -20446,55 +20807,108 @@ fn get_or_create_pool_with_authority(
 #[must_use]
 pub fn get_cached_pool(config: &DbPoolConfig) -> Option<DbPool> {
     let authority = DbPoolAuthority::resolve(config).ok()?;
+    cached_pool_with_authority(config, &authority)
+}
+
+fn cached_pool_with_authority(
+    config: &DbPoolConfig,
+    authority: &DbPoolAuthority,
+) -> Option<DbPool> {
     let cache_key = pool_cache_key_from_authority(
-        &authority,
+        authority,
         config.min_connections,
         config.max_connections,
         config.acquire_timeout_ms,
         config.max_lifetime_ms,
     );
     let cache = POOL_CACHE.get()?;
-    let guard = cache.read();
-    let shared_pool = guard.get(&cache_key)?.upgrade()?;
-    if shared_pool.is_closed() {
-        return None;
+    // Snapshot weak witnesses only. Descriptor validation must not hold the
+    // process-wide registry lock or pin otherwise dead pools/directories.
+    let candidates = {
+        let guard = cache.read();
+        if let Some(entry) = guard
+            .get(&cache_key)
+            .filter(|entry| entry.pool.strong_count() > 0)
+        {
+            vec![(cache_key.clone(), entry.clone())]
+        } else {
+            guard
+                .iter()
+                .filter(|(key, _)| key.same_pool_shape(&cache_key))
+                .map(|(key, entry)| (key.clone(), entry.clone()))
+                .collect()
+        }
+    };
+    for (old_key, entry) in candidates {
+        let Some(shared_pool) = entry.pool.upgrade().filter(|pool| !pool.is_closed()) else {
+            continue;
+        };
+        let Some(bound) = entry.bind_authority(authority) else {
+            continue;
+        };
+        if old_key != cache_key {
+            let mut guard = cache.write();
+            // Recovery may have retired the engine during validation. Never
+            // resurrect its entry or overwrite another published generation.
+            if shared_pool.is_closed()
+                || !(guard
+                    .get(&old_key)
+                    .is_some_and(|current| current.pool.ptr_eq(&entry.pool))
+                    || guard
+                        .get(&cache_key)
+                        .is_some_and(|current| current.pool.ptr_eq(&entry.pool)))
+                || guard.get(&cache_key).is_some_and(|current| {
+                    current.pool.strong_count() > 0 && !current.pool.ptr_eq(&entry.pool)
+                })
+            {
+                continue;
+            }
+            guard.remove(&old_key);
+            guard.insert(cache_key.clone(), entry);
+        }
+        if !shared_pool.is_closed() {
+            return DbPool::from_shared_pool_with_authority(config, shared_pool, false, bound).ok();
+        }
     }
-    drop(guard);
-    DbPool::from_shared_pool_with_authority(config, shared_pool, false, authority).ok()
+    None
 }
 
-fn compatible_cached_memory_pool(authority: &DbPoolAuthority) -> Option<Arc<Pool<DbConn>>> {
+fn compatible_cached_memory_pool(
+    authority: &DbPoolAuthority,
+) -> Option<(Arc<Pool<DbConn>>, DbPoolAuthority)> {
     if authority.sqlite_identity.is_some() {
         return None;
     }
 
     let cache =
         POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
-    let guard = cache.read();
-
-    let expected_chain = authority.storage_root_authority.existing_chain_ids();
-    let mut candidate: Option<Arc<Pool<DbConn>>> = None;
-    for (key, weak) in guard.iter() {
-        if key.sqlite_identity.is_some()
-            || key.storage_root_identity != authority.storage_root
-            || key.storage_root_chain != expected_chain
-        {
-            continue;
-        }
-        let Some(shared_pool) = weak.upgrade() else {
+    let entries = {
+        let guard = cache.read();
+        guard
+            .iter()
+            .filter(|(key, _)| {
+                key.sqlite_identity.is_none() && key.storage_root_identity == authority.storage_root
+            })
+            .map(|(_, entry)| entry.clone())
+            .collect::<Vec<_>>()
+    };
+    let mut candidate: Option<(Arc<Pool<DbConn>>, DbPoolAuthority)> = None;
+    for entry in entries {
+        let Some(shared_pool) = entry.pool.upgrade() else {
             continue;
         };
         if shared_pool.is_closed() {
             continue;
         }
+        let Some(bound) = entry.bind_authority(authority) else {
+            continue;
+        };
         match &candidate {
-            None => candidate = Some(shared_pool),
-            Some(existing) if Arc::ptr_eq(existing, &shared_pool) => {}
+            None => candidate = Some((shared_pool, bound)),
+            Some((existing, _)) if Arc::ptr_eq(existing, &shared_pool) => {}
             Some(_) => return None,
         }
     }
-    drop(guard);
-
     candidate
 }
 
@@ -20507,8 +20921,8 @@ fn compatible_cached_memory_pool(authority: &DbPoolAuthority) -> Option<Arc<Pool
 /// SQLite file.
 pub fn get_or_reuse_compatible_memory_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
     let authority = DbPoolAuthority::resolve(config)?;
-    if let Some(shared_pool) = compatible_cached_memory_pool(&authority) {
-        return DbPool::from_shared_pool_with_authority(config, shared_pool, false, authority);
+    if let Some((shared_pool, bound)) = compatible_cached_memory_pool(&authority) {
+        return DbPool::from_shared_pool_with_authority(config, shared_pool, false, bound);
     }
     get_or_create_pool_with_authority(config, authority)
 }
@@ -20990,7 +21404,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     type HealthProbe = fn(&Path) -> Result<bool, SqlError>;
 
     /// br-v0ucm: one WAL reset holds the gate at a time, checkouts wait for
@@ -21870,6 +22284,216 @@ mod tests {
             ..Default::default()
         };
         assert!(config.sqlite_path().is_err());
+    }
+
+    fn startup_repair_fixture(reject_recount: bool) -> DbConn {
+        let conn = DbConn::open_memory().expect("open startup repair fixture");
+        let constraint = if reject_recount {
+            "CHECK(total_count = 99)"
+        } else {
+            ""
+        };
+        conn.execute_raw(&format!(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, created_ts INTEGER, ack_required INTEGER); \
+             CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, read_ts INTEGER, ack_ts INTEGER); \
+             CREATE TABLE inbox_stats (agent_id INTEGER PRIMARY KEY, total_count INTEGER {constraint}, \
+                 unread_count INTEGER, ack_pending_count INTEGER, last_message_ts INTEGER); \
+             INSERT INTO messages VALUES (1, 2000000000, 1), (2, 1700000000000, 0), (3, 1800000000000000, 1); \
+             INSERT INTO message_recipients VALUES (1, 1, NULL, NULL), (2, 1, 7, NULL), (3, 1, NULL, 9); \
+             INSERT INTO inbox_stats VALUES (1, 99, 98, 97, 96);"
+        ))
+        .expect("seed mixed-scale messages and previous counters");
+        for (name, event) in [
+            ("trg_inbox_stats_insert", "INSERT"),
+            ("trg_inbox_stats_mark_read", "UPDATE OF read_ts"),
+            ("trg_inbox_stats_ack", "UPDATE OF ack_ts"),
+        ] {
+            conn.execute_raw(&format!(
+                "CREATE TRIGGER {name} AFTER {event} ON message_recipients BEGIN SELECT 1; END"
+            ))
+            .expect("seed legacy trigger rollback witness");
+        }
+        conn
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct StartupRepairSnapshotRow {
+        columns: Vec<String>,
+        values: Vec<sqlmodel_core::Value>,
+    }
+
+    fn startup_repair_snapshot(conn: &DbConn) -> Vec<Vec<StartupRepairSnapshotRow>> {
+        [
+            "SELECT id, created_ts, ack_required FROM messages ORDER BY id",
+            "SELECT agent_id, total_count, unread_count, ack_pending_count, last_message_ts FROM inbox_stats ORDER BY agent_id",
+            "SELECT name, sql FROM sqlite_master WHERE type='trigger' ORDER BY name",
+        ]
+        .iter()
+        .map(|sql| {
+            conn.query_sync(sql, &[])
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    // HashMap Debug iteration order is not persisted state.
+                    // Keep ordered metadata and typed cells, checking both
+                    // lookup interfaces before discarding that internal map.
+                    let info = row.column_info();
+                    let columns = info.names().to_vec();
+                    let values: Vec<_> = row.values().cloned().collect();
+                    assert_eq!(columns.len(), values.len());
+                    assert_eq!(row.len(), values.len());
+                    for (index, (name, value)) in columns.iter().zip(&values).enumerate() {
+                        assert_eq!(info.name_at(index), Some(name.as_str()));
+                        assert_eq!(info.index_of(name), Some(index));
+                        assert_eq!(row.get(index), Some(value));
+                        assert_eq!(row.get_by_name(name), Some(value));
+                    }
+                    StartupRepairSnapshotRow { columns, values }
+                })
+                .collect()
+        })
+        .collect()
+    }
+
+    #[test]
+    fn startup_repair_snapshot_is_stable_and_detects_state_changes() {
+        let conn = startup_repair_fixture(false);
+        let original = startup_repair_snapshot(&conn);
+        for _ in 0..8 {
+            assert_eq!(startup_repair_snapshot(&conn), original);
+        }
+        for (description, mutation) in [
+            (
+                "message timestamp",
+                "UPDATE messages SET created_ts=created_ts+1 WHERE id=1",
+            ),
+            (
+                "message acknowledgement",
+                "UPDATE messages SET ack_required=0 WHERE id=1",
+            ),
+            ("message identity", "UPDATE messages SET id=4 WHERE id=1"),
+            (
+                "message cardinality",
+                "INSERT INTO messages VALUES (4, 2000000000, 1)",
+            ),
+            (
+                "inbox identity",
+                "UPDATE inbox_stats SET agent_id=2 WHERE agent_id=1",
+            ),
+            (
+                "total counter",
+                "UPDATE inbox_stats SET total_count=100 WHERE agent_id=1",
+            ),
+            (
+                "unread counter",
+                "UPDATE inbox_stats SET unread_count=99 WHERE agent_id=1",
+            ),
+            (
+                "pending acknowledgement counter",
+                "UPDATE inbox_stats SET ack_pending_count=98 WHERE agent_id=1",
+            ),
+            (
+                "last message timestamp",
+                "UPDATE inbox_stats SET last_message_ts=97 WHERE agent_id=1",
+            ),
+            (
+                "trigger definition",
+                "DROP TRIGGER trg_inbox_stats_insert; \
+                 CREATE TRIGGER trg_inbox_stats_insert AFTER INSERT ON message_recipients BEGIN SELECT 2; END",
+            ),
+            (
+                "trigger identity",
+                "DROP TRIGGER trg_inbox_stats_insert; \
+                 CREATE TRIGGER renamed_inbox_stats_insert AFTER INSERT ON message_recipients BEGIN SELECT 1; END",
+            ),
+        ] {
+            conn.execute_raw("BEGIN").expect("begin snapshot witness");
+            conn.execute_raw(mutation).expect(description);
+            assert_ne!(
+                startup_repair_snapshot(&conn),
+                original,
+                "snapshot must detect changed {description}"
+            );
+            conn.execute_raw("ROLLBACK")
+                .expect("restore snapshot witness");
+            assert_eq!(
+                startup_repair_snapshot(&conn),
+                original,
+                "rollback must restore the exact snapshot after {description}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_repairs_recount_normalized_timestamps_on_the_first_pass() {
+        let conn = startup_repair_fixture(false);
+        startup_data_repairs(&conn).expect("repair legacy timestamps and counters");
+        let rows = conn
+            .query_sync(
+                "SELECT total_count, unread_count, ack_pending_count, last_message_ts FROM inbox_stats WHERE agent_id=1",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.get_named::<i64>("total_count").unwrap(), 3);
+        assert_eq!(row.get_named::<i64>("unread_count").unwrap(), 2);
+        assert_eq!(row.get_named::<i64>("ack_pending_count").unwrap(), 1);
+        assert_eq!(
+            row.get_named::<i64>("last_message_ts").unwrap(),
+            2_000_000_000_000_000,
+            "MAX must use normalized timestamps, including a seconds-based newest message"
+        );
+        assert!(
+            conn.query_sync("SELECT name FROM sqlite_master WHERE type='trigger'", &[])
+                .unwrap()
+                .is_empty()
+        );
+        let repaired = startup_repair_snapshot(&conn);
+        startup_data_repairs(&conn).expect("repeat an already completed repair");
+        assert_eq!(startup_repair_snapshot(&conn), repaired);
+        conn.execute_raw("BEGIN; ROLLBACK")
+            .expect("repair must release its own transaction");
+    }
+
+    #[test]
+    fn startup_repair_failure_preserves_timestamps_counters_triggers_and_parent_writes() {
+        for outer_transaction in [false, true] {
+            let conn = startup_repair_fixture(true);
+            let original = startup_repair_snapshot(&conn);
+            if outer_transaction {
+                conn.execute_raw("BEGIN; INSERT INTO messages VALUES (4, 123, 0)")
+                    .expect("seed a caller-owned transaction");
+            }
+            let before_repair = startup_repair_snapshot(&conn);
+            let error = startup_data_repairs(&conn).expect_err("reject the rebuilt counter");
+            assert!(error.to_string().contains("CHECK"), "{error}");
+            assert_eq!(
+                startup_repair_snapshot(&conn),
+                before_repair,
+                "failed repair must restore its exact prior data and trigger definitions"
+            );
+            if outer_transaction {
+                conn.execute_raw("ROLLBACK")
+                    .expect("repair must leave the caller's transaction open");
+                assert_eq!(startup_repair_snapshot(&conn), original);
+            } else {
+                conn.execute_raw("BEGIN; ROLLBACK")
+                    .expect("failed repair must release its own savepoint");
+            }
+        }
+    }
+
+    #[test]
+    fn successful_startup_repair_does_not_commit_the_callers_transaction() {
+        let conn = startup_repair_fixture(false);
+        let original = startup_repair_snapshot(&conn);
+        conn.execute_raw("BEGIN").unwrap();
+        startup_data_repairs(&conn).expect("repair inside the caller's transaction");
+        assert_ne!(startup_repair_snapshot(&conn), original);
+        conn.execute_raw("ROLLBACK")
+            .expect("caller must retain rollback authority");
+        assert_eq!(startup_repair_snapshot(&conn), original);
     }
 
     #[test]
@@ -24050,6 +24674,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn checkout_readiness_requires_success_and_is_shared_until_retirement() {
+        let scratch = tempfile::tempdir().unwrap();
+        let config = DbPoolConfig {
+            database_url: "sqlite:///:memory:".into(),
+            storage_root: Some(scratch.path().to_path_buf()),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let mut pool = get_or_create_pool(&config).unwrap();
+        let cached = get_cached_pool(&config).expect("published lazy pool");
+        assert!(!pool.is_initialized());
+        assert!(!cached.is_initialized());
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let cx = Cx::for_testing();
+
+        // Fail after the real engine has opened and initialized its schema.
+        // The owner-adoption opened_connection bit must not make this pool
+        // eligible for request admission after failed connection setup.
+        pool.init_sql = Arc::new("THIS IS NOT VALID SQL".into());
+        assert!(matches!(
+            runtime.block_on(pool.acquire(&cx)),
+            Outcome::Err(_)
+        ));
+        assert!(
+            pool.message_id_state
+                .opened_connection
+                .load(Ordering::Acquire)
+        );
+        assert!(!pool.is_initialized());
+        assert!(!cached.is_initialized());
+        assert_eq!(pool.pool.stats().active_connections, 0);
+
+        // A separately rehydrated wrapper has the valid connection setup and
+        // may retry the same engine. Readiness is then visible to both.
+        let conn = runtime
+            .block_on(cached.acquire(&cx))
+            .into_result()
+            .expect("retry lazy pool after failed first checkout");
+        conn.query_sync("SELECT 1 FROM projects LIMIT 0", &[])
+            .expect("real schema initialized");
+        drop(conn);
+        assert!(pool.is_initialized());
+        assert!(cached.is_initialized());
+
+        pool.pool.close();
+        assert!(!pool.is_initialized());
+        assert!(!cached.is_initialized());
+        assert!(get_cached_pool(&config).is_none());
+    }
+
+    #[test]
+    fn cancelled_first_checkout_leaves_lazy_pool_retriable_and_unready() {
+        let scratch = tempfile::tempdir().unwrap();
+        let config = DbPoolConfig {
+            database_url: "sqlite:///:memory:".into(),
+            storage_root: Some(scratch.path().to_path_buf()),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = get_or_create_pool(&config).unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        assert!(matches!(
+            runtime.block_on(pool.acquire(&cancelled)),
+            Outcome::Cancelled(_)
+        ));
+        assert!(!pool.is_initialized());
+        assert!(
+            !pool
+                .message_id_state
+                .opened_connection
+                .load(Ordering::Acquire)
+        );
+        assert_eq!(pool.pool.stats().active_connections, 0);
+        assert_eq!(pool.pool.stats().pending_requests, 0);
+
+        let cached = get_cached_pool(&config).expect("cancelled lazy wrapper can be retried");
+        assert!(!cached.is_initialized());
+        let live = Cx::for_testing();
+        drop(
+            runtime
+                .block_on(cached.acquire(&live))
+                .into_result()
+                .expect("fresh caller initializes the same engine"),
+        );
+        assert!(pool.is_initialized());
+        assert!(cached.is_initialized());
+    }
+
     // ── DbPoolConfig coverage ─────────────────────────────────────────
 
     #[test]
@@ -24105,81 +24828,8 @@ mod tests {
         );
     }
 
-    /// GH#245 / F1: waiters on one-time DB init are BOUNDED; only the
-    /// initializer runs unboundedly, and failure/unwind resets the gate so
-    /// initialization is retryable.
     #[test]
-    fn sqlite_init_gate_bounds_waiters_and_resets_on_failure() {
-        let gate = SqliteInitGate::new();
-        assert!(matches!(
-            gate.claim_or_wait(Duration::from_millis(10)),
-            SqliteInitGateClaim::Initialize
-        ));
-
-        // While Running, another caller times out instead of parking forever.
-        let start = Instant::now();
-        assert!(matches!(
-            gate.claim_or_wait(Duration::from_millis(50)),
-            SqliteInitGateClaim::TimedOut
-        ));
-        assert!(start.elapsed() >= Duration::from_millis(45));
-
-        // Failure resets to NotStarted: the next caller retries init.
-        gate.complete(false);
-        assert!(matches!(
-            gate.claim_or_wait(Duration::from_millis(10)),
-            SqliteInitGateClaim::Initialize
-        ));
-
-        // Success publishes Done: everyone proceeds instantly.
-        gate.complete(true);
-        assert!(matches!(
-            gate.claim_or_wait(Duration::ZERO),
-            SqliteInitGateClaim::Ready
-        ));
-    }
-
-    #[test]
-    fn sqlite_init_gate_completion_guard_resets_on_unwind_path() {
-        let gate = SqliteInitGate::new();
-        assert!(matches!(
-            gate.claim_or_wait(Duration::ZERO),
-            SqliteInitGateClaim::Initialize
-        ));
-        // Dropping the guard without marking success (what an unwinding
-        // initializer does) must reset the gate to retryable.
-        drop(SqliteInitGateCompletion {
-            gate: &gate,
-            success: false,
-        });
-        assert!(matches!(
-            gate.claim_or_wait(Duration::ZERO),
-            SqliteInitGateClaim::Initialize
-        ));
-    }
-
-    #[test]
-    fn sqlite_init_gate_wakes_waiters_when_initializer_completes() {
-        let gate = Arc::new(SqliteInitGate::new());
-        assert!(matches!(
-            gate.claim_or_wait(Duration::ZERO),
-            SqliteInitGateClaim::Initialize
-        ));
-        let signaller = Arc::clone(&gate);
-        let handle = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(30));
-            signaller.complete(true);
-        });
-        let start = Instant::now();
-        assert!(matches!(
-            gate.claim_or_wait(Duration::from_secs(5)),
-            SqliteInitGateClaim::Ready
-        ));
-        assert!(
-            start.elapsed() < Duration::from_secs(4),
-            "waiter must wake on completion, not run out its full budget"
-        );
-        handle.join().expect("signaller thread");
+    fn pool_recycle_and_capacity_defaults() {
         assert_eq!(
             DEFAULT_POOL_RECYCLE_MS,
             30 * 60 * 1000,
@@ -24190,6 +24840,92 @@ mod tests {
         assert_eq!(cfg.min_connections, 25);
         assert_eq!(cfg.max_connections, 100); // 25 + 75
         assert_eq!(cfg.max_lifetime_ms, 1_800_000); // 30 min in ms
+    }
+
+    #[test]
+    fn cancelled_lazy_initializer_wait_returns_its_pool_slot_before_owner_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("cancelled-init.sqlite3");
+        let storage = temp.path().join("archive");
+        std::fs::create_dir_all(&storage).unwrap();
+        let config = DbPoolConfig {
+            database_url: sqlite_url_from_path(&database),
+            storage_root: Some(storage),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).unwrap();
+        let gate = sqlite_init_gate(pool.sqlite_identity.as_deref(), &pool.storage_root);
+        assert!(matches!(
+            gate.claim_or_wait(Duration::ZERO),
+            SqliteInitGateClaim::Initialize
+        ));
+        let owner = SqliteInitGateCompletion {
+            gate: &gate,
+            success: false,
+        };
+        let cx = Cx::for_testing();
+        let waiter_cx = cx.clone();
+        let waiter_pool = pool.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(waiter_pool.acquire(&waiter_cx)).map(drop);
+            done_tx.send(result).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while gate.waiter_count() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let parked = gate.waiter_count() != 0;
+        let reserved = pool.pool.stats();
+        cx.set_cancel_requested(true);
+        let completed = done_rx.recv_timeout(Duration::from_secs(2));
+        let released = pool.pool.stats();
+        let owner_retained = matches!(
+            gate.claim_or_wait(Duration::ZERO),
+            SqliteInitGateClaim::TimedOut
+        );
+        let database_unopened = !database.exists();
+        // Even an uncancellable implementation is released and reaped before
+        // a timeout assertion, so this regression never leaves a parked worker.
+        drop(owner);
+        waiter.join().expect("initialization waiter");
+        assert!(parked, "checkout did not reach the actual initializer gate");
+        assert_eq!(reserved.total_connections, 1);
+        assert_eq!(reserved.active_connections, 1);
+        assert!(matches!(
+            completed.expect("cancelled waiter retained its pool slot"),
+            Outcome::Cancelled(_)
+        ));
+        assert_eq!(released.total_connections, 0);
+        assert_eq!(released.active_connections, 0);
+        assert_eq!(released.pending_requests, 0);
+        assert!(
+            owner_retained,
+            "the waiter released the foreign initializer"
+        );
+        assert!(
+            database_unopened,
+            "the cancelled waiter opened the database"
+        );
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let conn = pool
+                .acquire(&Cx::for_testing())
+                .await
+                .into_result()
+                .expect("a fresh caller can initialize and use the returned slot");
+            let rows = conn.query_sync("SELECT 1 AS value", &[]).unwrap();
+            assert_eq!(rows[0].get_named::<i64>("value").unwrap(), 1);
+        });
     }
 
     /// GH#245 regression guard: the default pool acquire timeout must stay
@@ -25461,10 +26197,36 @@ mod tests {
     fn pool_warmup_opens_connections() {
         use asupersync::runtime::RuntimeBuilder;
 
+        const CHILD_ENV: &str = "AM_TEST_POOL_WARMUP_ISOLATED_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let unrelated_dir = tempfile::tempdir().unwrap();
+            let unrelated_archive = unrelated_dir.path().join("unrelated-archive-file");
+            let sentinel = b"unrelated operator archive authority\n";
+            std::fs::write(&unrelated_archive, sentinel).unwrap();
+            // Configure only the child: process-wide overrides would also be
+            // visible to unrelated tests running concurrently in this binary.
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "pool_impl::tests::pool_warmup_opens_connections",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env("STORAGE_ROOT", &unrelated_archive)
+                .output()
+                .expect("run warmup with an unrelated inherited archive");
+            assert!(child.status.success(), "isolated warmup failed: {child:?}");
+            assert_eq!(std::fs::read(&unrelated_archive).unwrap(), sentinel);
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("warmup_test.db");
         let config = DbPoolConfig {
             database_url: format!("sqlite:///{}", db_path.display()),
+            // A fresh database fixture must own its archive too. Custom
+            // inherited roots are intentionally not ephemeral-rerouted.
+            storage_root: Some(dir.path().join("archive")),
             min_connections: 10,
             max_connections: 20,
             warmup_connections: 5,
@@ -27464,48 +28226,77 @@ mod tests {
             .expect("rejection before receipt admission must not degrade readiness");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn recovery_admission_and_promotion_reject_hard_linked_primary_aliases() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt as _;
 
-        let dir = tempfile::tempdir().unwrap();
-        let primary_a = dir.path().join("storage-a.sqlite3");
-        let primary_b = dir.path().join("storage-b.sqlite3");
-        let candidate = dir.path().join("storage-a.sqlite3.candidate");
+        let dir = tempfile::Builder::new()
+            .prefix("recovery-primary-alias-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        eprintln!("retained recovery alias fixture: {}", dir.display());
+        let primary_a = dir.join("storage-a.sqlite3");
+        let primary_b = dir.join("storage-b.sqlite3");
+        let candidate = dir.join("storage-a.sqlite3.candidate");
         write_marker_db(&primary_a, "shared-live-generation");
         write_marker_db(&candidate, "fresh-candidate-generation");
+        let primary_before = std::fs::read(&primary_a).unwrap();
+        let candidate_before = std::fs::read(&candidate).unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o400))
             .expect("plant read-only candidate mode");
+        #[cfg(windows)]
+        {
+            let mut permissions = std::fs::metadata(&candidate).unwrap().permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&candidate, permissions)
+                .expect("plant read-only candidate attribute");
+        }
         std::fs::hard_link(&primary_a, &primary_b).expect("hard-link primary_b to primary_a");
+        let primary_identity_before = primary_identity(&primary_a);
+        let candidate_identity_before = primary_identity(&candidate);
+        assert_eq!(primary_identity(&primary_b), primary_identity_before);
 
         recovery_admission().reset();
-        let op_called = std::cell::Cell::new(false);
-        let admission_err = with_recovery_admission(&primary_a, "test recovery", || {
-            op_called.set(true);
-            Ok(())
-        })
-        .expect_err("admission must reject a multiply-linked primary database");
-        assert!(
-            admission_err.to_string().contains("has 2 hard links"),
-            "unexpected admission error: {admission_err}"
-        );
-        assert!(
-            !op_called.get(),
-            "operation body must not run for an aliased primary"
-        );
-        assert!(
-            std::fs::symlink_metadata(crate::recovery_breaker::breaker_sidecar_path(&primary_a))
-                .is_err(),
-            "rejecting an aliased primary must not create breaker authority"
-        );
+        for primary in [&primary_a, &primary_b] {
+            let op_called = std::cell::Cell::new(false);
+            let admission_err = with_recovery_admission(primary, "test recovery", || {
+                op_called.set(true);
+                Ok(())
+            })
+            .expect_err("admission must reject a multiply-linked primary database");
+            assert!(
+                admission_err.to_string().contains("has 2 hard links"),
+                "unexpected admission error: {admission_err}"
+            );
+            assert!(
+                !op_called.get(),
+                "operation body must not run for either aliased primary"
+            );
+            let absent =
+                std::fs::symlink_metadata(crate::recovery_breaker::breaker_sidecar_path(primary))
+                    .expect_err("rejecting an aliased primary must not create breaker authority");
+            assert_eq!(absent.kind(), std::io::ErrorKind::NotFound);
+        }
 
-        let promo_err = promote_recovery_candidate(&primary_a, &candidate, dir.path())
-            .expect_err("promotion must reject a multiply-linked primary database");
-        assert!(
-            promo_err.to_string().contains("has 2 hard links"),
-            "unexpected promotion error: {promo_err}"
-        );
+        for primary in [&primary_a, &primary_b] {
+            let promo_err = promote_recovery_candidate(primary, &candidate, &dir)
+                .expect_err("promotion must reject a multiply-linked primary database");
+            assert!(
+                promo_err.to_string().contains("has 2 hard links"),
+                "unexpected promotion error: {promo_err}"
+            );
+            assert_eq!(primary_identity(primary), primary_identity_before);
+            crate::forensics::verify_recovery_receipt_state(&dir, primary)
+                .expect("aliased primary rejection must not create a recovery receipt");
+        }
+        assert_eq!(primary_identity(&candidate), candidate_identity_before);
+        assert_eq!(std::fs::read(&primary_a).unwrap(), primary_before);
+        assert_eq!(std::fs::read(&primary_b).unwrap(), primary_before);
+        assert_eq!(std::fs::read(&candidate).unwrap(), candidate_before);
         assert_eq!(
             sqlite_marker_value(&primary_a).as_deref(),
             Some("shared-live-generation")
@@ -27518,6 +28309,7 @@ mod tests {
             sqlite_marker_value(&candidate).as_deref(),
             Some("fresh-candidate-generation")
         );
+        #[cfg(unix)]
         assert_eq!(
             std::fs::symlink_metadata(&candidate)
                 .expect("candidate metadata")
@@ -27527,8 +28319,14 @@ mod tests {
             0o400,
             "rejection must happen before candidate permission normalization"
         );
-        crate::forensics::verify_recovery_receipt_state(dir.path(), &primary_a)
-            .expect("aliased primary rejection must not create a recovery receipt");
+        #[cfg(windows)]
+        assert!(
+            std::fs::symlink_metadata(&candidate)
+                .expect("candidate metadata")
+                .permissions()
+                .readonly(),
+            "rejection must happen before candidate attribute normalization"
+        );
     }
 
     #[cfg(unix)]
@@ -29678,6 +30476,91 @@ mod tests {
         assert!(!pool2.pool.is_closed(), "replacement pool should be live");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cached_pool_preserves_materialized_directory_authority_and_rejects_replacement() {
+        for memory in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = dir.path().join("archive/later");
+            let database = dir.path().join("cached-authority.sqlite3");
+            let config = DbPoolConfig {
+                database_url: if memory {
+                    "sqlite:///:memory:".to_string()
+                } else {
+                    mcp_agent_mail_core::disk::sqlite_url_from_path(&database)
+                },
+                storage_root: Some(storage.clone()),
+                min_connections: 0,
+                max_connections: 1,
+                warmup_connections: 0,
+                ..Default::default()
+            };
+            let pool = get_or_create_pool(&config).expect("lazy original pool");
+            assert!(!storage.exists(), "cache construction must stay lazy");
+            assert!(!pool.is_initialized());
+            let cold = get_cached_pool(&config).expect("cached lazy pool");
+            assert!(Arc::ptr_eq(&pool.pool, &cold.pool));
+            assert!(!cold.is_initialized(), "lookup cannot invent a checkout");
+
+            std::fs::create_dir_all(&storage).unwrap();
+            let materialized = get_cached_pool(&config)
+                .expect("creating the frozen suffix must not lose the pool");
+            assert!(Arc::ptr_eq(&pool.pool, &materialized.pool));
+            assert_eq!(
+                pool.engine_identity_key(),
+                materialized.engine_identity_key()
+            );
+            assert!(!materialized.is_initialized());
+            if memory {
+                let resized = DbPoolConfig {
+                    max_connections: 2,
+                    ..config.clone()
+                };
+                let compatible = get_or_reuse_compatible_memory_pool(&resized).unwrap();
+                assert!(Arc::ptr_eq(&pool.pool, &compatible.pool));
+            }
+
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            runtime.block_on(async {
+                let conn = pool
+                    .acquire(&cx)
+                    .await
+                    .into_result()
+                    .expect("real checkout");
+                conn.query_sync("SELECT id FROM messages LIMIT 1", &[])
+                    .unwrap();
+            });
+            let ready = get_cached_pool(&config).expect("initialized pool stays discoverable");
+            assert!(ready.is_initialized());
+            assert_eq!(pool.engine_identity_key(), ready.engine_identity_key());
+
+            let retained = dir.path().join("retained-archive");
+            std::fs::rename(&storage, &retained).unwrap();
+            std::fs::create_dir(&storage).unwrap();
+            let sentinel = storage.join("operator-evidence");
+            std::fs::write(&sentinel, b"replacement archive").unwrap();
+            assert!(
+                get_cached_pool(&config).is_none(),
+                "replacement cannot inherit readiness"
+            );
+            if memory {
+                assert!(
+                    compatible_cached_memory_pool(&DbPoolAuthority::resolve(&config).unwrap())
+                        .is_none()
+                );
+            }
+            runtime.block_on(async {
+                assert!(pool.acquire(&cx).await.into_result().is_err());
+                assert!(materialized.acquire(&cx).await.into_result().is_err());
+            });
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"replacement archive");
+            assert!(retained.is_dir(), "the original archive remains intact");
+        }
+    }
+
     /// GH#333 / br-8r6dl: request-path reads must share one strict query-only
     /// pool per mailbox. A per-call pool opened and closed an engine connection
     /// on every read, and wherever the engine cannot reuse the retained
@@ -30209,7 +31092,7 @@ mod tests {
                     storage_root: Some(configured_storage_root.clone()),
                     ..Default::default()
                 };
-                let pool = DbPool::new(&config).unwrap();
+                let pool = get_or_create_pool(&config).unwrap();
                 let competing = DbPool::new(&config).expect("competing unopened pool");
                 let old_allocator = pool.message_id_allocator();
                 assert!(Arc::ptr_eq(
@@ -30247,6 +31130,11 @@ mod tests {
                         !pool.is_closed(),
                         "the actual initializer survives its promotion"
                     );
+                    assert!(pool.is_initialized());
+                    let cached = get_cached_pool(&config)
+                        .expect("successful initializer keeps its cache publication");
+                    assert!(cached.is_initialized());
+                    assert_eq!(cached.engine_identity_key(), pool.engine_identity_key());
                     assert!(
                         competing.is_closed(),
                         "an unopened competitor gets no exemption"
@@ -30312,7 +31200,7 @@ mod tests {
                 let conn = old.acquire(&cx).await.into_result().unwrap();
                 conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL); INSERT INTO marker VALUES('old-live');").unwrap();
             });
-            let unopened = DbPool::new(&config).unwrap();
+            let unopened = get_or_create_pool(&config).unwrap();
             let competing = DbPool::new(&config).unwrap();
             let selected = if case == "opened_owner" {
                 &old
@@ -30403,6 +31291,11 @@ mod tests {
                     !unopened.is_closed(),
                     "failed promotion grants no exemption to clean up"
                 );
+                assert!(!unopened.is_initialized());
+                assert_eq!(
+                    get_cached_pool(&config).unwrap().engine_identity_key(),
+                    unopened.engine_identity_key()
+                );
                 continue;
             }
             result.expect("real candidate promotion");
@@ -30413,16 +31306,25 @@ mod tests {
             crate::forensics::verify_recovery_receipt_state(&storage, &primary).unwrap();
             assert!(old.is_closed(), "older live owners always retire");
             assert!(competing.is_closed(), "other unopened owners also retire");
+            assert!(!old.is_initialized());
+            assert!(!competing.is_initialized());
             assert!(previous.is_retired());
             if case == "opened_owner" {
                 assert!(!owner.adopted.load(Ordering::Acquire));
                 assert!(unopened.is_closed());
+                assert!(get_cached_pool(&config).is_none());
                 continue;
             }
             assert!(owner.adopted.load(Ordering::Acquire));
             assert!(!unopened.is_closed());
             assert!(!Arc::ptr_eq(&previous, &unopened.message_id_allocator()));
             assert!(!unopened.message_id_allocator().is_retired());
+            let cached = get_cached_pool(&config).expect("adopted owner's former weak entry");
+            assert_eq!(cached.engine_identity_key(), unopened.engine_identity_key());
+            assert!(
+                !cached.is_initialized(),
+                "promotion alone is not a checkout"
+            );
             if case == "dropped_future" {
                 // Poll a real owning future to its suspension point, then
                 // cancel it by dropping it. Neither completion guard may leak.
@@ -30442,6 +31344,8 @@ mod tests {
                     unopened.is_closed(),
                     "cancelled initialization retires its adopted pool"
                 );
+                assert!(!cached.is_initialized());
+                assert!(get_cached_pool(&config).is_none());
                 assert!(matches!(
                     gate.claim_or_wait(Duration::ZERO),
                     SqliteInitGateClaim::Initialize
@@ -31303,8 +32207,12 @@ mod tests {
     fn health_probe_file_stamp_tracks_identity_and_rejects_nonfiles() {
         let dir = tempfile::tempdir().expect("stamp fixture");
         let path = dir.path().join("main.db");
-        assert!(health_probe_file_stamp(&path).is_none());
-        assert!(health_probe_file_stamp(dir.path()).is_none());
+        assert!(
+            health_probe_file_stamp(&path)
+                .expect("missing path")
+                .is_none()
+        );
+        assert!(health_probe_file_stamp(dir.path()).is_err());
 
         let replacement = dir.path().join("replacement.db");
         let modified = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
@@ -31317,19 +32225,26 @@ mod tests {
             file.set_times(std::fs::FileTimes::new().set_modified(modified))
                 .expect("set identical modification times");
         }
-        let before = health_probe_file_stamp(&path).expect("regular file identity");
-        assert_eq!(health_probe_file_stamp(&path), Some(before));
+        let before = health_probe_file_stamp(&path)
+            .expect("regular file metadata")
+            .expect("regular file identity");
+        assert_eq!(health_probe_file_stamp(&path).unwrap(), Some(before));
         std::fs::rename(&path, dir.path().join("preserved.db")).expect("preserve original");
         std::fs::rename(&replacement, &path).expect("install replacement");
-        let after = health_probe_file_stamp(&path).expect("replacement identity");
-        assert_eq!((before.2, before.3), (after.2, after.3));
-        assert_ne!((before.0, before.1), (after.0, after.1));
+        let after = health_probe_file_stamp(&path)
+            .expect("replacement metadata")
+            .expect("replacement identity");
+        assert_eq!(
+            (before.len, before.modified_ns),
+            (after.len, after.modified_ns)
+        );
+        assert_ne!(before.identity, after.identity);
 
         #[cfg(unix)]
         {
             let link = dir.path().join("link.db");
             std::os::unix::fs::symlink(&path, &link).expect("create symlink");
-            assert!(health_probe_file_stamp(&link).is_none());
+            assert!(health_probe_file_stamp(&link).is_err());
         }
     }
 
@@ -31355,6 +32270,211 @@ mod tests {
         assert_eq!(health_probe_stagings_for_test(&path), before + 2);
         assert!(sqlite_file_is_healthy_without_family_cleanup(&path).expect("no-cleanup reuse"));
         assert_eq!(health_probe_stagings_for_test(&path), before + 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healthy_staged_verdict_rejects_new_unsafe_sidecars() {
+        let probes: [HealthProbe; 2] = [
+            sqlite_file_is_healthy,
+            sqlite_file_is_healthy_without_family_cleanup,
+        ];
+        for probe in probes {
+            for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+                .into_iter()
+                .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES)
+            {
+                for directory in [false, true] {
+                    let dir = tempfile::tempdir().expect("unsafe sidecar fixture");
+                    let path = dir.path().join("cached.sqlite3");
+                    seed_settled_diagnostic_database(&path);
+                    assert!(probe(&path).expect("cache healthy source"));
+                    let staged = health_probe_stagings_for_test(&path);
+                    assert!(probe(&path).expect("reuse healthy source"));
+                    assert_eq!(health_probe_stagings_for_test(&path), staged);
+                    let sidecar = sqlite_sidecar_path(&path, suffix);
+                    if directory {
+                        std::fs::create_dir(&sidecar).expect("install directory sidecar");
+                    } else {
+                        std::os::unix::fs::symlink(dir.path().join("absent"), &sidecar)
+                            .expect("install dangling sidecar symlink");
+                    }
+                    let before = exact_diagnostic_parent_snapshot(dir.path());
+                    assert!(
+                        !matches!(probe(&path), Ok(true)),
+                        "cached health must refuse unsafe {suffix}, directory={directory}"
+                    );
+                    assert_eq!(exact_diagnostic_parent_snapshot(dir.path()), before);
+                    if !directory {
+                        assert_eq!(
+                            std::fs::read_link(&sidecar).unwrap(),
+                            dir.path().join("absent")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healthy_staged_verdict_rejects_a_new_primary_hard_link() {
+        let probes: [HealthProbe; 2] = [
+            sqlite_file_is_healthy,
+            sqlite_file_is_healthy_without_family_cleanup,
+        ];
+        for probe in probes {
+            let dir = tempfile::tempdir().expect("hard link fixture");
+            let path = dir.path().join("cached.sqlite3");
+            seed_settled_diagnostic_database(&path);
+            assert!(probe(&path).expect("cache healthy source"));
+            std::fs::hard_link(&path, dir.path().join("second-authority.sqlite3"))
+                .expect("introduce a second primary pathname");
+            let before = exact_diagnostic_parent_snapshot(dir.path());
+            assert!(
+                !matches!(probe(&path), Ok(true)),
+                "cached health cannot bypass the staging hard-link refusal"
+            );
+            assert_eq!(exact_diagnostic_parent_snapshot(dir.path()), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healthy_staged_verdict_never_bypasses_parent_path_admission() {
+        let probes: [HealthProbe; 2] = [
+            sqlite_file_is_healthy,
+            sqlite_file_is_healthy_without_family_cleanup,
+        ];
+        for probe in probes {
+            let directory = tempfile::tempdir().expect("parent alias fixture");
+            let authority = directory.path().join("authority");
+            std::fs::create_dir(&authority).expect("create real parent");
+            let primary = authority.join("mailbox.sqlite3");
+            seed_settled_diagnostic_database(&primary);
+            assert!(probe(&primary).expect("cache canonical healthy family"));
+            let staged = health_probe_stagings_for_test(&primary);
+            let alias = directory.path().join("alias");
+            std::os::unix::fs::symlink(&authority, &alias).expect("create parent alias");
+            let before = std::fs::read(&primary).expect("retain source bytes");
+            let error = probe(&alias.join("mailbox.sqlite3"))
+                .expect_err("cached health must not bypass parent path admission");
+            assert!(error.to_string().contains("symlinked path"), "{error}");
+            assert_eq!(std::fs::read(&primary).unwrap(), before);
+            assert_eq!(std::fs::read_link(&alias).unwrap(), authority);
+            assert!(probe(&primary).expect("canonical family remains healthy"));
+            assert_eq!(health_probe_stagings_for_test(&primary), staged);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healthy_staged_verdict_rejects_a_rewrite_with_restored_mtime() {
+        use std::io::Write as _;
+        let probes: [HealthProbe; 2] = [
+            sqlite_file_is_healthy,
+            sqlite_file_is_healthy_without_family_cleanup,
+        ];
+        for probe in probes {
+            let dir = tempfile::tempdir().expect("rewrite fixture");
+            let path = dir.path().join("cached.sqlite3");
+            seed_settled_diagnostic_database(&path);
+            assert!(probe(&path).expect("cache healthy source"));
+            let metadata = std::fs::metadata(&path).expect("original metadata");
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open source for deliberate corruption");
+            file.write_all(b"not a SQLite DB!").expect("corrupt header");
+            file.sync_all().expect("settle deliberate corruption");
+            file.set_times(std::fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+                .expect("restore original mtime");
+            drop(file);
+            let after = std::fs::metadata(&path).expect("rewritten metadata");
+            assert_eq!(after.len(), metadata.len());
+            assert_eq!(after.modified().unwrap(), metadata.modified().unwrap());
+            let before = exact_diagnostic_parent_snapshot(dir.path());
+            assert!(
+                !matches!(probe(&path), Ok(true)),
+                "same-length corruption must not inherit the cached healthy verdict"
+            );
+            assert_eq!(exact_diagnostic_parent_snapshot(dir.path()), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn health_verdict_fingerprint_tracks_sidecar_generation_identity() {
+        for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES
+            .into_iter()
+            .chain(FSQLITE_CANDIDATE_NAMESPACE_SUFFIXES)
+        {
+            let dir = tempfile::tempdir().expect("sidecar generation fixture");
+            let path = dir.path().join("source.sqlite3");
+            seed_settled_diagnostic_database(&path);
+            let sidecar = sqlite_sidecar_path(&path, suffix);
+            let replacement = dir.path().join("replacement");
+            let modified = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+            for (file_path, bytes) in [(&sidecar, b"old!"), (&replacement, b"new!")] {
+                std::fs::write(file_path, bytes).expect("write sidecar generation");
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(file_path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(modified))
+                    .expect("match sidecar mtimes");
+            }
+            let before = health_verdict_fingerprint(&path).expect("original fingerprint");
+            std::fs::rename(&sidecar, dir.path().join("preserved-sidecar"))
+                .expect("retain original generation");
+            std::fs::rename(&replacement, &sidecar).expect("install replacement generation");
+            assert_ne!(
+                health_verdict_fingerprint(&path).expect("replacement fingerprint"),
+                before,
+                "same-size, same-mtime replacement of {suffix} changes family identity"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn health_probe_replaces_stale_failure_reasons_after_recovery() {
+        let probes: [HealthProbe; 2] = [
+            sqlite_file_is_healthy,
+            sqlite_file_is_healthy_without_family_cleanup,
+        ];
+        for probe in probes {
+            let dir = tempfile::tempdir().expect("probe reason fixture");
+            let path = dir.path().join("source.sqlite3");
+            seed_settled_diagnostic_database(&path);
+            assert!(probe(&path).expect("cache healthy source"));
+            let healthy = std::fs::read(&path).expect("retain healthy source bytes");
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            let damaged = vec![b'x'; 4096];
+            std::fs::write(&path, &damaged).expect("damage private source");
+            assert!(!probe(&path).expect("observe unhealthy source"));
+            assert!(
+                unhealthy_probe_reasons()
+                    .lock()
+                    .unwrap()
+                    .contains_key(&path),
+                "both health variants must retain the failure under the live path"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), damaged);
+            std::fs::write(&path, &healthy).expect("restore private source");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .expect("restore original modification time");
+            assert!(probe(&path).expect("observe restored healthy source"));
+            assert!(
+                take_last_unhealthy_reason(&path).is_none(),
+                "a healthy result must not expose a previous failure reason"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), healthy);
+        }
     }
 
     #[test]
@@ -33968,6 +35088,230 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn recovery_breaker_election_replacement_preserves_armed_state() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        for terminal in ["success", "failure", "storage", "panic"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("storage.sqlite3");
+            std::fs::write(&db, b"recoverable-content").unwrap();
+            let state_path = crate::recovery_breaker::breaker_sidecar_path(&db);
+            let election_path = crate::recovery_breaker::breaker_lock_path(&db);
+            let mut replacement_owner = None;
+            let mut armed_bytes = None;
+            let clock = std::cell::Cell::new(100_i64);
+
+            recovery_admission().reset();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_recovery_admission_using_clock(
+                    &db,
+                    "recovery with replaced election",
+                    || {
+                        let armed = crate::recovery_breaker::load(&db).unwrap().unwrap();
+                        assert!(armed.attempt_in_progress);
+                        assert_eq!(armed.consecutive_failures, 1);
+                        armed_bytes = Some(std::fs::read(&state_path).unwrap());
+                        std::fs::rename(&election_path, dir.path().join("retired.lock")).unwrap();
+                        let replacement = std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .open(&election_path)
+                            .unwrap();
+                        fs2::FileExt::try_lock_exclusive(&replacement)
+                            .expect("replacement inode admits a separate election owner");
+                        replacement_owner = Some(replacement);
+                        match terminal {
+                            "success" => Ok(()),
+                            "failure" => Err(SqlError::Custom("repair failed".to_string())),
+                            "storage" => Err(SqlError::Custom(
+                                "Quota exceeded (os error 122)".to_string(),
+                            )),
+                            "panic" => std::panic::panic_any("interrupted repair"),
+                            _ => unreachable!(),
+                        }
+                    },
+                    || {
+                        let now = clock.get();
+                        clock.set(now + 1);
+                        now
+                    },
+                )
+            }));
+            if terminal == "panic" {
+                assert_eq!(
+                    outcome.unwrap_err().downcast_ref::<&str>(),
+                    Some(&"interrupted repair"),
+                    "retargeting must preserve the original panic"
+                );
+            } else {
+                let error = outcome
+                    .unwrap()
+                    .expect_err("an obsolete election must not publish a terminal outcome");
+                if terminal == "storage" {
+                    assert!(error.to_string().contains("Quota exceeded"));
+                } else {
+                    assert!(
+                        error.to_string().contains("election authority changed"),
+                        "unexpected {terminal} refusal: {error}"
+                    );
+                }
+            }
+            assert_eq!(
+                std::fs::read(&state_path).unwrap(),
+                armed_bytes.expect("operation observed its durable attempt marker"),
+                "{terminal} must leave the unfinished marker under lost election authority"
+            );
+            assert_eq!(std::fs::read(&db).unwrap(), b"recoverable-content");
+            assert!(
+                crate::recovery_breaker::try_acquire_file_lock(&db).is_err(),
+                "terminal handling must not release the replacement owner's lock"
+            );
+
+            drop(replacement_owner);
+            recovery_admission().reset();
+            let _bypass = crate::recovery_breaker::RecoveryBreakerBypassGuard::enter();
+            with_recovery_admission_using_clock(
+                &db,
+                "repair under replacement election",
+                || Ok(()),
+                || 101,
+            )
+            .expect("a newly acquired valid election can persist an operator recovery outcome");
+            let cleared = crate::recovery_breaker::load(&db).unwrap().unwrap();
+            assert!(!cleared.attempt_in_progress);
+            assert_eq!(cleared.consecutive_failures, 0);
+            recovery_admission().reset();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_breaker_operator_bypass_still_requires_current_election() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("storage.sqlite3");
+        std::fs::write(&db, b"recoverable-content").unwrap();
+        let state_path = crate::recovery_breaker::breaker_sidecar_path(&db);
+        std::fs::write(&state_path, b"malformed history requiring operator bypass").unwrap();
+        let election_path = crate::recovery_breaker::breaker_lock_path(&db);
+        let operation_called = std::cell::Cell::new(false);
+        let mut replacement_owner = None;
+        let _bypass = crate::recovery_breaker::RecoveryBreakerBypassGuard::enter();
+
+        recovery_admission().reset();
+        let error = with_recovery_admission_using_clock(
+            &db,
+            "operator recovery with replaced election",
+            || {
+                operation_called.set(true);
+                Ok(())
+            },
+            || {
+                // Bypass obtains its start time after the guarded reload. Its
+                // permission to disregard corrupt JSON must not permit it to
+                // execute under an election inode that has since been replaced.
+                assert!(replacement_owner.is_none());
+                std::fs::rename(&election_path, dir.path().join("retired.lock")).unwrap();
+                let replacement = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&election_path)
+                    .unwrap();
+                fs2::FileExt::try_lock_exclusive(&replacement).unwrap();
+                replacement_owner = Some(replacement);
+                100
+            },
+        )
+        .expect_err("operator bypass cannot bypass lost election authority");
+        assert!(
+            error.to_string().contains("election authority changed"),
+            "unexpected bypass refusal: {error}"
+        );
+        assert!(!operation_called.get());
+        assert_eq!(
+            std::fs::read(&state_path).unwrap(),
+            b"malformed history requiring operator bypass"
+        );
+        assert_eq!(std::fs::read(&db).unwrap(), b"recoverable-content");
+        assert!(crate::recovery_breaker::try_acquire_file_lock(&db).is_err());
+
+        drop(replacement_owner);
+        recovery_admission().reset();
+        with_recovery_admission_using_clock(
+            &db,
+            "operator recovery with current election",
+            || Ok(()),
+            || 101,
+        )
+        .expect("valid election still permits operator recovery from malformed history");
+        assert_eq!(
+            crate::recovery_breaker::load(&db)
+                .unwrap()
+                .unwrap()
+                .consecutive_failures,
+            0
+        );
+        recovery_admission().reset();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_breaker_operator_outcomes_refuse_lost_election() {
+        for operation_fails in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("storage.sqlite3");
+            std::fs::write(&db, b"recoverable-content").unwrap();
+            let state = crate::recovery_breaker::record_attempt(
+                None,
+                &crate::recovery_breaker::fingerprint_db(&db),
+                crate::recovery_breaker::config_from_env(),
+                100,
+            );
+            crate::recovery_breaker::store(&db, &state).unwrap();
+            let state_path = crate::recovery_breaker::breaker_sidecar_path(&db);
+            let state_bytes = std::fs::read(&state_path).unwrap();
+            let election_path = crate::recovery_breaker::breaker_lock_path(&db);
+            let mut replacement_owner = None;
+            let _bypass = crate::recovery_breaker::RecoveryBreakerBypassGuard::enter();
+
+            recovery_admission().reset();
+            let error = with_recovery_admission_using_clock(
+                &db,
+                "operator recovery losing election",
+                || {
+                    std::fs::rename(&election_path, dir.path().join("retired.lock")).unwrap();
+                    replacement_owner =
+                        Some(crate::recovery_breaker::try_acquire_file_lock(&db).unwrap());
+                    if operation_fails {
+                        Err(SqlError::Custom("supervised recovery failed".to_string()))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || 101,
+            )
+            .expect_err("operator best-effort persistence cannot hide election loss");
+            assert!(error.to_string().contains("election authority changed"));
+            if operation_fails {
+                assert!(error.to_string().contains("supervised recovery failed"));
+            }
+            assert_eq!(std::fs::read(&state_path).unwrap(), state_bytes);
+            assert_eq!(std::fs::read(&db).unwrap(), b"recoverable-content");
+            assert!(crate::recovery_breaker::try_acquire_file_lock(&db).is_err());
+            drop(replacement_owner);
+            let current = crate::recovery_breaker::try_acquire_file_lock(&db).unwrap();
+            assert_eq!(current.load().unwrap(), Some(state));
+            recovery_admission().reset();
+        }
+    }
+
     #[test]
     fn terminal_breaker_failure_uses_completion_time() {
         let dir = tempfile::tempdir().unwrap();
@@ -34742,6 +36086,158 @@ mod tests {
             Some("am serve-http --port 8765".to_string())
         );
         assert_eq!(parse_ps_output_value(b"\n \t\n"), None);
+    }
+
+    #[test]
+    fn process_table_rows_keep_spaces_in_values_and_drop_unparseable_lines() {
+        let table = parse_ps_table(
+            b"    1 /sbin/launchd\n\
+              23744 /Users/me/.local/bin/am serve-http --port 8765\n\
+              57477 /System/Applications/Utilities/Screen Sharing.app/Contents/MacOS/Screen Sharing\n\
+              not-a-pid am\n\
+              99001   \n",
+        );
+        assert_eq!(
+            table,
+            vec![
+                (1, "/sbin/launchd".to_string()),
+                (
+                    23_744,
+                    "/Users/me/.local/bin/am serve-http --port 8765".to_string()
+                ),
+                (
+                    57_477,
+                    "/System/Applications/Utilities/Screen Sharing.app/Contents/MacOS/Screen Sharing"
+                        .to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn process_table_candidates_match_pid_is_agent_mail_tests() {
+        let row = |pid: u32, value: &str| (pid, value.to_string());
+        let commands = [
+            row(10, "/Users/me/.local/bin/am serve-http --port 8765"),
+            row(11, "am check-inbox --agent BlueLake"),
+            row(12, "/opt/homebrew/bin/python3 -m mcp_agent_mail.http"),
+            row(13, "renamed-argv0 serve-http"),
+            row(14, "/usr/bin/python3 -m unrelated_tool"),
+            row(15, "/Users/me/bin/amber --serve"),
+            row(16, "(am)"),
+        ];
+        let executables = [
+            row(10, "/Users/me/.local/bin/am"),
+            row(11, "/Users/me/.local/bin/am"),
+            row(12, "/opt/homebrew/bin/python3"),
+            row(13, "/Users/me/.cargo/bin/mcp-agent-mail"),
+            row(14, "/usr/bin/python3"),
+            row(15, "/Users/me/bin/amber"),
+            row(16, "am"),
+        ];
+        let candidates = agent_mail_pids_in_process_table(&commands, &executables);
+        // 10/11: argv0 basename; 12: Python shadow; 13: executable basename
+        // only; 16: an unreadable command line but a readable executable.
+        assert_eq!(candidates, vec![10, 11, 12, 13, 16]);
+        for (pid, command) in &commands {
+            let executable = &executables.iter().find(|(p, _)| p == pid).unwrap().1;
+            let accepted = command_line_is_agent_mail_process(command)
+                || executable_path_has_agent_mail_signature(Path::new(executable));
+            assert_eq!(
+                candidates.contains(pid),
+                accepted,
+                "pid {pid}: the table filter must apply pid_is_agent_mail's tests"
+            );
+        }
+    }
+
+    #[test]
+    fn lsof_holder_args_restrict_to_candidates_only_when_given() {
+        assert_eq!(lsof_holder_args(None), ["-t", "-w", "--"]);
+        assert_eq!(
+            lsof_holder_args(Some(&[23_744, 90_055])),
+            ["-t", "-w", "-a", "-p", "23744,90055", "--"]
+        );
+    }
+
+    // Needs lsof, which Windows lacks.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn non_linux_lsof_among_candidates_finds_only_listed_holders() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held.lock");
+        let _held = std::fs::File::create(&path).unwrap();
+        let me = std::process::id();
+        // Above macOS's PID limit (99,999), so no process has it.
+        let no_such_pid = 99_999_999;
+
+        assert_eq!(pids_holding_file_via_lsof(&path, Some(&[me])), vec![me]);
+        // The full scan agrees with the restricted one about this holder.
+        assert!(pids_holding_file_via_lsof(&path, None).contains(&me));
+        // A listed PID that does not hold the file, a PID with no process,
+        // and an empty list report no holder.
+        let none: Vec<u32> = Vec::new();
+        assert_eq!(pids_holding_file_via_lsof(&path, Some(&[1])), none);
+        assert_eq!(
+            pids_holding_file_via_lsof(&path, Some(&[1, no_such_pid])),
+            none
+        );
+        assert_eq!(pids_holding_file_via_lsof(&path, Some(&[])), none);
+        // A missing file has no holder, with or without a PID list.
+        let missing = dir.path().join("missing.lock");
+        assert_eq!(pids_holding_file_via_lsof(&missing, Some(&[me])), none);
+        assert_eq!(pids_holding_file_via_lsof(&missing, None), none);
+        // lsof exits 1 when a listed PID has no process; the live holder it
+        // printed must still be reported.
+        assert_eq!(
+            pids_holding_file_via_lsof(&path, Some(&[me, no_such_pid])),
+            vec![me]
+        );
+    }
+
+    // Needs ps, which Windows lacks.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn non_linux_process_table_lists_this_process() {
+        let commands = spawn_ps_table("command=")
+            .and_then(collect_ps_table)
+            .expect("ps command table");
+        let executables = spawn_ps_table("comm=")
+            .and_then(collect_ps_table)
+            .expect("ps comm table");
+        let me = std::process::id();
+        assert!(commands.iter().any(|(pid, _)| *pid == me));
+        assert!(executables.iter().any(|(pid, _)| *pid == me));
+        assert!(agent_mail_pids_from_process_table().is_some());
+    }
+
+    // Needs lsof and ps, which Windows lacks.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn non_linux_mailbox_holders_list_processes_only_for_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+        let holders = MailboxFileHolders::probe();
+
+        assert_eq!(
+            holders.open_holders(&dir.path().join("missing.lock")),
+            Vec::<u32>::new()
+        );
+        assert!(
+            holders.candidates.get().is_none(),
+            "a missing file must not list the process table"
+        );
+
+        let path = dir.path().join("present.lock");
+        let _held = std::fs::File::create(&path).unwrap();
+        let found = holders.open_holders(&path);
+        match holders.candidates.get() {
+            // This test binary is not an Agent Mail process, so lsof skips it.
+            Some(Some(_)) => assert!(!found.contains(&me)),
+            // Without a process table every process is read.
+            Some(None) => assert!(found.contains(&me)),
+            None => panic!("an existing file must list the process table"),
+        }
     }
 
     #[test]
@@ -39871,6 +41367,44 @@ mod tests {
     }
 
     #[test]
+    fn failed_startup_repair_prevents_successful_file_initialization() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let directory = tempfile::tempdir().expect("temporary mailbox");
+        let path = directory.path().join("rejected-repair.sqlite3");
+        let path_str = path.to_str().expect("UTF-8 fixture path");
+        let conn = DbConn::open_file(path_str).expect("open fixture");
+        conn.execute_raw(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, created_ts INTEGER, ack_required INTEGER); \
+             CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, read_ts INTEGER, ack_ts INTEGER); \
+             CREATE TABLE inbox_stats (agent_id INTEGER PRIMARY KEY, total_count INTEGER CHECK(total_count = 99), \
+                 unread_count INTEGER, ack_pending_count INTEGER, last_message_ts INTEGER); \
+             INSERT INTO messages VALUES (1, 2000000000, 1); \
+             INSERT INTO message_recipients VALUES (1, 1, NULL, NULL); \
+             INSERT INTO inbox_stats VALUES (1, 99, 98, 97, 96);",
+        )
+        .expect("seed repair that must roll back");
+        let before = startup_repair_snapshot(&conn);
+        drop(conn);
+
+        let outcome = runtime.block_on(run_sqlite_init_once(&Cx::for_testing(), path_str, false));
+        assert!(
+            matches!(outcome, Outcome::Err(ref error)
+                if error.to_string().contains("stage=startup_data_repairs")
+                    && error.to_string().contains("CHECK")),
+            "a failed data repair must not publish successful initialization: {outcome:?}"
+        );
+
+        let conn = DbConn::open_file(path_str).expect("inspect rejected mailbox");
+        assert_eq!(
+            startup_repair_snapshot(&conn),
+            before,
+            "failed admission must preserve the original messages and counters"
+        );
+    }
+
+    #[test]
     fn sqlite_init_missing_file_bootstraps_without_recovery_artifacts() {
         use asupersync::runtime::RuntimeBuilder;
 
@@ -40264,6 +41798,41 @@ mod tests {
     }
 
     // ── DbPoolConfig::from_env ──────────────────────────────────────────
+
+    #[test]
+    fn pool_config_from_resolved_config_preserves_the_serving_authority_and_shape() {
+        let directory = tempfile::tempdir().expect("serving storage root");
+        let resolved = mcp_agent_mail_core::Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            storage_root: directory.path().to_path_buf(),
+            database_pool_size: Some(1),
+            database_max_overflow: Some(0),
+            database_pool_timeout: Some(3),
+            database_cache_budget_kb: 16 * 1024,
+            ..Default::default()
+        };
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", "sqlite:///unrelated-mailbox.sqlite3"),
+                ("DATABASE_POOL_SIZE", "31"),
+                ("DATABASE_MAX_OVERFLOW", "7"),
+                ("DATABASE_POOL_TIMEOUT", "9"),
+            ],
+            || {
+                let config = DbPoolConfig::from_config(&resolved);
+                assert_eq!(config.database_url, resolved.database_url);
+                assert_eq!(config.storage_root.as_deref(), Some(directory.path()));
+                assert_eq!(config.min_connections, 1);
+                assert_eq!(config.max_connections, 1);
+                assert_eq!(config.acquire_timeout_ms, 3_000);
+                assert_eq!(config.cache_budget_kb, 16 * 1024);
+                let pool = get_or_create_pool(&config).expect("serving pool");
+                let same = get_cached_pool(&DbPoolConfig::from_config(&resolved))
+                    .expect("warmup must resolve the serving pool");
+                assert!(Arc::ptr_eq(&pool.pool, &same.pool));
+            },
+        );
+    }
 
     #[test]
     fn pool_config_from_env_has_defaults() {

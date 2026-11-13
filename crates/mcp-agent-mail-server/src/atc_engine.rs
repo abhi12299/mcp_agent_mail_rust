@@ -15,11 +15,19 @@
 //! All downstream subsystems (liveness, conflict, routing, calibration)
 //! are built on top of these two primitives.
 
+use mcp_agent_mail_db::models::{
+    ATC_POPULATION_MAX_NAME_BYTES, ATC_POPULATION_MAX_PROGRAM_BYTES,
+    ATC_POPULATION_MAX_PROJECT_BYTES,
+};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::time::Instant;
+
+#[path = "atc_outcomes.rs"]
+mod outcomes;
+use outcomes::{BoundedOutcomes, OutcomeEvidence, latest_outcome};
 
 fn u64_to_f64(value: u64) -> f64 {
     #[allow(clippy::cast_precision_loss)]
@@ -1796,6 +1804,10 @@ struct PendingLivenessFeedback {
     action: LivenessAction,
     expected_loss: f64,
     issued_at_micros: i64,
+    /// Score independent Alive observations using the policy that issued the
+    /// decision, even if tuning or reload changes the policy before feedback.
+    alive_loss_at_issue: f64,
+    correct_if_alive_at_issue: bool,
 }
 
 /// Infer a reasonable inter-activity prior from program name.
@@ -1815,6 +1827,23 @@ pub const ATC_AGENT_NAME: &str = "AirTrafficControl";
 // ──────────────────────────────────────────────────────────────────────
 // Conflict Detector (Track 3)
 // ──────────────────────────────────────────────────────────────────────
+
+// The population limit also bounds total retained conflict edges, and therefore
+// nonempty projects. Bound detail within an edge as well: a single long-lived
+// holder/blocker pair must not retain every path it has ever contested.
+const MAX_CONFLICT_PATTERNS_PER_EDGE: usize = 32;
+const MAX_CONFLICT_PATTERN_BYTES_PER_EDGE: usize = 4_096;
+const MAX_CONFLICT_PROJECT_BYTES: usize = 4_096;
+// Match the agent identity byte limit in mcp_agent_mail_core::models.
+const MAX_CONFLICT_AGENT_BYTES: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictAdmission {
+    Unchanged,
+    Updated,
+    Added,
+    Refused,
+}
 
 /// A hard conflict edge: agent `holder` has an exclusive reservation
 /// overlapping with agent `blocked`.
@@ -1841,6 +1870,10 @@ pub struct ProjectConflictGraph {
 }
 
 impl ProjectConflictGraph {
+    fn edge_count(&self) -> usize {
+        self.hard_edges.values().map(Vec::len).sum()
+    }
+
     fn patterns_overlap(left: &str, right: &str) -> bool {
         let left = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(left);
         let right = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(right);
@@ -1862,25 +1895,48 @@ impl ProjectConflictGraph {
         requested_path: &str,
         holder_path_pattern: &str,
         since: i64,
-    ) -> bool {
+        can_add_edge: bool,
+    ) -> ConflictAdmission {
         if holder.is_empty() || blocked.is_empty() || holder == blocked {
-            return false;
+            return ConflictAdmission::Unchanged;
+        }
+        if holder.len() > MAX_CONFLICT_AGENT_BYTES || blocked.len() > MAX_CONFLICT_AGENT_BYTES {
+            return ConflictAdmission::Refused;
         }
 
-        let edges = self.hard_edges.entry(holder.to_string()).or_default();
-        if let Some(edge) = edges.iter_mut().find(|edge| edge.blocked == blocked) {
-            let mut changed = false;
-            for pattern in [requested_path, holder_path_pattern] {
-                if !pattern.is_empty()
-                    && !edge
-                        .contested_patterns
-                        .iter()
-                        .any(|existing| existing == pattern)
-                {
-                    edge.contested_patterns.push(pattern.to_string());
-                    changed = true;
-                }
+        let patterns = [requested_path, holder_path_pattern];
+        if let Some(edge) = self
+            .hard_edges
+            .get_mut(holder)
+            .and_then(|edges| edges.iter_mut().find(|edge| edge.blocked == blocked))
+        {
+            let missing: Vec<&str> = patterns
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, pattern)| {
+                    (!pattern.is_empty()
+                        && (index == 0 || pattern != requested_path)
+                        && !edge
+                            .contested_patterns
+                            .iter()
+                            .any(|existing| existing == pattern))
+                    .then_some(pattern)
+                })
+                .collect();
+            let retained_bytes: usize = edge.contested_patterns.iter().map(String::len).sum();
+            let added_bytes = missing.iter().fold(0_usize, |bytes, pattern| {
+                bytes.saturating_add(pattern.len())
+            });
+            if edge.contested_patterns.len() + missing.len() > MAX_CONFLICT_PATTERNS_PER_EDGE
+                || retained_bytes.saturating_add(added_bytes) > MAX_CONFLICT_PATTERN_BYTES_PER_EDGE
+            {
+                // Refuse the whole observation; never partially overwrite or
+                // evict retained evidence to make new detail appear complete.
+                return ConflictAdmission::Refused;
             }
+            let mut changed = !missing.is_empty();
+            edge.contested_patterns
+                .extend(missing.into_iter().map(str::to_string));
             if since > 0 && (edge.since == 0 || since < edge.since) {
                 edge.since = since;
                 changed = true;
@@ -1890,25 +1946,47 @@ impl ProjectConflictGraph {
                 edge.contested_patterns.dedup();
                 self.bump_generation();
             }
-            return changed;
+            return if changed {
+                ConflictAdmission::Updated
+            } else {
+                ConflictAdmission::Unchanged
+            };
         }
 
+        if !can_add_edge {
+            return ConflictAdmission::Refused;
+        }
+
+        let pattern_bytes =
+            requested_path
+                .len()
+                .saturating_add(if holder_path_pattern == requested_path {
+                    0
+                } else {
+                    holder_path_pattern.len()
+                });
+        if pattern_bytes > MAX_CONFLICT_PATTERN_BYTES_PER_EDGE {
+            return ConflictAdmission::Refused;
+        }
         let mut contested_patterns = Vec::new();
-        for pattern in [requested_path, holder_path_pattern] {
+        for pattern in patterns {
             if !pattern.is_empty() {
                 contested_patterns.push(pattern.to_string());
             }
         }
         contested_patterns.sort();
         contested_patterns.dedup();
-        edges.push(HardEdge {
-            holder: holder.to_string(),
-            blocked: blocked.to_string(),
-            contested_patterns,
-            since,
-        });
+        self.hard_edges
+            .entry(holder.to_string())
+            .or_default()
+            .push(HardEdge {
+                holder: holder.to_string(),
+                blocked: blocked.to_string(),
+                contested_patterns,
+                since,
+            });
         self.bump_generation();
-        true
+        ConflictAdmission::Added
     }
 
     fn clear_blocked_conflicts_for_grant(
@@ -2518,16 +2596,20 @@ impl OnsState {
 
     /// Update this e-process with a new observation.
     fn update(&mut self, centered: f64, alpha: f64) {
-        self.sum_centered += centered;
-        self.sum_sq += centered * centered;
-
+        // A test-martingale bet must be predictable: choose it using only
+        // earlier observations. Including this outcome before placing its bet
+        // makes both possible first outcomes increase the evidence, even under
+        // the calibrated null (85% accuracy gives E[E_1] = 1.0816, not 1).
         let lambda = self.adaptive_bet_size(alpha);
         let factor = lambda.mul_add(centered, 1.0);
         // factor is guaranteed non-negative by the lambda bounds.
-        // Cap at 1e100 to prevent f64 overflow during sustained miscalibration
-        // (the e-value is evidence, not a probability — any value > threshold
-        // is equally actionable, so capping doesn't lose information).
-        self.e_value = (self.e_value * factor).clamp(1e-30, 1e100);
+        // Upper truncation preserves the supermartingale inequality while
+        // preventing overflow. A positive lower floor would create evidence
+        // after ruin; zero must remain absorbing. Clamp rounding at zero only.
+        self.e_value = (self.e_value * factor).clamp(0.0, 1e100);
+
+        self.sum_centered += centered;
+        self.sum_sq += centered * centered;
     }
 
     /// ONS adaptive bet sizing with CORRECT bounds for non-negative factors.
@@ -2925,6 +3007,79 @@ mod martingale_tests {
     }
 
     #[test]
+    fn eprocess_first_outcome_cannot_choose_its_own_bet() {
+        for correct in [false, true] {
+            let mut monitor = EProcessMonitor::new(0.85, 20.0);
+            monitor.update(correct, AtcSubsystem::Liveness, Some("BlueLake"));
+
+            // All three independent processes have no prior observations.
+            // Neither first outcome can finance a bet on itself.
+            for state in [
+                &monitor.global,
+                &monitor.per_subsystem[&AtcSubsystem::Liveness],
+                &monitor.per_agent["BlueLake"],
+            ] {
+                assert!((state.e_value - 1.0).abs() < f64::EPSILON);
+                assert!(state.sum_sq > 0.0, "learn the outcome for the next bet");
+            }
+        }
+    }
+
+    #[test]
+    fn ons_conditional_null_expectation_never_increases_evidence() {
+        // Enumerate both possible next observations after every short history,
+        // not just one conveniently ordered stream at the nominal accuracy.
+        // Under the null P(error | history) = alpha, each conditional expected
+        // next value must be no greater than the current value.
+        for alpha in [0.0, 0.01, 0.15, 0.5, 0.99, 1.0] {
+            let mut histories = vec![OnsState::new()];
+            for _ in 0..10 {
+                let mut next = Vec::with_capacity(histories.len() * 2);
+                for state in histories {
+                    let mut correct = state.clone();
+                    correct.update(-alpha, alpha);
+                    let mut incorrect = state.clone();
+                    incorrect.update(1.0 - alpha, alpha);
+
+                    let expectation =
+                        (1.0 - alpha).mul_add(correct.e_value, alpha * incorrect.e_value);
+                    let tolerance = 1e-12 * state.e_value.max(1.0);
+                    assert!(
+                        expectation <= state.e_value + tolerance,
+                        "alpha={alpha}, history={state:?}, conditional mean={expectation}"
+                    );
+                    assert!(correct.e_value.is_finite() && correct.e_value >= 0.0);
+                    assert!(incorrect.e_value.is_finite() && incorrect.e_value >= 0.0);
+                    next.extend([correct, incorrect]);
+                }
+                histories = next;
+            }
+        }
+    }
+
+    #[test]
+    fn ons_does_not_create_evidence_with_a_positive_floor() {
+        for initial in [0.0, 1e-40] {
+            for centered in [-0.15, 0.85] {
+                let mut state = OnsState {
+                    e_value: initial,
+                    ..OnsState::new()
+                };
+                state.update(centered, 0.15);
+                assert_eq!(state.e_value.to_bits(), initial.to_bits());
+            }
+        }
+
+        let mut exhausted = OnsState {
+            e_value: 0.0,
+            sum_centered: 10.0,
+            sum_sq: 1.0,
+        };
+        exhausted.update(0.85, 0.15);
+        assert_eq!(exhausted.e_value.to_bits(), 0.0_f64.to_bits());
+    }
+
+    #[test]
     fn eprocess_stays_below_threshold_under_good_calibration() {
         let mut monitor = EProcessMonitor::new(0.85, 20.0);
         // Simulate 85% accuracy (well-calibrated)
@@ -3302,6 +3457,11 @@ pub struct AtcConfig {
     pub cusum_delta: f64,
     /// Evidence ledger ring buffer capacity.
     pub ledger_capacity: usize,
+    /// Maximum retained liveness identities and total conflict edges (which
+    /// also bounds nonempty conflict projects). Existing evidence is never
+    /// evicted for new arrivals. Refusals leave the corresponding coverage
+    /// incomplete until the engine is reset.
+    pub max_tracked_agents: usize,
     /// Tick budget (microseconds) — warn if exceeded.
     pub tick_budget_micros: u64,
     /// Suspicion k-factor for rhythm-based detection.
@@ -3321,6 +3481,7 @@ impl Default for AtcConfig {
             cusum_threshold: 5.0,
             cusum_delta: 0.1,
             ledger_capacity: 1000,
+            max_tracked_agents: mcp_agent_mail_core::config::ATC_POPULATION_LIMIT_DEFAULT,
             tick_budget_micros: 5_000,
             suspicion_k: 3.0,
         }
@@ -3361,6 +3522,22 @@ pub struct AtcStageTimings {
 pub struct AtcKernelTelemetry {
     pub due_agents: usize,
     pub scheduled_agents: usize,
+    pub tracked_agents: usize,
+    pub max_tracked_agents: usize,
+    /// Refused identity-count or metadata-byte admissions, not distinct agents.
+    pub agent_capacity_refusals: u64,
+    /// Latches after the first refusal; resetting the engine clears it.
+    pub agent_coverage_incomplete: bool,
+    pub conflict_projects: usize,
+    pub conflict_edges: usize,
+    pub max_conflict_edges: usize,
+    pub max_conflict_patterns_per_edge: usize,
+    pub max_conflict_pattern_bytes_per_edge: usize,
+    /// Refused conflict observations, not a count of distinct identities.
+    pub conflict_capacity_refusals: u64,
+    /// Latches on any refused conflict identity, edge, or pattern detail.
+    /// Expiring retained edges cannot prove that omitted evidence expired.
+    pub conflict_coverage_incomplete: bool,
     pub next_due_micros: Option<i64>,
     pub dirty_agents: usize,
     pub dirty_projects: usize,
@@ -3593,6 +3770,7 @@ impl AtcLivenessPolicyArtifact {
         &self,
         posterior: &[(LivenessState, f64)],
         release_guard_active: bool,
+        mandatory_release_guard: bool,
     ) -> (LivenessAction, f64, f64) {
         let mut best_action = LivenessAction::DeclareAlive;
         let mut best_loss = f64::INFINITY;
@@ -3602,8 +3780,7 @@ impl AtcLivenessPolicyArtifact {
             LivenessAction::Suspect,
             LivenessAction::ReleaseReservations,
         ] {
-            if release_guard_active
-                && self.release_guard_enabled
+            if (mandatory_release_guard || (release_guard_active && self.release_guard_enabled))
                 && action == LivenessAction::ReleaseReservations
             {
                 continue;
@@ -3972,6 +4149,10 @@ pub struct AtcEngine {
     conflict_core: DecisionCore<ConflictState, ConflictAction>,
     /// Per-agent liveness tracking.
     agents: HashMap<String, AgentLivenessEntry>,
+    /// Saturating count of identity or metadata admissions refused at capacity.
+    /// A nonzero count permanently marks liveness coverage as incomplete;
+    /// forgetting the refused identities must not restore release authority.
+    agent_capacity_refusals: u64,
     /// Cached deterministic agent ordering for summary rendering.
     sorted_agent_names: Vec<String>,
     /// Whether the cached agent ordering must be rebuilt.
@@ -3980,8 +4161,15 @@ pub struct AtcEngine {
     liveness_schedule: BinaryHeap<Reverse<ScheduledAgentReview>>,
     /// Agents that must be reevaluated immediately due to policy changes.
     dirty_agents: BTreeSet<String>,
+    /// Alternate eligible schedule and policy work, including across ticks
+    /// whose review budget is one. Each queue retains its own ordering.
+    dirty_review_next: bool,
     /// Per-project conflict graphs.
     conflict_graphs: HashMap<String, ProjectConflictGraph>,
+    /// Total edges across all projects, bounded by `max_tracked_agents`.
+    conflict_edge_count: usize,
+    /// Saturating refusal count; latches incomplete coverage until reset.
+    conflict_capacity_refusals: u64,
     /// Projects whose conflict state has changed since the last cached render.
     dirty_projects: HashSet<String>,
     /// Lifetime communication totals with bounded recent entity detail.
@@ -4037,20 +4225,26 @@ pub struct AtcEngine {
     snapshot_seq: u64,
     /// Number of feedback resolutions received (resolved experiences).
     resolved_experience_count: u64,
+    /// Feedback windows closed without an independent outcome observation.
+    /// Expiration and supersession are censored, never successful predictions.
+    censored_experience_count: u64,
     /// Per-agent intervention counts for concentration detection.
     agent_intervention_counts: HashMap<String, u64>,
     /// Cached state from the previous snapshot for delta computation.
     prev_snapshot_state: PrevSnapshotState,
-    /// Recent reservation lifecycle events for expiry sweep correlation (br-bn0vb.10).
+    /// Recent reservation lifecycle outcomes for expiry sweep correlation
+    /// (br-bn0vb.10). Paths are not retained: outcome correlation only needs the
+    /// scoped identity, event kind, and timestamp.
     /// Ring buffer bounded to MAX_RESERVATION_EVENT_LOG entries.
     reservation_event_log: VecDeque<ReservationEvent>,
-    /// Per-project, per-agent last-outcome index. Survives ring buffer eviction so the
-    /// sweep can always find the most recent non-Granted outcome even after
-    /// a flood of events from other agents pushes the original event out.
-    reservation_last_outcome: HashMap<(String, String), (ReservationEventKind, i64)>,
+    /// Bounded per-project, per-agent outcomes that survive event-ring eviction.
+    /// Under index pressure, its timestamp floor also invalidates older ring
+    /// evidence so forgetting a newer outcome cannot invent a successful one.
+    reservation_last_outcome: BoundedOutcomes<(String, String), ReservationEventKind>,
 }
 
 const MAX_RESERVATION_EVENT_LOG: usize = 512;
+const MAX_RESERVATION_OUTCOME_IDENTITIES: usize = 4_096;
 
 #[derive(Debug, Clone)]
 // `atc.rs` re-exports this module with `pub use engine::*` from a `pub mod atc`,
@@ -4061,8 +4255,6 @@ pub(crate) struct ReservationEvent {
     pub kind: ReservationEventKind,
     pub agent: String,
     pub project: String,
-    #[allow(dead_code)]
-    pub paths: Vec<String>,
     pub timestamp_micros: i64,
 }
 
@@ -4113,7 +4305,10 @@ impl AtcEngine {
 
     /// Create a new ATC engine with the given configuration.
     #[must_use]
-    pub fn new(config: AtcConfig) -> Self {
+    pub fn new(mut config: AtcConfig) -> Self {
+        config.max_tracked_agents = config
+            .max_tracked_agents
+            .clamp(1, mcp_agent_mail_core::config::ATC_POPULATION_LIMIT_MAX);
         let calibration = CalibrationGuard::new(config.safe_mode_recovery_count);
         let eprocess = EProcessMonitor::new(0.85, config.eprocess_alert_threshold);
         let cusum = CusumDetector::new(0.15, config.cusum_threshold, config.cusum_delta);
@@ -4162,11 +4357,15 @@ impl AtcEngine {
             liveness_core,
             conflict_core: default_conflict_core(),
             agents: HashMap::new(),
+            agent_capacity_refusals: 0,
             sorted_agent_names: Vec::new(),
             agent_order_dirty: false,
             liveness_schedule: BinaryHeap::new(),
             dirty_agents: BTreeSet::new(),
+            dirty_review_next: false,
             conflict_graphs: HashMap::new(),
+            conflict_edge_count: 0,
+            conflict_capacity_refusals: 0,
             dirty_projects: HashSet::new(),
             session_summary: SessionSummary::default(),
             thread_participation: ThreadParticipationGraph::default(),
@@ -4197,10 +4396,11 @@ impl AtcEngine {
             tick_count: 0,
             snapshot_seq: 0,
             resolved_experience_count: 0,
+            censored_experience_count: 0,
             agent_intervention_counts: HashMap::new(),
             prev_snapshot_state: PrevSnapshotState::default(),
             reservation_event_log: VecDeque::new(),
-            reservation_last_outcome: HashMap::new(),
+            reservation_last_outcome: BoundedOutcomes::new(MAX_RESERVATION_OUTCOME_IDENTITIES),
         }
     }
 
@@ -4395,19 +4595,19 @@ impl AtcEngine {
             kind: ReservationEventKind::Granted,
             agent: agent.to_string(),
             project: project.to_string(),
-            paths: paths.to_vec(),
             timestamp_micros,
         });
         if !exclusive || paths.is_empty() {
             return;
         }
-        let graph = self.conflict_graphs.entry(project.to_string()).or_default();
+        let Some(graph) = self.conflict_graphs.get_mut(project) else {
+            return;
+        };
+        let before = graph.edge_count();
         let cleared = graph.clear_blocked_conflicts_for_grant(agent, paths);
-        if cleared > 0 {
-            self.dirty_projects.insert(project.to_string());
-            self.session_summary
-                .absorb(&SynthesisEvent::ConflictResolved { timestamp_micros });
-        }
+        let removed_edges = before.saturating_sub(graph.edge_count());
+        self.conflict_edge_count = self.conflict_edge_count.saturating_sub(removed_edges);
+        self.finish_conflict_resolution(project, cleared, timestamp_micros);
     }
 
     pub(crate) fn note_reservation_released(
@@ -4426,16 +4626,16 @@ impl AtcEngine {
             kind: ReservationEventKind::Released,
             agent: agent.to_string(),
             project: project.to_string(),
-            paths: paths.to_vec(),
             timestamp_micros,
         });
-        let graph = self.conflict_graphs.entry(project.to_string()).or_default();
+        let Some(graph) = self.conflict_graphs.get_mut(project) else {
+            return;
+        };
+        let before = graph.edge_count();
         let cleared = graph.clear_holder_conflicts_for_release(agent, paths);
-        if cleared > 0 {
-            self.dirty_projects.insert(project.to_string());
-            self.session_summary
-                .absorb(&SynthesisEvent::ConflictResolved { timestamp_micros });
-        }
+        let removed_edges = before.saturating_sub(graph.edge_count());
+        self.conflict_edge_count = self.conflict_edge_count.saturating_sub(removed_edges);
+        self.finish_conflict_resolution(project, cleared, timestamp_micros);
     }
 
     pub(crate) fn note_reservation_renewed(
@@ -4454,17 +4654,17 @@ impl AtcEngine {
             kind: ReservationEventKind::Renewed,
             agent: agent.to_string(),
             project: project.to_string(),
-            paths: paths.to_vec(),
             timestamp_micros,
         });
         if !paths.is_empty() {
-            let graph = self.conflict_graphs.entry(project.to_string()).or_default();
+            let Some(graph) = self.conflict_graphs.get_mut(project) else {
+                return;
+            };
+            let before = graph.edge_count();
             let cleared = graph.clear_blocked_conflicts_for_grant(agent, paths);
-            if cleared > 0 {
-                self.dirty_projects.insert(project.to_string());
-                self.session_summary
-                    .absorb(&SynthesisEvent::ConflictResolved { timestamp_micros });
-            }
+            let removed_edges = before.saturating_sub(graph.edge_count());
+            self.conflict_edge_count = self.conflict_edge_count.saturating_sub(removed_edges);
+            self.finish_conflict_resolution(project, cleared, timestamp_micros);
         }
     }
 
@@ -4484,72 +4684,148 @@ impl AtcEngine {
             kind: ReservationEventKind::ForceReleased,
             agent: agent.to_string(),
             project: project.to_string(),
-            paths: paths.to_vec(),
             timestamp_micros,
         });
-        let graph = self.conflict_graphs.entry(project.to_string()).or_default();
+        let Some(graph) = self.conflict_graphs.get_mut(project) else {
+            return;
+        };
+        let before = graph.edge_count();
         let cleared = graph.clear_holder_conflicts_for_release(agent, paths);
-        if cleared > 0 {
-            self.dirty_projects.insert(project.to_string());
-            self.session_summary
-                .absorb(&SynthesisEvent::ConflictResolved { timestamp_micros });
-        }
+        let removed_edges = before.saturating_sub(graph.edge_count());
+        self.conflict_edge_count = self.conflict_edge_count.saturating_sub(removed_edges);
+        self.finish_conflict_resolution(project, cleared, timestamp_micros);
     }
 
-    pub(crate) fn note_reservation_conflicts(
+    pub(crate) fn note_reservation_conflicts<T: AsRef<str>>(
         &mut self,
         requester: &str,
         project: &str,
-        conflicts: &[(String, String, String)],
+        conflicts: &[(T, T, T)],
         timestamp_micros: i64,
     ) {
         if requester.is_empty() || conflicts.is_empty() {
             return;
         }
-        let conflict_paths: Vec<String> = conflicts
-            .iter()
-            .map(|(_, requested_path, _)| requested_path.clone())
-            .collect();
+        if requester.len() > MAX_CONFLICT_AGENT_BYTES || project.len() > MAX_CONFLICT_PROJECT_BYTES
+        {
+            self.note_conflict_capacity_refusals(conflicts.len());
+            // Do not clone an oversized identity into the outcome ring/index.
+            // Its missing newer conflict must not expose older successful
+            // evidence from either view as the apparent latest observation.
+            self.reservation_last_outcome
+                .forget_through(timestamp_micros);
+            return;
+        }
         self.push_reservation_event(ReservationEvent {
             kind: ReservationEventKind::Conflicted,
             agent: requester.to_string(),
             project: project.to_string(),
-            paths: conflict_paths,
             timestamp_micros,
         });
-        let graph = self.conflict_graphs.entry(project.to_string()).or_default();
-        let mut added = false;
+        let mut changed = false;
+        let mut refused = 0_usize;
         for (holder, requested_path, holder_path_pattern) in conflicts {
-            added |= graph.record_blocking_conflict(
-                holder,
-                requester,
-                requested_path,
-                holder_path_pattern,
-                timestamp_micros,
-            );
+            let holder = holder.as_ref();
+            if holder.is_empty() || holder == requester {
+                continue;
+            }
+            let can_add_edge = self.conflict_edge_count < self.config.max_tracked_agents;
+            let admission = if let Some(graph) = self.conflict_graphs.get_mut(project) {
+                graph.record_blocking_conflict(
+                    holder,
+                    requester,
+                    requested_path.as_ref(),
+                    holder_path_pattern.as_ref(),
+                    timestamp_micros,
+                    can_add_edge,
+                )
+            } else if can_add_edge {
+                let mut graph = ProjectConflictGraph::default();
+                let admission = graph.record_blocking_conflict(
+                    holder,
+                    requester,
+                    requested_path.as_ref(),
+                    holder_path_pattern.as_ref(),
+                    timestamp_micros,
+                    true,
+                );
+                // Never allocate empty project/cache identities for invalid or
+                // refused observations. Nonempty projects cannot exceed edges.
+                if admission == ConflictAdmission::Added {
+                    self.conflict_graphs.insert(project.to_string(), graph);
+                }
+                admission
+            } else {
+                ConflictAdmission::Refused
+            };
+            match admission {
+                ConflictAdmission::Added => {
+                    self.conflict_edge_count += 1;
+                    changed = true;
+                }
+                ConflictAdmission::Updated => changed = true,
+                ConflictAdmission::Refused => refused = refused.saturating_add(1),
+                ConflictAdmission::Unchanged => {}
+            }
         }
-        if added {
+        self.note_conflict_capacity_refusals(refused);
+        if changed {
             self.dirty_projects.insert(project.to_string());
             self.session_summary
                 .absorb(&SynthesisEvent::ConflictDetected { timestamp_micros });
         }
     }
 
+    fn note_conflict_capacity_refusals(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if self.conflict_capacity_refusals == 0 {
+            self.mark_agents_dirty();
+        }
+        self.conflict_capacity_refusals = self
+            .conflict_capacity_refusals
+            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+    }
+
+    fn finish_conflict_resolution(&mut self, project: &str, cleared: usize, timestamp_micros: i64) {
+        if self
+            .conflict_graphs
+            .get(project)
+            .is_some_and(|graph| graph.hard_edges.is_empty())
+        {
+            // Project identities must live only as long as their conflicts.
+            // Keeping empty graphs also grows the deadlock cache and makes
+            // every future tick revisit all historical reservation projects.
+            self.conflict_graphs.remove(project);
+            self.dirty_projects.remove(project);
+            if let Some(cached) = self.deadlock_cache.remove(project) {
+                self.deadlock_cycle_total = self
+                    .deadlock_cycle_total
+                    .saturating_sub(cached.cycles.len());
+            }
+        } else if cleared > 0 {
+            self.dirty_projects.insert(project.to_string());
+        }
+        if cleared > 0 {
+            self.session_summary
+                .absorb(&SynthesisEvent::ConflictResolved { timestamp_micros });
+        }
+    }
+
     fn push_reservation_event(&mut self, event: ReservationEvent) {
-        if !matches!(event.kind, ReservationEventKind::Granted) {
-            self.reservation_last_outcome
-                .entry((
+        if event.kind != ReservationEventKind::Granted
+            && !event.project.trim().is_empty()
+            && !event.agent.trim().is_empty()
+        {
+            self.reservation_last_outcome.observe(
+                (
                     event.project.trim().to_string(),
                     event.agent.to_ascii_lowercase(),
-                ))
-                .and_modify(|previous| {
-                    // An out-of-order observation must not erase newer evidence
-                    // when the bounded event log later evicts both events.
-                    if event.timestamp_micros >= previous.1 {
-                        *previous = (event.kind, event.timestamp_micros);
-                    }
-                })
-                .or_insert((event.kind, event.timestamp_micros));
+                ),
+                event.kind,
+                event.timestamp_micros,
+            );
         }
         if self.reservation_event_log.len() >= MAX_RESERVATION_EVENT_LOG {
             self.reservation_event_log.pop_front();
@@ -4569,26 +4845,31 @@ impl AtcEngine {
         }
         // Agent names are only unique within a project. Both the ring and its
         // eviction fallback must carry that scope; an unrelated project's
-        // release is not evidence that this intervention succeeded.
+        // release is not evidence that this intervention succeeded. The index's
+        // forgetting floor applies to both lanes: an older ring entry must not
+        // become ground truth after a newer indexed outcome was discarded.
         let recent = self.reservation_event_log.iter().filter_map(|event| {
             (event.timestamp_micros >= since_micros
+                && self
+                    .reservation_last_outcome
+                    .retains_timestamp(event.timestamp_micros)
                 && event.kind != ReservationEventKind::Granted
                 && event.agent.eq_ignore_ascii_case(agent)
                 && crate::atc_project_keys_match(&event.project, project))
-            .then_some((event.kind, event.timestamp_micros))
+            .then_some(OutcomeEvidence::observed(
+                event.timestamp_micros,
+                event.kind,
+            ))
         });
         let retained = self.reservation_last_outcome.iter().filter_map(
-            |((cached_project, cached_agent), &(kind, timestamp))| {
-                (timestamp >= since_micros
+            |((cached_project, cached_agent), evidence)| {
+                (evidence.timestamp_micros >= since_micros
                     && cached_agent.eq_ignore_ascii_case(agent)
                     && crate::atc_project_keys_match(cached_project, project))
-                .then_some((kind, timestamp))
+                .then_some(evidence)
             },
         );
-        recent
-            .chain(retained)
-            .max_by_key(|(_, timestamp)| *timestamp)
-            .map(|(kind, _)| kind)
+        latest_outcome(recent.chain(retained))
     }
 
     fn note_atc_intervention(&mut self, timestamp_micros: i64) {
@@ -4606,14 +4887,30 @@ impl AtcEngine {
         if action == LivenessAction::DeclareAlive {
             return;
         }
-        self.pending_liveness_feedback.insert(
-            agent.to_string(),
-            PendingLivenessFeedback {
-                action,
-                expected_loss,
-                issued_at_micros,
-            },
-        );
+        if self
+            .pending_liveness_feedback
+            .insert(
+                agent.to_string(),
+                PendingLivenessFeedback {
+                    action,
+                    expected_loss,
+                    issued_at_micros,
+                    alive_loss_at_issue: self
+                        .liveness_core
+                        .loss_entry(action, LivenessState::Alive),
+                    correct_if_alive_at_issue: action
+                        == self
+                            .liveness_core
+                            .best_action_for_state(LivenessState::Alive),
+                },
+            )
+            .is_some()
+        {
+            // The bounded per-agent frontier retains the newest decision. A
+            // superseded decision has no attributable outcome; replacing it
+            // must not silently turn it into resolved learning evidence.
+            self.censored_experience_count = self.censored_experience_count.saturating_add(1);
+        }
     }
 
     fn apply_liveness_feedback(
@@ -4694,63 +4991,47 @@ impl AtcEngine {
         let Some(pending) = self.pending_liveness_feedback.remove(agent) else {
             return;
         };
-        let (actual_loss, correct) = match pending.action {
-            LivenessAction::ReleaseReservations => (100.0, false),
-            LivenessAction::Suspect => (2.0, true),
-            LivenessAction::DeclareAlive => (0.0, true),
-        };
+        if timestamp_micros.saturating_sub(pending.issued_at_micros)
+            >= self.liveness_feedback_window_micros()
+        {
+            // Use observation time as well as the periodic sweep. Otherwise
+            // the same late activity trains or does not train depending only
+            // on whether an operator tick happened to run first.
+            self.censored_experience_count = self.censored_experience_count.saturating_add(1);
+            return;
+        }
+        // Independent activity establishes Alive. Score the issued action
+        // against that state using the issued policy's costs: suspecting a live
+        // agent is not a correct Flaky prediction merely because it replied.
         self.apply_liveness_feedback(
             agent,
             pending.action,
             LivenessState::Alive,
             pending.expected_loss,
-            actual_loss,
-            correct,
+            pending.alive_loss_at_issue,
+            pending.correct_if_alive_at_issue,
             timestamp_micros,
         );
     }
 
-    fn resolve_stale_liveness_feedback(&mut self, now_micros: i64) {
-        let feedback_window_micros = self.config.probe_interval_micros.max(60_000_000);
-        let expired_agents: Vec<String> = self
-            .pending_liveness_feedback
-            .iter()
-            .filter_map(|(agent, pending)| {
-                (now_micros.saturating_sub(pending.issued_at_micros) >= feedback_window_micros)
-                    .then_some(agent.clone())
-            })
-            .collect();
-        for agent in expired_agents {
-            let Some(pending) = self.pending_liveness_feedback.remove(&agent) else {
-                continue;
-            };
-            let true_state = self
-                .agents
-                .get(&agent)
-                .map_or(LivenessState::Dead, |entry| entry.state);
-            let (actual_loss, correct) = match pending.action {
-                LivenessAction::ReleaseReservations => match true_state {
-                    LivenessState::Dead => (1.0, true),
-                    LivenessState::Flaky => (20.0, false),
-                    LivenessState::Alive => (100.0, false),
-                },
-                LivenessAction::Suspect => match true_state {
-                    LivenessState::Alive => (8.0, false),
-                    LivenessState::Flaky => (2.0, true),
-                    LivenessState::Dead => (6.0, true),
-                },
-                LivenessAction::DeclareAlive => (0.0, true),
-            };
-            self.apply_liveness_feedback(
-                &agent,
-                pending.action,
-                true_state,
-                pending.expected_loss,
-                actual_loss,
-                correct,
-                now_micros,
-            );
-        }
+    fn liveness_feedback_window_micros(&self) -> i64 {
+        self.config.probe_interval_micros.max(60_000_000)
+    }
+
+    fn expire_stale_liveness_feedback(&mut self, now_micros: i64) {
+        let feedback_window_micros = self.liveness_feedback_window_micros();
+        let before = self.pending_liveness_feedback.len();
+        self.pending_liveness_feedback.retain(|_, pending| {
+            now_micros.saturating_sub(pending.issued_at_micros) < feedback_window_micros
+        });
+        // An agent's inferred Dead/Flaky state is the prediction under review,
+        // not ground truth. Silence alone cannot validate that prediction or
+        // train calibration, adaptive thresholds, survival, or the loss tuner.
+        // The bounded frontier can expire while the outcome remains unknown.
+        let expired = before.saturating_sub(self.pending_liveness_feedback.len());
+        self.censored_experience_count = self
+            .censored_experience_count
+            .saturating_add(u64::try_from(expired).unwrap_or(u64::MAX));
     }
 
     fn prune_stale_conflicts(&mut self, now_micros: i64) {
@@ -4761,44 +5042,49 @@ impl AtcEngine {
                 .conflict_graphs
                 .get_mut(&project)
                 .map_or(0, |graph| graph.prune_stale_edges(cutoff));
-            if removed > 0 {
-                self.dirty_projects.insert(project);
-                self.session_summary
-                    .absorb(&SynthesisEvent::ConflictResolved {
-                        timestamp_micros: now_micros,
-                    });
-            }
+            self.conflict_edge_count = self.conflict_edge_count.saturating_sub(removed);
+            self.finish_conflict_resolution(&project, removed, now_micros);
         }
     }
 
     fn prune_agent_from_conflict_graphs(&mut self, agent_name: &str) {
         let dirty_projects: Vec<String> = self.conflict_graphs.keys().cloned().collect();
+        let timestamp_micros = mcp_agent_mail_core::timestamps::now_micros();
         for project in dirty_projects {
             let removed = self
                 .conflict_graphs
                 .get_mut(&project)
                 .map_or(0, |graph| graph.remove_agent(agent_name));
-            if removed > 0 {
-                self.dirty_projects.insert(project);
-                // Also note conflict resolved so UI updates
-                self.session_summary
-                    .absorb(&SynthesisEvent::ConflictResolved {
-                        timestamp_micros: mcp_agent_mail_core::timestamps::now_micros(),
-                    });
-            }
+            self.conflict_edge_count = self.conflict_edge_count.saturating_sub(removed);
+            self.finish_conflict_resolution(&project, removed, timestamp_micros);
+        }
+    }
+
+    fn capacity_guard_reason(&self) -> Option<&'static str> {
+        if self.agent_capacity_refusals > 0 {
+            Some("agent_capacity")
+        } else if self.conflict_capacity_refusals > 0 {
+            Some("conflict_capacity")
+        } else {
+            None
         }
     }
 
     fn current_release_guard_reason(&self) -> Option<String> {
-        if self.policy_bundle.validate().is_err() {
-            Some("policy_bundle_invalid".to_string())
-        } else if self.calibration.is_safe_mode() {
-            Some("calibration_safe_mode".to_string())
-        } else if self.slow_controller.probe_budget_fraction < 0.2 {
-            Some("budget_pressure".to_string())
-        } else {
-            None
-        }
+        self.capacity_guard_reason().map_or_else(
+            || {
+                if self.policy_bundle.validate().is_err() {
+                    Some("policy_bundle_invalid".to_string())
+                } else if self.calibration.is_safe_mode() {
+                    Some("calibration_safe_mode".to_string())
+                } else if self.slow_controller.probe_budget_fraction < 0.2 {
+                    Some("budget_pressure".to_string())
+                } else {
+                    None
+                }
+            },
+            |reason| Some(reason.to_string()),
+        )
     }
 
     fn mark_agents_dirty(&mut self) {
@@ -4958,13 +5244,37 @@ impl AtcEngine {
     fn pop_due_agents(&mut self, now_micros: i64, max_reviews: usize) -> Vec<String> {
         let mut due = Vec::with_capacity(max_reviews);
         let mut seen = HashSet::with_capacity(max_reviews);
-        while due.len() < max_reviews
-            && let Some(Reverse(next)) = self.liveness_schedule.peek().cloned()
-        {
-            if next.review_at_micros > now_micros {
+        let mut schedule_pops = 0;
+        while due.len() < max_reviews {
+            let scheduled_due = schedule_pops < MAX_LIVENESS_SCHEDULE_POPS_PER_TICK
+                && self
+                    .liveness_schedule
+                    .peek()
+                    .is_some_and(|Reverse(next)| next.review_at_micros <= now_micros);
+            if !scheduled_due && self.dirty_agents.is_empty() {
                 break;
             }
-            self.liveness_schedule.pop();
+
+            // A continuously overdue population must not starve agents that
+            // need policy reevaluation but have no ordinary deadline. Likewise,
+            // policy changes must not consume every slot ahead of timed work.
+            if !self.dirty_agents.is_empty() && (self.dirty_review_next || !scheduled_due) {
+                if let Some(agent) = self.dirty_agents.pop_first()
+                    && seen.insert(agent.clone())
+                {
+                    due.push(agent);
+                    self.dirty_review_next = false;
+                }
+                continue;
+            }
+
+            let Some(Reverse(next)) = self.liveness_schedule.pop() else {
+                break;
+            };
+            // Stale and duplicate entries consume work even though they do
+            // not consume review slots. Leave excess cleanup for later ticks
+            // instead of scanning the whole heap under the engine mutex.
+            schedule_pops += 1;
             let Some(entry) = self.agents.get(&next.agent) else {
                 continue;
             };
@@ -4979,35 +5289,21 @@ impl AtcEngine {
                 // together so the next batch cannot evaluate it twice.
                 self.dirty_agents.remove(&next.agent);
                 due.push(next.agent);
-            }
-        }
-        while due.len() < max_reviews {
-            let Some(agent) = self.dirty_agents.iter().next().cloned() else {
-                break;
-            };
-            self.dirty_agents.remove(&agent);
-            if seen.insert(agent.clone()) {
-                due.push(agent);
+                self.dirty_review_next = true;
             }
         }
         due
     }
 
-    fn next_scheduled_review_micros(&mut self) -> Option<i64> {
-        while let Some(Reverse(next)) = self.liveness_schedule.peek().cloned() {
-            let Some(entry) = self.agents.get(&next.agent) else {
-                self.liveness_schedule.pop();
-                continue;
-            };
-            let stale_version = entry.schedule_version != next.schedule_version;
-            let stale_review_time = entry.next_review_micros != next.review_at_micros;
-            if stale_version || stale_review_time {
-                self.liveness_schedule.pop();
-                continue;
-            }
-            return Some(next.review_at_micros);
-        }
-        None
+    fn next_scheduled_review_micros(&self) -> Option<i64> {
+        // This is a conservative wake deadline, not proof that the head still
+        // represents a live review. Cleanup belongs to pop_due_agents's bounded
+        // work budget. An overdue stale head keeps the operator at its resume
+        // floor until cleanup catches up; removing it here would silently do
+        // an unbounded second heap walk while publishing the health snapshot.
+        self.liveness_schedule
+            .peek()
+            .map(|Reverse(next)| next.review_at_micros)
     }
 
     fn normalize_deadlock_cycles(mut cycles: Vec<Vec<String>>) -> Vec<Vec<String>> {
@@ -5074,10 +5370,24 @@ impl AtcEngine {
         from == ATC_AGENT_NAME || to.iter().any(|t| t == ATC_AGENT_NAME)
     }
 
-    /// Register a new agent for liveness tracking.
-    pub fn register_agent(&mut self, name: &str, program: &str, project_key: Option<&str>) {
-        if name == ATC_AGENT_NAME {
-            return; // self-exclusion
+    /// Register or update an agent for liveness tracking.
+    ///
+    /// Returns whether the identity is tracked. At capacity, existing agents
+    /// retain their state and feedback; new identities are refused without
+    /// allocating a liveness entry or scheduling work. Refusals latch incomplete
+    /// coverage until an engine reset, normally with a larger population limit.
+    /// Metadata byte limits also apply to existing-agent updates: retain the
+    /// last valid state and fail closed instead of truncating routing identity.
+    pub fn register_agent(&mut self, name: &str, program: &str, project_key: Option<&str>) -> bool {
+        if name.len() > ATC_POPULATION_MAX_NAME_BYTES
+            || program.len() > ATC_POPULATION_MAX_PROGRAM_BYTES
+            || project_key.is_some_and(|key| key.len() > ATC_POPULATION_MAX_PROJECT_BYTES)
+        {
+            self.agent_capacity_refusals = self.agent_capacity_refusals.saturating_add(1);
+            return false;
+        }
+        if name.trim().is_empty() || name == ATC_AGENT_NAME {
+            return false;
         }
         let project_key = project_key.map(str::trim).filter(|value| !value.is_empty());
         if let Some(entry) = self.agents.get_mut(name) {
@@ -5089,7 +5399,7 @@ impl AtcEngine {
                 // identical snapshot. Treat that as a true no-op: allocating
                 // replacement Strings and pushing another scheduler heap item
                 // every minute created needless long-running daemon churn.
-                return;
+                return true;
             }
             if project_changed {
                 entry.project_key = project_key.map(ToOwned::to_owned);
@@ -5106,6 +5416,10 @@ impl AtcEngine {
             }
             entry.core.sync_policy_from(&self.liveness_core);
         } else {
+            if self.agents.len() >= self.config.max_tracked_agents {
+                self.agent_capacity_refusals = self.agent_capacity_refusals.saturating_add(1);
+                return false;
+            }
             self.agents.insert(
                 name.to_string(),
                 AgentLivenessEntry {
@@ -5135,6 +5449,22 @@ impl AtcEngine {
             mcp_agent_mail_core::timestamps::now_micros(),
             incumbent_k,
         );
+        true
+    }
+
+    /// Called while the global engine lock is held, after admission succeeds.
+    /// Keep ENGINE -> THRESHOLDS ordering so a reset cannot interleave admission
+    /// and adaptive-state creation, and refused identities allocate no state.
+    fn ensure_adaptive_threshold(&self, name: &str) {
+        if let Some(thresholds) = ATC_THRESHOLDS.get()
+            && let Ok(mut thresholds) = thresholds.lock()
+            && !thresholds.contains_key(name)
+        {
+            thresholds.insert(
+                name.to_string(),
+                AdaptiveThreshold::new(self.config.suspicion_k),
+            );
+        }
     }
 
     /// Process an agent activity signal (message, reservation, commit).
@@ -5154,6 +5484,13 @@ impl AtcEngine {
         // previously still consumed feedback, changed project attribution,
         // resurrected dead agents, and churned the scheduler.
         if timestamp_micros <= entry.rhythm.last_activity_ts {
+            return;
+        }
+        if project_key.is_some_and(|key| key.len() > ATC_POPULATION_MAX_PROJECT_BYTES) {
+            // A newer signal with unretainable routing metadata is incomplete
+            // evidence. Do not replace the project, consume pending feedback,
+            // or resurrect the agent from a partially accepted observation.
+            self.agent_capacity_refusals = self.agent_capacity_refusals.saturating_add(1);
             return;
         }
         self.resolve_pending_feedback_on_activity(agent, timestamp_micros);
@@ -5193,6 +5530,9 @@ impl AtcEngine {
     pub(crate) fn evaluate_liveness(&mut self, now_micros: i64) -> LivenessEvaluation {
         let fallback_reason = self.current_release_guard_reason();
         let fallback_active = fallback_reason.is_some();
+        // Incomplete population or conflict coverage is an authority boundary,
+        // independent of whether a policy opts into the ordinary fallback guard.
+        let mandatory_release_guard = self.capacity_guard_reason().is_some();
         let incumbent_policy = self.incumbent_policy.clone();
         let candidate_policy = self.shadow_policy.candidate.clone();
         let due_agents = self.pop_due_agents(now_micros, MAX_LIVENESS_REVIEWS_PER_TICK);
@@ -5242,7 +5582,11 @@ impl AtcEngine {
 
                     let (incumbent_action, incumbent_loss, runner_up_loss) = if incumbent_suspicious
                     {
-                        incumbent_policy.choose_action(entry.core.posterior(), fallback_active)
+                        incumbent_policy.choose_action(
+                            entry.core.posterior(),
+                            fallback_active,
+                            mandatory_release_guard,
+                        )
                     } else {
                         (
                             LivenessAction::DeclareAlive,
@@ -5258,8 +5602,11 @@ impl AtcEngine {
                         (LivenessAction::DeclareAlive, incumbent_loss),
                         |candidate| {
                             if candidate_suspicious {
-                                let (action, loss, _) = candidate
-                                    .choose_action(entry.core.posterior(), fallback_active);
+                                let (action, loss, _) = candidate.choose_action(
+                                    entry.core.posterior(),
+                                    fallback_active,
+                                    mandatory_release_guard,
+                                );
                                 (action, loss)
                             } else {
                                 (
@@ -5371,7 +5718,10 @@ impl AtcEngine {
         evaluation
     }
 
-    /// Check for deadlock cycles in all project conflict graphs.
+    /// Check for observed deadlock cycles in retained project conflict graphs.
+    /// After a capacity refusal this is partial evidence: an empty result is not
+    /// proof that no cycle exists. Summary completeness and the mandatory release
+    /// guard remain conservative until the engine is reset.
     #[must_use]
     pub fn detect_deadlocks(&mut self) -> Vec<(String, Vec<Vec<String>>)> {
         if self.deadlock_cache.is_empty() {
@@ -5407,10 +5757,22 @@ impl AtcEngine {
         self.refresh_incumbent_policy_from_core();
     }
 
-    fn absorb_population_snapshot(&self, population: &mut HierarchicalAgentModel) {
-        for entry in self.agents.values() {
-            population.absorb_agent(&entry.program, &entry.rhythm);
+    fn refresh_population_snapshot(&mut self, population: &mut HierarchicalAgentModel) {
+        // Rhythms already summarize each agent's observations. Reabsorbing
+        // their full counts into the previous population would count quiet
+        // agents again every 50 ticks, teaching stronger priors without any
+        // new activity. Rebuild the bounded current population instead: one
+        // contribution per agent, including program changes and rhythm resets.
+        // Reuse the cached stable order so floating-point pooling is also
+        // independent of HashMap iteration and registration order.
+        self.sorted_agent_names();
+        let mut refreshed = HierarchicalAgentModel::new();
+        for name in &self.sorted_agent_names {
+            if let Some(entry) = self.agents.get(name) {
+                refreshed.absorb_agent(&entry.program, &entry.rhythm);
+            }
         }
+        *population = refreshed;
     }
 
     fn build_summary_snapshot_with(
@@ -5422,6 +5784,28 @@ impl AtcEngine {
         policy: &AtcPolicyTelemetry,
     ) -> AtcSummarySnapshot {
         self.snapshot_seq = self.snapshot_seq.saturating_add(1);
+
+        // Admission can change between ticks. Publish live coverage even when
+        // the remaining telemetry came from the previous tick (or startup).
+        let coverage_reason = self.capacity_guard_reason();
+        let coverage_incomplete = coverage_reason.is_some();
+        let mut kernel = kernel.clone();
+        kernel.tracked_agents = self.agents.len();
+        kernel.max_tracked_agents = self.config.max_tracked_agents;
+        kernel.agent_capacity_refusals = self.agent_capacity_refusals;
+        kernel.agent_coverage_incomplete = self.agent_capacity_refusals > 0;
+        kernel.conflict_projects = self.conflict_graphs.len();
+        kernel.conflict_edges = self.conflict_edge_count;
+        kernel.max_conflict_edges = self.config.max_tracked_agents;
+        kernel.max_conflict_patterns_per_edge = MAX_CONFLICT_PATTERNS_PER_EDGE;
+        kernel.max_conflict_pattern_bytes_per_edge = MAX_CONFLICT_PATTERN_BYTES_PER_EDGE;
+        kernel.conflict_capacity_refusals = self.conflict_capacity_refusals;
+        kernel.conflict_coverage_incomplete = self.conflict_capacity_refusals > 0;
+        let mut policy = policy.clone();
+        if let Some(reason) = coverage_reason {
+            policy.fallback_active = true;
+            policy.fallback_reason = Some(reason.to_string());
+        }
 
         // ── agent snapshots (deterministic order) ────────────────────
         let mut agent_states = Vec::with_capacity(self.agents.len());
@@ -5447,7 +5831,9 @@ impl AtcEngine {
         let safe_mode = self.is_safe_mode();
         let execution_posture = if safe_mode {
             ExecutionPosture::SafeMode
-        } else if self.eprocess.miscalibrated() || self.slow_controller.probe_budget_fraction < 0.5
+        } else if coverage_incomplete
+            || self.eprocess.miscalibrated()
+            || self.slow_controller.probe_budget_fraction < 0.5
         {
             ExecutionPosture::Cautious
         } else {
@@ -5520,7 +5906,11 @@ impl AtcEngine {
         AtcSummarySnapshot {
             snapshot_seq: self.snapshot_seq,
             generated_at_micros: now_micros,
-            completeness: SnapshotCompleteness::Full,
+            completeness: if coverage_incomplete {
+                SnapshotCompleteness::Partial
+            } else {
+                SnapshotCompleteness::Full
+            },
             enabled: self.enabled(),
             safe_mode,
             execution_posture,
@@ -5535,6 +5925,7 @@ impl AtcEngine {
             decisions_total: self.ledger.latest_id(),
             experiences_open: self.pending_liveness_feedback.len(),
             experiences_resolved: self.resolved_experience_count,
+            experiences_censored: self.censored_experience_count,
             calibration_consecutive_correct: self.calibration.consecutive_correct(),
             calibration_recovery_target: self.calibration.recovery_count(),
             regime_state,
@@ -5545,9 +5936,9 @@ impl AtcEngine {
             delta,
             recent_decisions: self.ledger.recent(16).cloned().collect(),
             stage_timings: stage_timings.clone(),
-            kernel: kernel.clone(),
+            kernel,
             budget: budget.clone(),
-            policy: policy.clone(),
+            policy,
         }
     }
 
@@ -5776,7 +6167,7 @@ impl AtcEngine {
     fn run_tick(&mut self, now_micros: i64) -> AtcTickReport {
         let total_started = Instant::now();
         self.tick_count = self.tick_count.saturating_add(1);
-        self.resolve_stale_liveness_feedback(now_micros);
+        self.expire_stale_liveness_feedback(now_micros);
         self.prune_stale_conflicts(now_micros);
 
         let decision_fallback_reason = self.current_release_guard_reason();
@@ -6200,7 +6591,7 @@ impl AtcEngine {
             && let Some(pop_lock) = ATC_POPULATION.get()
             && let Ok(mut pop) = pop_lock.lock()
         {
-            self.absorb_population_snapshot(&mut pop);
+            self.refresh_population_snapshot(&mut pop);
         }
         let pre_summary_total_micros = elapsed_micros(total_started);
         let budget_exceeded = pre_summary_total_micros > self.config.tick_budget_micros;
@@ -6221,7 +6612,8 @@ impl AtcEngine {
         // their ordinary liveness deadlines. If a bounded tick leaves dirty
         // work behind, publish an already-due deadline so the operator loop
         // resumes at its 250ms floor instead of sleeping until the earliest
-        // (possibly hours-away) scheduled review.
+        // (possibly hours-away) scheduled review. An overdue stale heap head
+        // also retains a due wake time until bounded cleanup reaches it.
         let next_due_micros = if self.dirty_agents.is_empty() {
             self.next_scheduled_review_micros()
         } else {
@@ -6231,6 +6623,17 @@ impl AtcEngine {
         let kernel = AtcKernelTelemetry {
             due_agents: liveness.due_agents,
             scheduled_agents: self.scheduled_agent_count(),
+            tracked_agents: self.agents.len(),
+            max_tracked_agents: self.config.max_tracked_agents,
+            agent_capacity_refusals: self.agent_capacity_refusals,
+            agent_coverage_incomplete: self.agent_capacity_refusals > 0,
+            conflict_projects: self.conflict_graphs.len(),
+            conflict_edges: self.conflict_edge_count,
+            max_conflict_edges: self.config.max_tracked_agents,
+            max_conflict_patterns_per_edge: MAX_CONFLICT_PATTERNS_PER_EDGE,
+            max_conflict_pattern_bytes_per_edge: MAX_CONFLICT_PATTERN_BYTES_PER_EDGE,
+            conflict_capacity_refusals: self.conflict_capacity_refusals,
+            conflict_coverage_incomplete: self.conflict_capacity_refusals > 0,
             next_due_micros,
             dirty_agents: self.dirty_agents.len(),
             dirty_projects: self.dirty_projects.len(),
@@ -6425,6 +6828,438 @@ mod engine_tests {
     }
 
     #[test]
+    fn liveness_capacity_clamps_explicit_configuration() {
+        assert_eq!(
+            AtcConfig::default().max_tracked_agents,
+            mcp_agent_mail_core::config::ATC_POPULATION_LIMIT_DEFAULT
+        );
+        for (requested, expected) in [
+            (0, 1),
+            (3, 3),
+            (
+                usize::MAX,
+                mcp_agent_mail_core::config::ATC_POPULATION_LIMIT_MAX,
+            ),
+        ] {
+            let engine = AtcEngine::new(AtcConfig {
+                max_tracked_agents: requested,
+                ..AtcConfig::default()
+            });
+            assert_eq!(engine.config.max_tracked_agents, expected);
+            assert_eq!(engine.agent_capacity_refusals, 0);
+            assert!(engine.agents.is_empty());
+        }
+    }
+
+    #[test]
+    fn liveness_capacity_preserves_tracked_agents_and_unresolved_feedback() {
+        let mut engine = AtcEngine::new(AtcConfig {
+            max_tracked_agents: 2,
+            ..AtcConfig::default()
+        });
+        assert!(engine.register_agent("BlueFox", "claude-code", Some("/old")));
+        assert!(engine.register_agent("RedHawk", "codex-cli", None));
+        engine.observe_activity("BlueFox", None, 5_000_000);
+        engine.record_pending_liveness_feedback(
+            "BlueFox",
+            LivenessAction::Suspect,
+            2.0,
+            10_000_000,
+        );
+        let scheduled = engine.liveness_schedule.len();
+        let dirty = engine.dirty_agents.len();
+        let ledger_id = engine.ledger.latest_id();
+        let cached_names = engine.sorted_agent_names().to_vec();
+
+        for index in 0..1_000 {
+            assert!(!engine.register_agent(&format!("Overflow{index}"), "unknown-tool", None));
+        }
+        assert_eq!(engine.agents.len(), 2);
+        assert_eq!(engine.agent_capacity_refusals, 1_000);
+        assert_eq!(engine.liveness_schedule.len(), scheduled);
+        assert_eq!(engine.dirty_agents.len(), dirty);
+        assert_eq!(engine.sorted_agent_names(), cached_names);
+        assert_eq!(engine.pending_liveness_feedback.len(), 1);
+        assert_eq!(engine.ledger.latest_id(), ledger_id);
+        assert_eq!(engine.resolved_experience_count, 0);
+        assert_eq!(engine.agent_liveness("BlueFox"), Some(LivenessState::Alive));
+        assert_eq!(engine.agent_liveness("RedHawk"), Some(LivenessState::Alive));
+
+        assert!(engine.register_agent("BlueFox", "codex-cli", Some("/new")));
+        engine.observe_activity("BlueFox", Some("/new"), 6_000_000);
+        let entry = engine
+            .agents
+            .get("BlueFox")
+            .expect("active identity retained");
+        assert_eq!(entry.program, "codex-cli");
+        assert_eq!(entry.project_key.as_deref(), Some("/new"));
+        assert_eq!(entry.rhythm.last_activity_ts, 6_000_000);
+        assert_eq!(engine.pending_liveness_feedback.len(), 1);
+        assert_eq!(engine.agent_capacity_refusals, 1_000);
+        assert_eq!(
+            engine.current_release_guard_reason().as_deref(),
+            Some("agent_capacity")
+        );
+    }
+
+    #[test]
+    fn liveness_capacity_refusals_saturate_and_exclude_invalid_identities() {
+        let mut engine = AtcEngine::new(AtcConfig {
+            max_tracked_agents: 1,
+            ..AtcConfig::default()
+        });
+        for name in ["", " \t ", ATC_AGENT_NAME] {
+            assert!(!engine.register_agent(name, "unknown-tool", None));
+        }
+        assert_eq!(engine.agent_capacity_refusals, 0);
+        assert!(engine.agents.is_empty());
+        assert!(engine.register_agent("Retained", "claude-code", None));
+        for name in ["", " \t ", ATC_AGENT_NAME] {
+            assert!(!engine.register_agent(name, "unknown-tool", None));
+        }
+        assert_eq!(engine.agent_capacity_refusals, 0);
+
+        engine.agent_capacity_refusals = u64::MAX - 1;
+        assert!(!engine.register_agent("Refused", "unknown-tool", None));
+        assert!(!engine.register_agent("AlsoRefused", "unknown-tool", None));
+        assert_eq!(engine.agent_capacity_refusals, u64::MAX);
+        assert!(engine.register_agent("Retained", "codex-cli", None));
+        assert_eq!(engine.agents.len(), 1);
+    }
+
+    #[test]
+    fn liveness_metadata_bounds_preserve_existing_state_and_feedback() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        reset_global_atc_state_for_test(&config);
+        let mut engine = AtcEngine::new_for_testing();
+        let name = "N".repeat(ATC_POPULATION_MAX_NAME_BYTES);
+        let program = "é".repeat(ATC_POPULATION_MAX_PROGRAM_BYTES / 2);
+        let project = "é".repeat(ATC_POPULATION_MAX_PROJECT_BYTES / 2);
+        assert!(engine.register_agent(&name, &program, Some(&project)));
+        engine.observe_activity(&name, Some(&project), 5_000_000);
+        engine.record_pending_liveness_feedback(&name, LivenessAction::Suspect, 2.0, 10_000_000);
+        let schedule_version = engine.agents[&name].schedule_version;
+        let schedule_len = engine.liveness_schedule.len();
+        let posterior = engine.agents[&name].core.posterior().to_vec();
+
+        assert!(!engine.register_agent(&format!("{name}x"), "codex-cli", None));
+        assert!(!engine.register_agent(&name, &format!("{program}x"), Some("/changed")));
+        assert!(!engine.register_agent(&name, "codex-cli", Some(&format!("{project}x"))));
+        engine.observe_activity(&name, Some(&format!("x\0{project}")), 11_000_000);
+        let oversized_program = format!("x\0{program}");
+        for index in 0..1_000 {
+            assert!(!engine.register_agent(
+                &format!("Overflow{index}"),
+                &oversized_program,
+                Some("/new"),
+            ));
+        }
+        assert_eq!(engine.agents.len(), 1);
+        assert_eq!(engine.agent_capacity_refusals, 1_004);
+        assert_eq!(engine.liveness_schedule.len(), schedule_len);
+        assert_eq!(engine.pending_liveness_feedback.len(), 1);
+        assert_eq!(engine.resolved_experience_count, 0);
+        let retained = &engine.agents[&name];
+        assert_eq!(retained.name, name);
+        assert_eq!(retained.program, program);
+        assert_eq!(retained.project_key.as_deref(), Some(project.as_str()));
+        assert_eq!(retained.rhythm.last_activity_ts, 5_000_000);
+        assert_eq!(retained.schedule_version, schedule_version);
+        assert_eq!(retained.core.posterior(), posterior);
+        assert_eq!(
+            engine.current_release_guard_reason().as_deref(),
+            Some("agent_capacity")
+        );
+
+        assert!(engine.register_agent(&name, "codex-cli", Some("/valid-update")));
+        engine.observe_activity(&name, None, 12_000_000);
+        assert_eq!(engine.agents[&name].program, "codex-cli");
+        assert_eq!(
+            engine.agents[&name].project_key.as_deref(),
+            Some("/valid-update")
+        );
+        assert_eq!(engine.agents[&name].rhythm.last_activity_ts, 12_000_000);
+        assert!(engine.pending_liveness_feedback.is_empty());
+        assert_eq!(
+            engine.agent_capacity_refusals, 1_004,
+            "a subsequent valid update cannot certify refused evidence"
+        );
+        reset_global_atc_state_for_test(&config);
+    }
+
+    #[test]
+    fn incomplete_coverage_blocks_release_even_if_policy_disables_guard() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_global_atc_state_for_test(&mcp_agent_mail_core::Config::default());
+        for (conflict_limited, metadata_limited) in [(false, false), (false, true), (true, false)] {
+            let mut engine = AtcEngine::new(AtcConfig {
+                max_tracked_agents: 1,
+                ..AtcConfig::default()
+            });
+            assert!(engine.register_agent("StillTracked", "claude-code", None));
+            for index in 1..=9 {
+                engine.observe_activity("StillTracked", None, index * 60_000_000);
+            }
+            engine.incumbent_policy.release_guard_enabled = false;
+            engine.incumbent_policy.artifact_hash = engine.incumbent_policy.compute_artifact_hash();
+            if let Some(candidate) = engine.shadow_policy.candidate.as_mut() {
+                candidate.release_guard_enabled = false;
+                candidate.artifact_hash = candidate.compute_artifact_hash();
+            }
+            engine.policy_bundle = AtcLivenessPolicyBundle::from_live_policies(
+                &engine.incumbent_policy,
+                engine.shadow_policy.candidate.as_ref(),
+                engine.policy_revision,
+            );
+            assert!(engine.policy_bundle.validate().is_ok());
+            let entry = engine.agents.get_mut("StillTracked").expect("agent");
+            for _ in 0..30 {
+                entry.core.update_posterior(&[
+                    (LivenessState::Alive, 0.01),
+                    (LivenessState::Flaky, 0.05),
+                    (LivenessState::Dead, 0.95),
+                ]);
+            }
+            assert_eq!(
+                engine
+                    .incumbent_policy
+                    .choose_action(entry.core.posterior(), true, false)
+                    .0,
+                LivenessAction::ReleaseReservations,
+                "control: the valid policy ignores its optional release guard"
+            );
+            let expected_reason = if conflict_limited {
+                engine.note_reservation_conflicts(
+                    "Waiter",
+                    "retained",
+                    &[("Holder", "src/a.rs", "src/a.rs")],
+                    1,
+                );
+                engine.note_reservation_conflicts(
+                    "Waiter",
+                    "refused",
+                    &[("Holder", "src/b.rs", "src/b.rs")],
+                    1,
+                );
+                "conflict_capacity"
+            } else if metadata_limited {
+                assert!(!engine.register_agent(
+                    "StillTracked",
+                    &"p".repeat(ATC_POPULATION_MAX_PROGRAM_BYTES + 1),
+                    None,
+                ));
+                "agent_capacity"
+            } else {
+                assert!(!engine.register_agent("Untracked", "codex-cli", None));
+                "agent_capacity"
+            };
+            assert_eq!(engine.resolved_experience_count, 0);
+            assert!(engine.pending_liveness_feedback.is_empty());
+
+            let report = engine.run_tick(9 * 60_000_000 + 600_000_000);
+            assert!(report.summary.kernel.due_agents > 0);
+            assert!(
+                !report
+                    .actions
+                    .iter()
+                    .any(|action| { matches!(action, AtcTickAction::ReleaseReservations { .. }) })
+            );
+            assert!(
+                !report
+                    .effects
+                    .iter()
+                    .any(|effect| { effect.kind == "release_reservations_requested" })
+            );
+            assert_ne!(
+                engine.agent_liveness("StillTracked"),
+                Some(LivenessState::Dead)
+            );
+            assert!(
+                engine
+                    .pending_liveness_feedback
+                    .values()
+                    .all(|pending| { pending.action != LivenessAction::ReleaseReservations })
+            );
+            assert_eq!(engine.resolved_experience_count, 0);
+            assert_eq!(report.summary.completeness, SnapshotCompleteness::Partial);
+            assert_eq!(report.summary.execution_posture, ExecutionPosture::Cautious);
+            assert_eq!(report.summary.kernel.tracked_agents, 1);
+            assert_eq!(report.summary.kernel.max_tracked_agents, 1);
+            assert_eq!(
+                report.summary.kernel.agent_coverage_incomplete,
+                !conflict_limited
+            );
+            assert_eq!(
+                report.summary.kernel.conflict_coverage_incomplete,
+                conflict_limited
+            );
+            if conflict_limited {
+                // Expiry erases every retained edge, but cannot certify that the
+                // refused edge expired or authorize release from an empty graph.
+                assert_eq!(report.summary.kernel.conflict_edges, 0);
+                assert_eq!(report.summary.deadlock_cycles, 0);
+                assert_eq!(report.summary.kernel.conflict_capacity_refusals, 1);
+            } else {
+                assert_eq!(report.summary.kernel.agent_capacity_refusals, 1);
+            }
+            assert!(report.summary.policy.fallback_active);
+            assert_eq!(
+                report.summary.policy.fallback_reason.as_deref(),
+                Some(expected_reason)
+            );
+            assert!(
+                report
+                    .summary
+                    .recent_decisions
+                    .iter()
+                    .any(|record| { record.fallback_reason.as_deref() == Some(expected_reason) })
+            );
+        }
+    }
+
+    #[test]
+    fn release_capacity_admission_rechecks_previously_planned_effects() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_global_atc_state_for_test(&mcp_agent_mail_core::Config::default());
+        for (conflict_limited, metadata_limited) in [(false, false), (false, true), (true, false)] {
+            let mut engine = AtcEngine::new(AtcConfig {
+                max_tracked_agents: 1,
+                ..AtcConfig::default()
+            });
+            assert!(engine.register_agent("ReleaseTarget", "claude-code", Some("/project")));
+            for index in 1..=9 {
+                engine.observe_activity("ReleaseTarget", None, index * 60_000_000);
+            }
+            let entry = engine.agents.get_mut("ReleaseTarget").expect("agent");
+            for _ in 0..30 {
+                entry.core.update_posterior(&[
+                    (LivenessState::Alive, 0.01),
+                    (LivenessState::Flaky, 0.05),
+                    (LivenessState::Dead, 0.95),
+                ]);
+            }
+            let prior_report = engine.run_tick(9 * 60_000_000 + 600_000_000);
+            assert!(prior_report.effects.iter().any(|effect| {
+                effect.kind == "release_reservations_requested" && effect.agent == "ReleaseTarget"
+            }));
+            assert_eq!(prior_report.summary.kernel.agent_capacity_refusals, 0);
+
+            let engine_lock = Mutex::new(engine);
+            assert_eq!(
+                release_capacity_admission_from_engine(Some(&engine_lock)),
+                Ok(())
+            );
+            assert!(engine_lock.try_lock().is_ok(), "admission releases ENGINE");
+            let expected_reason = if conflict_limited {
+                let mut engine = engine_lock.lock().unwrap();
+                engine.note_reservation_conflicts(
+                    "Waiter",
+                    "retained",
+                    &[("Holder", "src/a.rs", "src/a.rs")],
+                    1,
+                );
+                assert_eq!(engine.conflict_capacity_refusals, 0);
+                drop(engine);
+                assert_eq!(
+                    release_capacity_admission_from_engine(Some(&engine_lock)),
+                    Ok(())
+                );
+                engine_lock.lock().unwrap().note_reservation_conflicts(
+                    "Waiter",
+                    "refused",
+                    &[("Holder", "src/b.rs", "src/b.rs")],
+                    1,
+                );
+                "conflict_capacity"
+            } else if metadata_limited {
+                assert!(!engine_lock.lock().unwrap().register_agent(
+                    "ReleaseTarget",
+                    &"p".repeat(ATC_POPULATION_MAX_PROGRAM_BYTES + 1),
+                    Some("/project"),
+                ));
+                "agent_capacity"
+            } else {
+                assert!(!engine_lock.lock().unwrap().register_agent(
+                    "LaterArrival",
+                    "codex-cli",
+                    None
+                ));
+                "agent_capacity"
+            };
+            assert_eq!(
+                release_capacity_admission_from_engine(Some(&engine_lock)),
+                Err(expected_reason)
+            );
+            assert!(engine_lock.try_lock().is_ok(), "refusal releases ENGINE");
+            assert!(prior_report.actions.iter().any(|action| {
+            matches!(action, AtcTickAction::ReleaseReservations { agent } if agent == "ReleaseTarget")
+        }), "the stale report is still a release intent, not the admission authority");
+        }
+    }
+
+    #[test]
+    fn release_capacity_admission_fails_closed_without_usable_engine_state() {
+        assert_eq!(
+            release_capacity_admission_from_engine(None),
+            Err("agent_coverage_unavailable")
+        );
+        let disabled = Mutex::new(AtcEngine::new(AtcConfig {
+            enabled: false,
+            ..AtcConfig::default()
+        }));
+        assert_eq!(
+            release_capacity_admission_from_engine(Some(&disabled)),
+            Err("agent_coverage_unavailable")
+        );
+        assert!(disabled.try_lock().is_ok());
+
+        let poisoned = Mutex::new(AtcEngine::new_for_testing());
+        let result = std::panic::catch_unwind(|| {
+            let _guard = poisoned.lock().unwrap();
+            panic!("simulate interrupted engine mutation");
+        });
+        assert!(result.is_err());
+        assert!(poisoned.is_poisoned());
+        assert_eq!(
+            release_capacity_admission_from_engine(Some(&poisoned)),
+            Err("agent_coverage_unavailable")
+        );
+        assert!(
+            poisoned.is_poisoned(),
+            "admission cannot repair unknown state"
+        );
+    }
+
+    #[test]
+    fn release_capacity_admission_distinguishes_full_capacity_from_refusal() {
+        let mut engine = AtcEngine::new(AtcConfig {
+            max_tracked_agents: 1,
+            ..AtcConfig::default()
+        });
+        assert!(engine.register_agent("Tracked", "claude-code", None));
+        assert_eq!(engine.agents.len(), engine.config.max_tracked_agents);
+        assert_eq!(engine.agent_capacity_refusals, 0);
+        engine.slow_controller.probe_budget_fraction = 0.1;
+        assert_eq!(
+            engine.current_release_guard_reason().as_deref(),
+            Some("budget_pressure")
+        );
+        let engine_lock = Mutex::new(engine);
+        assert_eq!(
+            release_capacity_admission_from_engine(Some(&engine_lock)),
+            Ok(())
+        );
+        assert!(engine_lock.try_lock().is_ok());
+    }
+
+    #[test]
     fn engine_excludes_atc_from_registration() {
         let mut engine = AtcEngine::new_for_testing();
         engine.register_agent(ATC_AGENT_NAME, "mcp-agent-mail", None);
@@ -6599,6 +7434,523 @@ mod engine_tests {
         assert_eq!(deadlocks[0].1[0].len(), 2);
     }
 
+    fn note_test_conflict_cycle(
+        engine: &mut AtcEngine,
+        project: &str,
+        first: &str,
+        second: &str,
+        timestamp_micros: i64,
+    ) {
+        for (requester, holder) in [(first, second), (second, first)] {
+            engine.note_reservation_conflicts(
+                requester,
+                project,
+                &[(
+                    holder.to_string(),
+                    "src/lib.rs".to_string(),
+                    "src/lib.rs".to_string(),
+                )],
+                timestamp_micros,
+            );
+        }
+    }
+
+    #[test]
+    fn conflict_admission_bounds_projects_and_edges_without_evicting_cycles() {
+        let mut engine = AtcEngine::new(AtcConfig {
+            max_tracked_agents: 3,
+            ..AtcConfig::default()
+        });
+        note_test_conflict_cycle(&mut engine, "retained", "BlueFox", "RedOwl", 10);
+        engine.note_reservation_conflicts(
+            "OtherWaiter",
+            "other",
+            &[("OtherHolder", "src/a.rs", "src/a.rs")],
+            10,
+        );
+        assert_eq!(engine.detect_deadlocks().len(), 1);
+        assert_eq!(engine.conflict_edge_count, 3);
+
+        for index in 0..128 {
+            engine.note_reservation_conflicts(
+                "NewWaiter",
+                &format!("refused-{index}"),
+                &[("NewHolder", "new.rs", "new.rs")],
+                20,
+            );
+        }
+        engine.note_reservation_conflicts(
+            "NewWaiter",
+            "retained",
+            &[("NewHolder", "new.rs", "new.rs")],
+            20,
+        );
+        // Full edge capacity still permits new detail on an existing edge.
+        engine.note_reservation_conflicts(
+            "BlueFox",
+            "retained",
+            &[("RedOwl", "src/extra.rs", "src/extra.rs")],
+            20,
+        );
+        engine.note_reservation_conflicts(
+            "BlueFox",
+            "invalid",
+            &[
+                ("BlueFox", "ignored", "ignored"),
+                ("", "ignored", "ignored"),
+            ],
+            20,
+        );
+
+        assert_eq!(engine.conflict_capacity_refusals, 129);
+        assert_eq!(engine.conflict_edge_count, 3);
+        assert_eq!(engine.conflict_graphs.len(), 2);
+        assert_eq!(engine.deadlock_cache.len(), 2);
+        assert!(
+            !engine.conflict_graphs["retained"]
+                .hard_edges
+                .contains_key("NewHolder")
+        );
+        assert_eq!(
+            engine.conflict_graphs["retained"].hard_edges["RedOwl"][0].contested_patterns,
+            ["src/extra.rs", "src/lib.rs"],
+        );
+        let cycles = engine.detect_deadlocks();
+        assert_eq!(cycles.len(), 1);
+        assert_eq!(cycles[0].0, "retained");
+        assert_eq!(cycles[0].1[0], ["BlueFox", "RedOwl"]);
+
+        // Admission happens between ticks; stale kernel telemetry must not
+        // publish complete coverage or hide the reason for restricted authority.
+        let snapshot = engine.build_summary_snapshot_with(
+            20,
+            &AtcStageTimings::default(),
+            &AtcKernelTelemetry::default(),
+            &AtcBudgetTelemetry::default(),
+            &AtcPolicyTelemetry::default(),
+        );
+        assert_eq!(snapshot.completeness, SnapshotCompleteness::Partial);
+        assert_eq!(snapshot.execution_posture, ExecutionPosture::Cautious);
+        assert_eq!(snapshot.kernel.conflict_projects, 2);
+        assert_eq!(snapshot.kernel.conflict_edges, 3);
+        assert_eq!(snapshot.kernel.max_conflict_edges, 3);
+        assert_eq!(snapshot.kernel.conflict_capacity_refusals, 129);
+        assert!(snapshot.kernel.conflict_coverage_incomplete);
+        assert!(!snapshot.kernel.agent_coverage_incomplete);
+        assert_eq!(
+            snapshot.policy.fallback_reason.as_deref(),
+            Some("conflict_capacity")
+        );
+        let report = engine.run_tick(20);
+        assert_eq!(report.summary.deadlock_cycles, 1);
+        assert_eq!(report.summary.completeness, SnapshotCompleteness::Partial);
+        assert!(report.actions.iter().any(|action| matches!(
+            action,
+            AtcTickAction::SendAdvisory { message, .. }
+                if message.contains("Deadlock in retained") && message.contains("conflict_capacity")
+        )));
+        assert!(
+            !report
+                .effects
+                .iter()
+                .any(|effect| effect.kind == "release_reservations_requested")
+        );
+
+        engine.conflict_capacity_refusals = u64::MAX - 1;
+        for _ in 0..2 {
+            engine.note_reservation_conflicts(
+                "NewWaiter",
+                "refused",
+                &[("NewHolder", "new.rs", "new.rs")],
+                30,
+            );
+        }
+        assert_eq!(engine.conflict_capacity_refusals, u64::MAX);
+        assert_eq!(engine.conflict_edge_count, 3);
+    }
+
+    #[test]
+    fn conflict_detail_capacity_keeps_existing_patterns_and_reuses_released_space() {
+        let mut engine = AtcEngine::new(AtcConfig {
+            max_tracked_agents: 1,
+            ..AtcConfig::default()
+        });
+        for index in 0..MAX_CONFLICT_PATTERNS_PER_EDGE {
+            let path = format!("src/file-{index}.rs");
+            engine.note_reservation_conflicts(
+                "Waiter",
+                "project",
+                &[("Holder", path.as_str(), path.as_str())],
+                10,
+            );
+        }
+        engine.note_reservation_conflicts(
+            "Waiter",
+            "project",
+            &[("Holder", "extra.rs", "src/file-0.rs")],
+            20,
+        );
+        // Already known detail and an earlier observation remain admissible at
+        // both the edge and pattern limits; refusal cannot erase the old edge.
+        engine.note_reservation_conflicts(
+            "Waiter",
+            "project",
+            &[("Holder", "src/file-0.rs", "src/file-0.rs")],
+            5,
+        );
+        let edge = &engine.conflict_graphs["project"].hard_edges["Holder"][0];
+        assert_eq!(
+            edge.contested_patterns.len(),
+            MAX_CONFLICT_PATTERNS_PER_EDGE
+        );
+        assert_eq!(edge.since, 5);
+        assert!(
+            !edge
+                .contested_patterns
+                .iter()
+                .any(|path| path == "extra.rs")
+        );
+        assert_eq!(engine.conflict_capacity_refusals, 1);
+        assert_eq!(engine.conflict_edge_count, 1);
+
+        engine.note_reservation_released("Holder", &["src/file-0.rs".to_string()], "project", 30);
+        assert_eq!(engine.conflict_edge_count, 1);
+        engine.note_reservation_conflicts(
+            "Waiter",
+            "project",
+            &[("Holder", "extra.rs", "extra.rs")],
+            40,
+        );
+        let edge = &engine.conflict_graphs["project"].hard_edges["Holder"][0];
+        assert_eq!(
+            edge.contested_patterns.len(),
+            MAX_CONFLICT_PATTERNS_PER_EDGE
+        );
+        assert!(
+            edge.contested_patterns
+                .iter()
+                .any(|path| path == "extra.rs")
+        );
+        assert_eq!(engine.conflict_capacity_refusals, 1);
+        assert_eq!(engine.capacity_guard_reason(), Some("conflict_capacity"));
+    }
+
+    #[test]
+    fn conflict_detail_bytes_are_bounded_without_truncation_or_partial_updates() {
+        let mut engine = AtcEngine::new(AtcConfig {
+            max_tracked_agents: 2,
+            ..AtcConfig::default()
+        });
+        let first = "a".repeat(MAX_CONFLICT_PATTERN_BYTES_PER_EDGE / 2);
+        let second = "b".repeat(MAX_CONFLICT_PATTERN_BYTES_PER_EDGE / 2);
+        engine.note_reservation_conflicts(
+            "Waiter",
+            "project",
+            &[("Holder", first.as_str(), second.as_str())],
+            10,
+        );
+        engine.note_reservation_conflicts("Waiter", "project", &[("Holder", "c", "d")], 20);
+        engine.note_reservation_conflicts(
+            "Waiter",
+            "project",
+            &[("Holder", first.as_str(), second.as_str())],
+            5,
+        );
+        let oversized = "é".repeat(MAX_CONFLICT_PATTERN_BYTES_PER_EDGE / 2 + 1);
+        engine.note_reservation_conflicts(
+            "OtherWaiter",
+            "oversized",
+            &[("OtherHolder", oversized.as_str(), oversized.as_str())],
+            20,
+        );
+        let edge = &engine.conflict_graphs["project"].hard_edges["Holder"][0];
+        assert_eq!(edge.contested_patterns, [first, second]);
+        assert_eq!(edge.since, 5);
+        assert_eq!(engine.conflict_edge_count, 1);
+        assert_eq!(engine.conflict_graphs.len(), 1);
+        assert_eq!(engine.conflict_capacity_refusals, 2);
+        // Rejected detail still contributes the real scoped conflict outcome.
+        assert_eq!(
+            engine.reservation_outcome_for_agent("OtherWaiter", "oversized", 0),
+            Some(ReservationEventKind::Conflicted),
+        );
+    }
+
+    #[test]
+    fn conflict_identity_byte_limits_refuse_without_aliasing_or_restoring_stale_outcomes() {
+        let mut engine = AtcEngine::new_for_testing();
+        let project = "p".repeat(MAX_CONFLICT_PROJECT_BYTES);
+        let requester = "w".repeat(MAX_CONFLICT_AGENT_BYTES);
+        let holder = "h".repeat(MAX_CONFLICT_AGENT_BYTES);
+        engine.note_reservation_conflicts(
+            &requester,
+            &project,
+            &[(holder.as_str(), "src/a.rs", "src/a.rs")],
+            1,
+        );
+        assert_eq!(engine.conflict_edge_count, 1);
+        assert_eq!(engine.conflict_capacity_refusals, 0);
+        engine.note_reservation_conflicts(
+            &requester,
+            &project,
+            &[(format!("{holder}x").as_str(), "src/b.rs", "src/b.rs")],
+            2,
+        );
+        assert_eq!(engine.conflict_edge_count, 1);
+        assert_eq!(engine.conflict_graphs[&project].hard_edges.len(), 1);
+
+        engine.note_reservation_released("KnownAgent", &["src/a.rs".to_string()], "known", 10);
+        for (oversized_requester, oversized_project, timestamp) in [
+            (format!("{requester}x"), project.clone(), 20),
+            (requester.clone(), format!("{project}x"), 30),
+        ] {
+            engine.note_reservation_conflicts(
+                &oversized_requester,
+                &oversized_project,
+                &[(holder.as_str(), "src/b.rs", "src/b.rs")],
+                timestamp,
+            );
+            assert!(
+                !engine
+                    .reservation_event_log
+                    .iter()
+                    .any(|event| event.timestamp_micros == timestamp)
+            );
+        }
+        assert_eq!(engine.conflict_capacity_refusals, 3);
+        assert_eq!(engine.conflict_graphs.len(), 1);
+        assert_eq!(engine.conflict_edge_count, 1);
+        assert_eq!(
+            engine.reservation_outcome_for_agent("KnownAgent", "known", 0),
+            None
+        );
+        engine.note_reservation_released("KnownAgent", &["src/a.rs".to_string()], "known", 31);
+        assert_eq!(
+            engine.reservation_outcome_for_agent("KnownAgent", "known", 0),
+            Some(ReservationEventKind::Released),
+        );
+        assert_eq!(engine.capacity_guard_reason(), Some("conflict_capacity"));
+    }
+
+    #[test]
+    fn expired_conflicts_free_admission_without_restoring_complete_coverage() {
+        let mut engine = AtcEngine::new(AtcConfig {
+            max_tracked_agents: 2,
+            ..AtcConfig::default()
+        });
+        note_test_conflict_cycle(&mut engine, "expired", "BlueFox", "RedOwl", 1);
+        assert_eq!(engine.detect_deadlocks().len(), 1);
+        engine.note_reservation_conflicts(
+            "NewWaiter",
+            "new",
+            &[("NewHolder", "new.rs", "new.rs")],
+            2,
+        );
+        assert_eq!(engine.conflict_capacity_refusals, 1);
+
+        let now = engine.conflict_edge_ttl_micros() + 2;
+        engine.prune_stale_conflicts(now);
+        assert_eq!(engine.conflict_edge_count, 0);
+        assert!(engine.conflict_graphs.is_empty());
+        assert!(engine.deadlock_cache.is_empty());
+        assert!(engine.dirty_projects.is_empty());
+        assert_eq!(engine.detect_deadlocks(), []);
+        assert_eq!(engine.capacity_guard_reason(), Some("conflict_capacity"));
+
+        note_test_conflict_cycle(&mut engine, "new", "NewHolder", "NewWaiter", now);
+        assert_eq!(engine.conflict_edge_count, 2);
+        assert_eq!(engine.detect_deadlocks().len(), 1);
+        assert_eq!(engine.conflict_capacity_refusals, 1);
+        assert_eq!(
+            release_capacity_admission_from_engine(Some(&Mutex::new(engine))),
+            Err("conflict_capacity"),
+        );
+        let reset = Mutex::new(AtcEngine::new(AtcConfig {
+            max_tracked_agents: 2,
+            ..AtcConfig::default()
+        }));
+        assert_eq!(release_capacity_admission_from_engine(Some(&reset)), Ok(()));
+    }
+
+    #[test]
+    fn conflict_project_churn_retains_only_active_projects() {
+        let mut engine = AtcEngine::new_for_testing();
+        note_test_conflict_cycle(&mut engine, "active-project", "BlueFox", "RedOwl", 1);
+        assert_eq!(engine.detect_deadlocks().len(), 1);
+        let paths = ["src/lib.rs".to_string()];
+
+        for index in 0_i64..4_096 {
+            let project = format!("completed-project-{index}");
+            let timestamp = index + 2;
+            match index % 5 {
+                0 => engine.note_reservation_granted("BlueFox", &paths, true, &project, timestamp),
+                1 => engine.note_reservation_released("BlueFox", &paths, &project, timestamp),
+                2 => engine.note_reservation_renewed("BlueFox", &paths, &project, timestamp),
+                3 => engine.note_reservation_force_released("BlueFox", &paths, &project, timestamp),
+                _ => engine.note_reservation_conflicts(
+                    "BlueFox",
+                    &project,
+                    &[("BlueFox".to_string(), paths[0].clone(), paths[0].clone())],
+                    timestamp,
+                ),
+            }
+        }
+
+        assert_eq!(engine.conflict_graphs.len(), 1);
+        assert!(engine.conflict_graphs.contains_key("active-project"));
+        assert_eq!(engine.deadlock_cache.len(), 1);
+        assert!(engine.dirty_projects.is_empty());
+        let deadlocks = engine.detect_deadlocks();
+        assert_eq!(deadlocks.len(), 1);
+        assert_eq!(deadlocks[0].0, "active-project");
+        assert_eq!(engine.deadlock_cycle_total, 1);
+    }
+
+    #[test]
+    fn conflict_project_resolution_retires_all_reservation_paths() {
+        for kind in [
+            ReservationEventKind::Granted,
+            ReservationEventKind::Renewed,
+            ReservationEventKind::Released,
+            ReservationEventKind::ForceReleased,
+        ] {
+            let mut engine = AtcEngine::new_for_testing();
+            for project in ["resolved-project", "active-project"] {
+                note_test_conflict_cycle(&mut engine, project, "BlueFox", "RedOwl", 1);
+            }
+            assert_eq!(engine.detect_deadlocks().len(), 2);
+            assert_eq!(engine.deadlock_cycle_total, 2);
+            assert_eq!(engine.conflict_edge_count, 4);
+            let paths = ["src/lib.rs".to_string()];
+
+            for agent in ["BlueFox", "RedOwl"] {
+                match kind {
+                    ReservationEventKind::Granted => {
+                        engine.note_reservation_granted(agent, &paths, true, "resolved-project", 2);
+                    }
+                    ReservationEventKind::Renewed => {
+                        engine.note_reservation_renewed(agent, &paths, "resolved-project", 2);
+                    }
+                    ReservationEventKind::Released => {
+                        engine.note_reservation_released(agent, &paths, "resolved-project", 2);
+                    }
+                    ReservationEventKind::ForceReleased => {
+                        engine.note_reservation_force_released(
+                            agent,
+                            &paths,
+                            "resolved-project",
+                            2,
+                        );
+                    }
+                    ReservationEventKind::Conflicted => unreachable!("resolution paths only"),
+                }
+                if agent == "BlueFox" {
+                    assert_eq!(
+                        engine.conflict_graphs["resolved-project"].hard_edges.len(),
+                        1
+                    );
+                    assert!(engine.dirty_projects.contains("resolved-project"));
+                    assert_eq!(engine.conflict_edge_count, 3);
+                }
+            }
+
+            assert!(!engine.conflict_graphs.contains_key("resolved-project"));
+            assert!(!engine.deadlock_cache.contains_key("resolved-project"));
+            assert!(engine.dirty_projects.is_empty());
+            assert_eq!(engine.deadlock_cycle_total, 1);
+            assert_eq!(engine.conflict_edge_count, 2);
+            let remaining = engine.detect_deadlocks();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].0, "active-project");
+
+            // A new graph restarts its generation. An old cache entry must not
+            // hide a new cycle when the same project encounters contention again.
+            note_test_conflict_cycle(&mut engine, "resolved-project", "BlueFox", "RedOwl", 3);
+            assert_eq!(engine.detect_deadlocks().len(), 2);
+            assert_eq!(engine.deadlock_cycle_total, 2);
+            assert_eq!(engine.conflict_edge_count, 4);
+        }
+    }
+
+    #[test]
+    fn conflict_project_expiry_retires_cache_before_next_tick() {
+        let mut engine = AtcEngine::new_for_testing();
+        let now = engine.conflict_edge_ttl_micros() + 2;
+        note_test_conflict_cycle(&mut engine, "expired-project", "BlueFox", "RedOwl", 1);
+        note_test_conflict_cycle(&mut engine, "active-project", "BlueFox", "RedOwl", now);
+        assert_eq!(engine.detect_deadlocks().len(), 2);
+        assert_eq!(engine.conflict_edge_count, 4);
+
+        engine.prune_stale_conflicts(now);
+        assert!(!engine.conflict_graphs.contains_key("expired-project"));
+        assert!(!engine.deadlock_cache.contains_key("expired-project"));
+        assert!(engine.dirty_projects.is_empty());
+        assert_eq!(engine.deadlock_cycle_total, 1);
+        assert_eq!(engine.conflict_edge_count, 2);
+        let report = engine.run_tick(now);
+        assert_eq!(report.summary.deadlock_cycles, 1);
+        assert!(report.actions.iter().any(|action| matches!(
+            action,
+            AtcTickAction::SendAdvisory { message, .. }
+                if message.contains("Deadlock in active-project")
+        )));
+        assert!(!report.actions.iter().any(|action| matches!(
+            action,
+            AtcTickAction::SendAdvisory { message, .. }
+                if message.contains("expired-project")
+        )));
+
+        let report = engine.run_tick(now + engine.conflict_edge_ttl_micros() + 1);
+        assert_eq!(report.summary.deadlock_cycles, 0);
+        assert!(engine.conflict_graphs.is_empty());
+        assert!(engine.deadlock_cache.is_empty());
+        assert!(engine.dirty_projects.is_empty());
+        assert_eq!(engine.conflict_edge_count, 0);
+    }
+
+    #[test]
+    fn conflict_project_dead_agent_cleanup_preserves_other_cycles() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("DeadConflictHolder", "claude-code", Some("expired-project"));
+        // Keep this fixture independent of the process-global population prior.
+        engine.agents.get_mut("DeadConflictHolder").unwrap().rhythm = AgentRhythm::new(60.0);
+        for index in 0..10 {
+            engine.observe_activity("DeadConflictHolder", None, index * 60_000_000);
+        }
+        let entry = engine.agents.get_mut("DeadConflictHolder").unwrap();
+        for _ in 0..30 {
+            entry.core.update_posterior(&[
+                (LivenessState::Alive, 0.01),
+                (LivenessState::Flaky, 0.05),
+                (LivenessState::Dead, 0.95),
+            ]);
+        }
+        let now = 9 * 60_000_000 + 600_000_000;
+        note_test_conflict_cycle(
+            &mut engine,
+            "expired-project",
+            "DeadConflictHolder",
+            "BlockedAgent",
+            now - 1,
+        );
+        note_test_conflict_cycle(&mut engine, "active-project", "BlueFox", "RedOwl", now - 1);
+        assert_eq!(engine.detect_deadlocks().len(), 2);
+        assert_eq!(engine.conflict_edge_count, 4);
+
+        let evaluation = engine.evaluate_liveness(now);
+        assert!(evaluation.actions.iter().any(|(agent, action)| {
+            agent == "DeadConflictHolder" && *action == LivenessAction::ReleaseReservations
+        }));
+        assert!(!engine.conflict_graphs.contains_key("expired-project"));
+        assert!(!engine.deadlock_cache.contains_key("expired-project"));
+        assert!(engine.dirty_projects.is_empty());
+        assert_eq!(engine.deadlock_cycle_total, 1);
+        assert_eq!(engine.conflict_edge_count, 2);
+        let remaining = engine.detect_deadlocks();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, "active-project");
+    }
+
     #[test]
     fn is_self_event_filters_correctly() {
         assert!(AtcEngine::is_self_event(ATC_AGENT_NAME, &[]));
@@ -6728,6 +8080,267 @@ mod engine_tests {
                 .contains_key("FeedbackAgent")
         );
         assert_eq!(engine.resolved_experience_count, 1);
+    }
+
+    fn isolated_liveness_feedback_test() -> bool {
+        // Calibration also updates process-global conformal, threshold, and
+        // loss-tuner state. Other local engine tests can feed those globals,
+        // so verify their invariance in a real, otherwise empty test process.
+        const CHILD: &str = "AM_TEST_LIVENESS_FEEDBACK_CHILD";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named libtest thread");
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let log = output.reopen().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, name)
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(30) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{name} exceeded its watchdog");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let log = std::fs::read_to_string(output.path()).unwrap();
+        assert!(
+            status.success() && log.contains("1 passed; 0 failed"),
+            "{name}: {log}"
+        );
+        true
+    }
+
+    #[test]
+    fn liveness_feedback_expiration_is_censored_not_ground_truth() {
+        if isolated_liveness_feedback_test() {
+            return;
+        }
+        reset_global_atc_state_for_test(&mcp_agent_mail_core::Config::default());
+        let mut engine = AtcEngine::new(AtcConfig {
+            enabled: true,
+            safe_mode_recovery_count: 1,
+            ..AtcConfig::default()
+        });
+        let issued_at = 10_000_000;
+        let expires_at = issued_at + engine.liveness_feedback_window_micros();
+        for (name, state, action) in [
+            (
+                "PredictedDead",
+                LivenessState::Dead,
+                LivenessAction::ReleaseReservations,
+            ),
+            (
+                "PredictedFlaky",
+                LivenessState::Flaky,
+                LivenessAction::Suspect,
+            ),
+            (
+                "PredictedAlive",
+                LivenessState::Alive,
+                LivenessAction::Suspect,
+            ),
+        ] {
+            engine.register_agent(name, "codex-cli", None);
+            engine.ensure_adaptive_threshold(name);
+            engine.agents.get_mut(name).unwrap().state = state;
+            engine.record_pending_liveness_feedback(name, action, 7.0, issued_at);
+        }
+        engine.set_safe_mode(true, issued_at);
+        let policy_revision = engine.policy_revision;
+        let loss_matrix = engine.liveness_core.loss_matrix.clone();
+
+        engine.expire_stale_liveness_feedback(expires_at - 1);
+        assert_eq!(engine.pending_liveness_feedback.len(), 3);
+        assert_eq!(engine.censored_experience_count, 0);
+        engine.expire_stale_liveness_feedback(expires_at);
+        engine.expire_stale_liveness_feedback(i64::MAX);
+
+        assert!(engine.pending_liveness_feedback.is_empty());
+        assert_eq!(engine.censored_experience_count, 3);
+        assert_eq!(engine.resolved_experience_count, 0);
+        assert!(
+            engine.is_safe_mode(),
+            "silence cannot satisfy safe-mode recovery"
+        );
+        assert_eq!(engine.calibration.consecutive_correct(), 0);
+        assert_eq!(
+            engine.eprocess.global.sum_centered.to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert!(engine.eprocess.per_agent.is_empty());
+        assert_eq!(engine.cusum.s_pos.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(engine.cusum.s_neg.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(engine.regret.outcome_count(), 0);
+        assert!(engine.agent_intervention_counts.is_empty());
+        assert_eq!(engine.policy_revision, policy_revision);
+        assert_eq!(engine.liveness_core.loss_matrix, loss_matrix);
+        let tuner = ATC_LIVENESS_TUNER.get().unwrap().lock().unwrap();
+        assert_eq!(tuner.decisions_since_update, 0);
+        assert!(tuner.regret_accum.is_empty());
+        drop(tuner);
+        let conformal = ATC_CONFORMAL.get().unwrap().lock().unwrap();
+        assert!(conformal.sets[&AtcSubsystem::Liveness].scores.is_empty());
+        drop(conformal);
+        let thresholds = ATC_THRESHOLDS.get().unwrap().lock().unwrap();
+        assert!(thresholds.values().all(|threshold| {
+            threshold.alpha.to_bits() == 2.0_f64.to_bits()
+                && threshold.beta_param.to_bits() == 2.0_f64.to_bits()
+        }));
+        drop(thresholds);
+        assert!(ATC_SURVIVAL.get().unwrap().lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn liveness_feedback_uses_observation_time_at_expiration_boundary() {
+        if isolated_liveness_feedback_test() {
+            return;
+        }
+        reset_global_atc_state_for_test(&mcp_agent_mail_core::Config::default());
+        let mut engine = AtcEngine::new_for_testing();
+        let issued_at = 10_000_000;
+        let expires_at = issued_at + engine.liveness_feedback_window_micros();
+        for (name, offset) in [("Observed", -1), ("AtDeadline", 0), ("AfterDeadline", 1)] {
+            engine.register_agent(name, "codex-cli", None);
+            engine.ensure_adaptive_threshold(name);
+            engine.agents.get_mut(name).unwrap().state = LivenessState::Dead;
+            engine.record_pending_liveness_feedback(
+                name,
+                LivenessAction::ReleaseReservations,
+                1.0,
+                issued_at,
+            );
+            engine.observe_activity(name, None, expires_at + offset);
+            assert_eq!(engine.agent_liveness(name), Some(LivenessState::Alive));
+        }
+        assert!(engine.pending_liveness_feedback.is_empty());
+        assert_eq!(engine.resolved_experience_count, 1);
+        assert_eq!(engine.censored_experience_count, 2);
+        assert!(engine.eprocess.per_agent.contains_key("Observed"));
+        assert!(!engine.eprocess.per_agent.contains_key("AtDeadline"));
+        assert!(!engine.eprocess.per_agent.contains_key("AfterDeadline"));
+        let thresholds = ATC_THRESHOLDS.get().unwrap().lock().unwrap();
+        assert!(thresholds["Observed"].precision_estimate() < 0.5);
+        assert_eq!(
+            thresholds["AtDeadline"].beta_param.to_bits(),
+            2.0_f64.to_bits()
+        );
+        assert_eq!(
+            thresholds["AfterDeadline"].beta_param.to_bits(),
+            2.0_f64.to_bits()
+        );
+        drop(thresholds);
+        let tuner = ATC_LIVENESS_TUNER.get().unwrap().lock().unwrap();
+        assert_eq!(tuner.decisions_since_update, 1);
+        assert_eq!(
+            tuner.regret_accum[&(LivenessAction::ReleaseReservations, LivenessState::Alive)].1,
+            1
+        );
+    }
+
+    #[test]
+    fn liveness_feedback_scores_observed_alive_against_issued_policy() {
+        if isolated_liveness_feedback_test() {
+            return;
+        }
+        reset_global_atc_state_for_test(&mcp_agent_mail_core::Config::default());
+        let mut engine = AtcEngine::new(AtcConfig {
+            enabled: true,
+            safe_mode_recovery_count: 1,
+            ..AtcConfig::default()
+        });
+        engine.set_safe_mode(true, 1);
+        for (name, alive_loss) in [("DefaultPolicy", 8.0), ("TunedPolicy", 23.0)] {
+            engine.liveness_core.set_loss_entry(
+                LivenessAction::Suspect,
+                LivenessState::Alive,
+                alive_loss,
+            );
+            engine.liveness_core.set_loss_entry(
+                LivenessAction::DeclareAlive,
+                LivenessState::Alive,
+                0.0,
+            );
+            engine.register_agent(name, "codex-cli", None);
+            engine.ensure_adaptive_threshold(name);
+            engine.record_pending_liveness_feedback(name, LivenessAction::Suspect, 2.0, 1);
+            // Both the incurred cost and best action change while the outcome
+            // is pending. Neither may rewrite the issued decision's score.
+            engine.liveness_core.set_loss_entry(
+                LivenessAction::Suspect,
+                LivenessState::Alive,
+                99.0,
+            );
+            engine.liveness_core.set_loss_entry(
+                LivenessAction::DeclareAlive,
+                LivenessState::Alive,
+                1000.0,
+            );
+            assert_eq!(
+                engine
+                    .liveness_core
+                    .best_action_for_state(LivenessState::Alive),
+                LivenessAction::Suspect
+            );
+            engine.observe_activity(name, None, 2);
+        }
+
+        assert_eq!(engine.resolved_experience_count, 2);
+        assert_eq!(engine.censored_experience_count, 0);
+        assert!(
+            engine.is_safe_mode(),
+            "a false suspicion cannot recover calibration"
+        );
+        assert_eq!(engine.calibration.consecutive_correct(), 0);
+        let thresholds = ATC_THRESHOLDS.get().unwrap().lock().unwrap();
+        assert!(thresholds.values().all(|threshold| {
+            threshold.alpha.to_bits() == 2.0_f64.to_bits()
+                && threshold.beta_param.to_bits() == 3.0_f64.to_bits()
+        }));
+        drop(thresholds);
+        let conformal = ATC_CONFORMAL.get().unwrap().lock().unwrap();
+        let scores = &conformal.sets[&AtcSubsystem::Liveness].scores;
+        assert_eq!(scores.len(), 2);
+        assert_eq!(scores[0].to_bits(), 6.0_f64.to_bits());
+        assert_eq!(scores[1].to_bits(), 21.0_f64.to_bits());
+        drop(conformal);
+        let tuner = ATC_LIVENESS_TUNER.get().unwrap().lock().unwrap();
+        let (regret, count) = tuner.regret_accum[&(LivenessAction::Suspect, LivenessState::Alive)];
+        assert_eq!(count, 2);
+        assert_eq!(regret.to_bits(), 27.0_f64.to_bits());
+    }
+
+    #[test]
+    fn liveness_feedback_tick_publishes_censorship_and_supersession() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("Silent", "codex-cli", None);
+        engine.agents.get_mut("Silent").unwrap().state = LivenessState::Dead;
+        engine.record_pending_liveness_feedback("Silent", LivenessAction::Suspect, 2.0, 1);
+        engine.record_pending_liveness_feedback(
+            "Silent",
+            LivenessAction::ReleaseReservations,
+            1.0,
+            2,
+        );
+        assert_eq!(engine.censored_experience_count, 1);
+        let report = engine.run_tick(2 + engine.liveness_feedback_window_micros());
+        assert_eq!(report.summary.experiences_open, 0);
+        assert_eq!(report.summary.experiences_resolved, 0);
+        assert_eq!(report.summary.experiences_censored, 2);
+        assert_eq!(
+            engine.eprocess.global.sum_centered.to_bits(),
+            0.0_f64.to_bits()
+        );
     }
 
     #[test]
@@ -7729,6 +9342,126 @@ mod synthesis_tests {
             "eviction fallback must preserve the newest scoped observation"
         );
         assert_eq!(engine.reservation_last_outcome.len(), 1);
+    }
+
+    #[test]
+    fn reservation_outcome_pressure_cannot_restore_older_ring_success() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.reservation_last_outcome = BoundedOutcomes::new(1);
+        let mut observe = |kind, agent: &str, timestamp_micros| {
+            engine.push_reservation_event(ReservationEvent {
+                kind,
+                agent: agent.to_string(),
+                project: "/project/alpha".to_string(),
+                timestamp_micros,
+            });
+        };
+        observe(ReservationEventKind::Released, "BlueLake", 10);
+        observe(ReservationEventKind::Conflicted, "BlueLake", 20);
+        observe(ReservationEventKind::Renewed, "OtherAgent", 30);
+        // An older positive outcome remains in the ring, while the newer
+        // contradictory outcome has been evicted from the bounded index.
+        assert_eq!(engine.reservation_last_outcome.len(), 1);
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", "/project/alpha", 0),
+            None
+        );
+        engine.push_reservation_event(ReservationEvent {
+            kind: ReservationEventKind::Released,
+            agent: "BlueLake".to_string(),
+            project: "/project/alpha".to_string(),
+            timestamp_micros: 20,
+        });
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", "/project/alpha", 0),
+            None,
+            "out-of-order evidence at the forgetting floor stays inconclusive"
+        );
+        engine.note_reservation_released("BlueLake", &[], "/project/alpha", 40);
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", "/project/alpha", 0),
+            Some(ReservationEventKind::Released),
+            "strictly newer evidence can resolve an experience again"
+        );
+    }
+
+    #[test]
+    fn reservation_outcome_timestamp_disagreement_survives_ring_eviction() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.note_reservation_released("BlueLake", &[], "/project/alpha", 10);
+        engine.note_reservation_renewed("bluelake", &[], "/project/alpha", 10);
+        for evict in [false, true] {
+            if evict {
+                for timestamp in 0..MAX_RESERVATION_EVENT_LOG {
+                    engine.note_reservation_granted(
+                        "OtherAgent",
+                        &[],
+                        false,
+                        "/project/other",
+                        20 + i64::try_from(timestamp).unwrap(),
+                    );
+                }
+            }
+            assert_eq!(
+                engine.reservation_outcome_for_agent("BLUELAKE", "/project/alpha", 0),
+                None,
+                "the clock cannot order different outcomes at the same timestamp"
+            );
+        }
+        engine.note_reservation_released("BlueLake", &[], "/project/alpha", 11);
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", "/project/alpha", 0),
+            Some(ReservationEventKind::Released)
+        );
+    }
+
+    #[test]
+    fn reservation_outcome_alias_disagreement_is_not_hash_iteration_dependent() {
+        let mut engine = AtcEngine::new_for_testing();
+        let project = "/tmp/atc-outcome-alias";
+        let slug = mcp_agent_mail_db::queries::generate_slug(project);
+        engine.note_reservation_released("BlueLake", &[], project, 10);
+        engine.note_reservation_renewed("BlueLake", &[], &slug, 10);
+        for query in [project, slug.as_str()] {
+            assert_eq!(
+                engine.reservation_outcome_for_agent("BlueLake", query, 0),
+                None,
+                "conflicting human-key/slug evidence must remain ambiguous"
+            );
+        }
+        engine.note_reservation_released("BlueLake", &[], project, 11);
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", &slug, 0),
+            Some(ReservationEventKind::Released)
+        );
+    }
+
+    #[test]
+    fn invalid_reservation_outcome_identities_do_not_consume_retention() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.reservation_last_outcome = BoundedOutcomes::new(1);
+        engine.note_reservation_released("BlueLake", &[], "/project/alpha", 10);
+        for (agent, project) in [("", "/project/alpha"), ("BlueLake", "   ")] {
+            engine.push_reservation_event(ReservationEvent {
+                kind: ReservationEventKind::Conflicted,
+                agent: agent.to_string(),
+                project: project.to_string(),
+                timestamp_micros: 20,
+            });
+        }
+        assert_eq!(engine.reservation_last_outcome.len(), 1);
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", "/project/alpha", 0),
+            Some(ReservationEventKind::Released)
+        );
+        assert_eq!(
+            engine.reservation_outcome_for_agent("", "/project/alpha", 0),
+            None
+        );
+        assert_eq!(
+            engine.reservation_outcome_for_agent("BlueLake", "", 0),
+            None
+        );
     }
 
     #[test]
@@ -10212,6 +11945,7 @@ impl AtcEngine {
             cusum_threshold: config.atc_cusum_threshold,
             cusum_delta: config.atc_cusum_delta,
             ledger_capacity: config.atc_ledger_capacity,
+            max_tracked_agents: mcp_agent_mail_core::config::atc_population_limit(),
             tick_budget_micros: 5_000,
             suspicion_k: config.atc_suspicion_k,
         }
@@ -10269,6 +12003,34 @@ pub fn atc_enabled() -> bool {
         .is_some_and(|e| e.enabled())
 }
 
+/// Recheck mandatory coverage before admitting a queued reservation release.
+///
+/// A capacity refusal completed before this check invalidates release authority
+/// even if the effect was planned earlier. The engine lock is released before
+/// runtime work begins. Optional policy fallback remains a planning decision;
+/// unavailable or incomplete agent/conflict coverage always refuses execution
+/// admission, independently of the policy's optional fallback guard.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn atc_release_capacity_admission() -> Result<(), &'static str> {
+    release_capacity_admission_from_engine(ATC_ENGINE.get())
+}
+
+fn release_capacity_admission_from_engine(
+    engine_lock: Option<&Mutex<AtcEngine>>,
+) -> Result<(), &'static str> {
+    let engine_lock = engine_lock.ok_or("agent_coverage_unavailable")?;
+    let engine = engine_lock
+        .lock()
+        .map_err(|_| "agent_coverage_unavailable")?;
+    if !engine.enabled() {
+        return Err("agent_coverage_unavailable");
+    }
+    if let Some(reason) = engine.capacity_guard_reason() {
+        return Err(reason);
+    }
+    Ok(())
+}
+
 /// Record an agent registration in the ATC.
 pub fn atc_register_agent(name: &str, program: &str) {
     atc_register_agent_with_project(name, program, None);
@@ -10285,15 +12047,8 @@ pub fn atc_register_agent_with_project(name: &str, program: &str, project_key: O
     if !e.enabled() {
         return;
     }
-    let base_k = e.config.suspicion_k;
-    e.register_agent(name, program, project_key);
-    drop(e);
-
-    if let Some(thresholds) = ATC_THRESHOLDS.get()
-        && let Ok(mut t) = thresholds.lock()
-    {
-        t.entry(name.to_string())
-            .or_insert_with(|| AdaptiveThreshold::new(base_k));
+    if e.register_agent(name, program, project_key) {
+        e.ensure_adaptive_threshold(name);
     }
 }
 
@@ -10308,7 +12063,7 @@ pub fn atc_observe_activity_with_project(
     project_key: Option<&str>,
     timestamp_micros: i64,
 ) {
-    if agent.trim().is_empty() {
+    if agent.trim().is_empty() || agent == ATC_AGENT_NAME || timestamp_micros <= 0 {
         return;
     }
     let Some(engine) = ATC_ENGINE.get() else {
@@ -10320,26 +12075,15 @@ pub fn atc_observe_activity_with_project(
     if !e.enabled() {
         return;
     }
-    let base_k = e.config.suspicion_k;
     if !e.agents.contains_key(agent) {
         // Tool-call activity frequently arrives after ATC startup for agents
         // that were registered in a previous process lifetime. Auto-register
         // unknown agents so liveness tracking can start from the first signal.
-        e.register_agent(agent, "unknown-tool", project_key);
+        if !e.register_agent(agent, "unknown-tool", project_key) {
+            return;
+        }
     }
-    drop(e);
-    if let Some(thresholds) = ATC_THRESHOLDS.get()
-        && let Ok(mut t) = thresholds.lock()
-    {
-        t.entry(agent.to_string())
-            .or_insert_with(|| AdaptiveThreshold::new(base_k));
-    }
-    let Some(engine) = ATC_ENGINE.get() else {
-        return;
-    };
-    let Ok(mut e) = engine.lock() else {
-        return;
-    };
+    e.ensure_adaptive_threshold(agent);
     e.observe_activity(agent, project_key, timestamp_micros);
 }
 
@@ -10365,7 +12109,6 @@ pub fn atc_sync_agent_snapshot(
     if !e.enabled() {
         return;
     }
-    let base_k = e.config.suspicion_k;
     let program = if program.trim().is_empty() {
         "unknown-tool"
     } else {
@@ -10385,16 +12128,12 @@ pub fn atc_sync_agent_snapshot(
         return;
     }
     let prior_last_activity = prior.map_or(0, |(prior_ts, _, _)| prior_ts);
-    e.register_agent(name, program, project_key);
+    if !e.register_agent(name, program, project_key) {
+        return;
+    }
+    e.ensure_adaptive_threshold(name);
     if last_activity_ts > prior_last_activity {
         e.observe_activity(name, project_key, last_activity_ts);
-    }
-    drop(e);
-    if let Some(thresholds) = ATC_THRESHOLDS.get()
-        && let Ok(mut thresholds) = thresholds.lock()
-        && !thresholds.contains_key(name)
-    {
-        thresholds.insert(name.to_string(), AdaptiveThreshold::new(base_k));
     }
 }
 
@@ -10414,6 +12153,10 @@ pub struct AtcPopulationSyncStats {
 /// seconds at the operator's 250ms floor while leaving ample headroom for
 /// probes, deadlock advisories, and HTTP/MCP work.
 const MAX_LIVENESS_REVIEWS_PER_TICK: usize = 8;
+
+/// Includes stale versions and duplicates, not just completed reviews. Heap
+/// memory is separately bounded; this cap limits cleanup work in one tick.
+const MAX_LIVENESS_SCHEDULE_POPS_PER_TICK: usize = 64;
 
 /// Hydrate the ATC engine from the durable DB snapshot.
 ///
@@ -10745,16 +12488,6 @@ pub fn atc_note_reservation_conflicts(
     if !e.enabled() {
         return;
     }
-    let conflicts: Vec<(String, String, String)> = conflicts
-        .iter()
-        .map(|conflict| {
-            (
-                conflict.holder.clone(),
-                conflict.requested_path.clone(),
-                conflict.holder_path_pattern.clone(),
-            )
-        })
-        .collect();
     if mode.is_shadow() {
         mcp_agent_mail_core::global_metrics()
             .atc
@@ -10770,6 +12503,18 @@ pub fn atc_note_reservation_conflicts(
         );
         return;
     }
+    // Borrow input detail so rejected oversized patterns are never cloned on
+    // their way to bounded admission. Shadow mode allocates no projection.
+    let conflicts: Vec<(&str, &str, &str)> = conflicts
+        .iter()
+        .map(|conflict| {
+            (
+                conflict.holder.as_str(),
+                conflict.requested_path.as_str(),
+                conflict.holder_path_pattern.as_str(),
+            )
+        })
+        .collect();
     e.note_reservation_conflicts(requester, project, &conflicts, timestamp_micros);
 }
 
@@ -11087,7 +12832,10 @@ pub fn atc_record_outcome(
     if let Some(engine_lock) = ATC_ENGINE.get()
         && let Ok(mut engine) = engine_lock.lock()
     {
-        engine.eprocess.update(correct, subsystem, agent);
+        // Outcomes for unknown/refused identities still inform aggregate safety,
+        // but cannot bypass population admission by allocating per-agent state.
+        let tracked_agent = agent.filter(|name| engine.agents.contains_key(*name));
+        engine.eprocess.update(correct, subsystem, tracked_agent);
         let now = mcp_agent_mail_core::timestamps::now_micros();
         engine.cusum.update(!correct, now);
 
@@ -11248,15 +12996,17 @@ impl ExecutionPosture {
     }
 }
 
-/// How complete the snapshot is. A `Full` snapshot reads all maintained
-/// statistics; `Partial` indicates some subsystem locks were contended;
+/// How complete the snapshot is.
+///
+/// A `Full` snapshot reads all maintained
+/// statistics; `Partial` indicates unavailable data or incomplete agent/conflict coverage;
 /// `Fallback` means only cached/stale data was available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotCompleteness {
     /// All subsystem data was freshly read.
     Full,
-    /// Some subsystem data was unavailable; snapshot is best-effort.
+    /// Some subsystem data, agent identities, or conflict evidence could not be retained.
     Partial,
     /// Only cached/stale data was used (lock contention or startup).
     Fallback,
@@ -11325,6 +13075,8 @@ pub struct AtcSummarySnapshot {
 
     // ── agent liveness (operator-facing, deterministic order) ────────
     pub tracked_agents: Vec<AgentStateSnapshot>,
+    /// Observed cycles in retained conflict evidence. If conflict coverage is
+    /// incomplete, zero does not certify that the full population is deadlock-free.
     pub deadlock_cycles: usize,
 
     // ── learning state (machine-facing) ──────────────────────────────
@@ -11340,10 +13092,13 @@ pub struct AtcSummarySnapshot {
     pub regret_trend: TrendDirection,
     /// Total decisions recorded in the evidence ledger.
     pub decisions_total: u64,
-    /// Open experiences (decisions awaiting ground-truth feedback).
+    /// Process-local liveness decisions awaiting independent feedback.
     pub experiences_open: usize,
-    /// Resolved experiences (decisions with feedback received).
+    /// Process-local liveness decisions with independent feedback received.
     pub experiences_resolved: u64,
+    /// Process-local liveness decisions expired or superseded without an
+    /// independent outcome. These do not update any learning controller.
+    pub experiences_censored: u64,
 
     // ── calibration & regime (operator-facing) ───────────────────────
     /// Calibration guard state: consecutive correct predictions toward
@@ -11639,7 +13394,7 @@ mod alien_enhancement_tests {
         }
 
         let mut population = HierarchicalAgentModel::new();
-        engine.absorb_population_snapshot(&mut population);
+        engine.refresh_population_snapshot(&mut population);
 
         let (claude_mean, _) = population.prior_for("claude-code");
         let (codex_mean, _) = population.prior_for("codex-cli");
@@ -11650,6 +13405,159 @@ mod alien_enhancement_tests {
         assert!(
             (codex_mean - 120_000_000.0).abs() < 1.0,
             "codex prior should stay near baseline when cadence matches it: {codex_mean}"
+        );
+    }
+
+    fn population_snapshot_values(population: &HierarchicalAgentModel) -> BTreeMap<&str, [u64; 4]> {
+        population
+            .populations
+            .iter()
+            .map(|(program, stats)| {
+                (
+                    program.as_str(),
+                    [
+                        stats.mean.to_bits(),
+                        stats.variance.to_bits(),
+                        stats.n.to_bits(),
+                        stats.agent_count,
+                    ],
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn engine_population_refresh_counts_each_observed_interval_once() {
+        let mut engine = AtcEngine::new_for_testing();
+        for (name, interval) in [("Quiet", 30_000_000), ("Busy", 90_000_000)] {
+            assert!(engine.register_agent(name, "claude-code", None));
+            // Use explicit priors so unrelated global ATC tests cannot seed
+            // this fixture's local rhythms with a learned population.
+            engine.agents.get_mut(name).unwrap().rhythm = AgentRhythm::new(60.0);
+            for i in 1..=4 {
+                engine.observe_activity(name, None, i * interval);
+            }
+        }
+        assert!(engine.register_agent("Unobserved", "claude-code", None));
+        let mut population = HierarchicalAgentModel::new();
+        engine.refresh_population_snapshot(&mut population);
+        let first = population.clone();
+        let stats = &population.populations["claude-code"];
+        assert_eq!(stats.agent_count, 2, "unobserved agents add no evidence");
+        assert_eq!(stats.n.to_bits(), 9.0_f64.to_bits()); // 3 prior + 3 + 3 intervals
+
+        for _ in 0..100 {
+            engine.refresh_population_snapshot(&mut population);
+            assert_eq!(
+                population_snapshot_values(&population),
+                population_snapshot_values(&first),
+                "an idle population refresh must not manufacture observations"
+            );
+        }
+
+        engine.observe_activity("Busy", None, 450_000_000);
+        engine.refresh_population_snapshot(&mut population);
+        let quiet = &engine.agents["Quiet"].rhythm;
+        let busy = &engine.agents["Busy"].rhythm;
+        assert_eq!((quiet.observation_count, busy.observation_count), (3, 4));
+        let stats = &population.populations["claude-code"];
+        assert_eq!(stats.agent_count, 2);
+        assert_eq!(stats.n.to_bits(), 10.0_f64.to_bits());
+        // Independent pooled-moment oracle: the fixed prior plus the current
+        // three quiet and four busy observations, never the old snapshot too.
+        let expected_mean =
+            (3.0 * 60_000_000.0 + 3.0 * quiet.avg_interval + 4.0 * busy.avg_interval) / 10.0;
+        let expected_variance = (3.0 * (30_000_000.0_f64.powi(2) + 60_000_000.0_f64.powi(2))
+            + 3.0 * (quiet.var_interval + quiet.avg_interval.powi(2))
+            + 4.0 * (busy.var_interval + busy.avg_interval.powi(2)))
+            / 10.0
+            - expected_mean.powi(2);
+        assert!((stats.mean - expected_mean).abs() < 1.0);
+        assert!((stats.variance - expected_variance).abs() < expected_variance * 1e-12);
+        let updated = population.clone();
+        engine.observe_activity("Busy", None, 450_000_000); // replayed activity
+        engine.observe_activity("Busy", None, 440_000_000); // stale activity
+        for _ in 0..100 {
+            engine.refresh_population_snapshot(&mut population);
+            assert_eq!(
+                population_snapshot_values(&population),
+                population_snapshot_values(&updated)
+            );
+        }
+    }
+
+    #[test]
+    fn engine_population_refresh_replaces_changed_program_and_reset_rhythm() {
+        let mut engine = AtcEngine::new_for_testing();
+        assert!(engine.register_agent("Agent", "claude-code", None));
+        engine.agents.get_mut("Agent").unwrap().rhythm = AgentRhythm::new(60.0);
+        for i in 1..=6 {
+            engine.observe_activity("Agent", None, i * 30_000_000);
+        }
+        let mut population = HierarchicalAgentModel::new();
+        engine.refresh_population_snapshot(&mut population);
+        assert_eq!(population.populations["claude-code"].agent_count, 1);
+
+        assert!(engine.register_agent("Agent", "codex_cli", None));
+        engine.refresh_population_snapshot(&mut population);
+        let defaults = HierarchicalAgentModel::new();
+        assert_eq!(
+            population_snapshot_values(&population)["claude-code"],
+            population_snapshot_values(&defaults)["claude-code"],
+            "reclassification must not leave stale evidence in the old cohort"
+        );
+        assert_eq!(population.populations["codex-cli"].agent_count, 1);
+        assert_eq!(
+            population.populations["codex-cli"].n.to_bits(),
+            8.0_f64.to_bits()
+        );
+
+        engine.agents.get_mut("Agent").unwrap().rhythm = AgentRhythm::new(120.0);
+        engine.observe_activity("Agent", None, 1_000_000); // anchor, not an interval
+        engine.refresh_population_snapshot(&mut population);
+        assert_eq!(
+            population_snapshot_values(&population),
+            population_snapshot_values(&defaults),
+            "a reset rhythm must not retain its previous lifetime's evidence"
+        );
+    }
+
+    #[test]
+    fn engine_population_refresh_is_independent_of_registration_order() {
+        let cases = [
+            ("Zeta", "claude-code", 17_000_003, 12),
+            ("Alpha", "claude_code", 921_001, 23),
+            ("Mu", "CLAUDE_CODE", 90_123_456, 7),
+            ("Beta", "claude-code", 1_700_900_013, 49),
+        ];
+        let build = |cases: &[(&str, &str, i64, i64)]| {
+            let mut engine = AtcEngine::new_for_testing();
+            for &(name, program, interval, count) in cases {
+                assert!(engine.register_agent(name, program, None));
+                engine.agents.get_mut(name).unwrap().rhythm = AgentRhythm::new(60.0);
+                for i in 1..=count {
+                    engine.observe_activity(name, None, i * interval);
+                }
+            }
+            engine
+        };
+        let mut forward = build(&cases);
+        let mut reverse_cases = cases;
+        reverse_cases.reverse();
+        let mut reverse = build(&reverse_cases);
+        let mut forward_population = HierarchicalAgentModel::new();
+        let mut reverse_population = HierarchicalAgentModel::new();
+        forward.refresh_population_snapshot(&mut forward_population);
+        reverse.refresh_population_snapshot(&mut reverse_population);
+        assert_eq!(
+            population_snapshot_values(&forward_population),
+            population_snapshot_values(&reverse_population),
+            "equivalent agent histories must produce bit-identical population priors"
+        );
+        assert_eq!(forward_population.populations["claude-code"].agent_count, 4);
+        assert_eq!(
+            forward_population.populations["claude-code"].n.to_bits(),
+            90.0_f64.to_bits()
         );
     }
 
@@ -11842,6 +13750,114 @@ mod alien_enhancement_tests {
         let atc_config = AtcEngine::config_from_env(&config);
         assert!(atc_config.enabled);
         assert_eq!(atc_config.probe_interval_micros, 120_000_000);
+    }
+
+    #[test]
+    fn liveness_capacity_uses_the_population_limit_override() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_POPULATION_LIMIT", "7")],
+            || {
+                let config = mcp_agent_mail_core::Config::default();
+                assert_eq!(AtcEngine::config_from_env(&config).max_tracked_agents, 7);
+            },
+        );
+    }
+
+    #[test]
+    fn global_liveness_capacity_bounds_all_admission_paths_and_thresholds() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        reset_global_atc_state_for_test(&config);
+        let engine_lock = ATC_ENGINE.get().expect("engine initialized");
+        *engine_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = AtcEngine::new(AtcConfig {
+            max_tracked_agents: 3,
+            ..AtcConfig::default()
+        });
+
+        for name in ["", " \t ", ATC_AGENT_NAME] {
+            atc_register_agent(name, "claude-code");
+            atc_observe_activity(name, 1_000_000);
+            atc_sync_agent_snapshot(name, "claude-code", None, 1_000_000);
+        }
+        let initial = atc_summary().expect("initial summary");
+        assert!(initial.tracked_agents.is_empty());
+        assert_eq!(initial.kernel.max_tracked_agents, 3);
+        assert_eq!(initial.kernel.agent_capacity_refusals, 0);
+        assert_eq!(initial.completeness, SnapshotCompleteness::Full);
+        assert!(ATC_THRESHOLDS.get().unwrap().lock().unwrap().is_empty());
+
+        atc_register_agent("Registered", "claude-code");
+        atc_observe_activity("Observed", 1_000_000);
+        atc_sync_agent_snapshot("Synced", "codex-cli", Some("/project"), 1_000_000);
+        assert_eq!(
+            atc_summary().unwrap().completeness,
+            SnapshotCompleteness::Full
+        );
+        for index in 0..128 {
+            let refused = format!("Refused{index}");
+            atc_register_agent(&refused, "claude-code");
+            atc_observe_activity(&refused, 2_000_000);
+            atc_sync_agent_snapshot(&refused, "codex-cli", None, 2_000_000);
+        }
+        for name in ["", " \t ", ATC_AGENT_NAME] {
+            atc_register_agent(name, "claude-code");
+            atc_observe_activity(name, 2_000_000);
+            atc_sync_agent_snapshot(name, "claude-code", None, 2_000_000);
+        }
+        atc_observe_activity("InvalidTimestamp", 0);
+        atc_sync_agent_snapshot("Registered", "codex-cli", Some("/new"), 3_000_000);
+        atc_observe_activity("Observed", 4_000_000);
+        atc_register_agent("Synced", "claude-code");
+
+        let summary = atc_summary().expect("live summary before any tick");
+        assert_eq!(summary.completeness, SnapshotCompleteness::Partial);
+        assert_eq!(summary.execution_posture, ExecutionPosture::Cautious);
+        assert_eq!(summary.kernel.tracked_agents, 3);
+        assert_eq!(summary.kernel.max_tracked_agents, 3);
+        assert_eq!(summary.kernel.agent_capacity_refusals, 384);
+        assert!(summary.kernel.agent_coverage_incomplete);
+        assert!(summary.policy.fallback_active);
+        assert_eq!(
+            summary.policy.fallback_reason.as_deref(),
+            Some("agent_capacity")
+        );
+        {
+            let engine = engine_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(engine.agents.len(), 3);
+            assert_eq!(engine.agents["Registered"].program, "codex-cli");
+            assert_eq!(
+                engine.agents["Registered"].rhythm.last_activity_ts,
+                3_000_000
+            );
+            assert_eq!(engine.agents["Observed"].rhythm.last_activity_ts, 4_000_000);
+            assert_eq!(engine.agents["Synced"].program, "claude-code");
+            assert!(engine.pending_liveness_feedback.is_empty());
+            assert_eq!(engine.resolved_experience_count, 0);
+            let thresholds = ATC_THRESHOLDS.get().unwrap().lock().unwrap();
+            assert_eq!(thresholds.len(), 3);
+            assert!(
+                engine
+                    .agents
+                    .keys()
+                    .all(|name| thresholds.contains_key(name))
+            );
+        }
+
+        reset_global_atc_state_for_test(&config);
+        let reset = atc_summary().expect("reset summary");
+        assert_eq!(reset.completeness, SnapshotCompleteness::Full);
+        assert!(!reset.kernel.agent_coverage_incomplete);
+        assert_eq!(reset.kernel.agent_capacity_refusals, 0);
+        assert!(ATC_THRESHOLDS.get().unwrap().lock().unwrap().is_empty());
     }
 
     #[test]
@@ -12074,6 +14090,183 @@ mod alien_enhancement_tests {
         }
 
         assert_eq!(reviewed.len(), POPULATION);
+    }
+
+    #[test]
+    fn policy_dirty_reviews_progress_under_continuously_due_work() {
+        let mut engine = AtcEngine::new_for_testing();
+        let now_micros = 42_000_000;
+        for index in 0..MAX_LIVENESS_REVIEWS_PER_TICK {
+            let agent = format!("Scheduled{index:04}");
+            engine.register_agent(&agent, "codex-cli", None);
+            engine.schedule_entry_for_push(&agent, now_micros);
+        }
+        let policy_agents: Vec<_> = (0..12).map(|index| format!("Policy{index:04}")).collect();
+        for agent in &policy_agents {
+            engine.register_agent(agent, "codex-cli", None);
+            engine.dirty_agents.insert(agent.clone());
+        }
+
+        let mut policy_reviews = Vec::new();
+        let mut scheduled_reviews = HashSet::new();
+        for _ in 0..3 {
+            let due = engine.pop_due_agents(now_micros, MAX_LIVENESS_REVIEWS_PER_TICK);
+            assert_eq!(due.len(), MAX_LIVENESS_REVIEWS_PER_TICK);
+            assert_eq!(due.iter().collect::<HashSet<_>>().len(), due.len());
+            let before = policy_reviews.len();
+            for agent in due {
+                if agent.starts_with("Scheduled") {
+                    scheduled_reviews.insert(agent.clone());
+                    // Keep real scheduler work overdue on every pass. Simply
+                    // draining a fixed heap cannot expose queue starvation.
+                    engine.schedule_entry_for_push(&agent, now_micros);
+                } else {
+                    policy_reviews.push(agent);
+                }
+            }
+            assert_eq!(
+                policy_reviews.len() - before,
+                MAX_LIVENESS_REVIEWS_PER_TICK / 2
+            );
+        }
+        assert_eq!(
+            policy_reviews, policy_agents,
+            "retain policy queue ordering"
+        );
+        assert_eq!(scheduled_reviews.len(), MAX_LIVENESS_REVIEWS_PER_TICK);
+        assert!(engine.dirty_agents.is_empty());
+    }
+
+    #[test]
+    fn one_review_budget_alternates_between_ready_queues() {
+        let mut engine = AtcEngine::new_for_testing();
+        for agent in ["Scheduled", "PolicyA", "PolicyB"] {
+            engine.register_agent(agent, "codex-cli", None);
+        }
+        engine.schedule_entry_for_push("Scheduled", 1);
+        engine
+            .dirty_agents
+            .extend(["PolicyA".to_string(), "PolicyB".to_string()]);
+
+        for expected in ["Scheduled", "PolicyA", "Scheduled", "PolicyB"] {
+            let dirty_before = engine.dirty_agents.clone();
+            let heap_before = engine.liveness_schedule.len();
+            let turn_before = engine.dirty_review_next;
+            assert_eq!(engine.pop_due_agents(1, 0), [] as [String; 0]);
+            assert_eq!(engine.dirty_agents, dirty_before);
+            assert_eq!(engine.liveness_schedule.len(), heap_before);
+            assert_eq!(engine.dirty_review_next, turn_before);
+
+            assert_eq!(engine.pop_due_agents(1, 1), vec![expected]);
+            if expected == "Scheduled" {
+                engine.schedule_entry_for_push(expected, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn policy_and_timed_review_of_the_same_agent_is_not_duplicated() {
+        let mut engine = AtcEngine::new_for_testing();
+        for agent in ["AgentA", "AgentB", "AgentC"] {
+            engine.register_agent(agent, "codex-cli", None);
+            engine.schedule_entry_for_push(agent, 1);
+        }
+        engine.mark_agents_dirty();
+        let due = engine.pop_due_agents(1, MAX_LIVENESS_REVIEWS_PER_TICK);
+        assert_eq!(due, vec!["AgentA", "AgentB", "AgentC"]);
+        assert!(engine.dirty_agents.is_empty());
+        assert!(engine.liveness_schedule.is_empty());
+        assert_eq!(
+            engine.pop_due_agents(1, MAX_LIVENESS_REVIEWS_PER_TICK),
+            [] as [String; 0]
+        );
+    }
+
+    #[test]
+    fn stale_schedule_cleanup_yields_and_keeps_a_due_resume_deadline() {
+        const POPULATION: usize = 940;
+        let mut engine = AtcEngine::new_for_testing();
+        for index in 0..POPULATION {
+            let agent = format!("Rescheduled{index:04}");
+            engine.register_agent(&agent, "codex-cli", None);
+            // These are active, recently probed agents. Otherwise the full
+            // tick legitimately selects never-probed identities and replaces
+            // their artificial deadlines while this test counts heap pops.
+            let entry = engine.agents.get_mut(&agent).expect("registered agent");
+            entry.rhythm.observe(1);
+            entry.probe_sent_at = 1;
+            // Use the production reschedule path to retain two obsolete
+            // versions ahead of the actual future review for each identity.
+            engine.schedule_entry_for_push(&agent, 1);
+            engine.schedule_entry_for_push(&agent, 2);
+            engine.schedule_entry_for_push(&agent, 1_000_000);
+        }
+        let original_entries = engine.liveness_schedule.len();
+        assert_eq!(original_entries, POPULATION * 3);
+
+        let now_micros = 3;
+        let report = engine.run_tick(now_micros);
+        assert!(engine.agents.values().all(|entry| entry.probe_sent_at == 1));
+        assert_eq!(report.summary.kernel.due_agents, 0);
+        assert_eq!(report.summary.kernel.scheduled_agents, POPULATION);
+        assert_eq!(
+            original_entries - engine.liveness_schedule.len(),
+            MAX_LIVENESS_SCHEDULE_POPS_PER_TICK,
+            "a tick must bound stale work as well as completed reviews"
+        );
+        assert!(
+            report
+                .summary
+                .kernel
+                .next_due_micros
+                .is_some_and(|due| due <= now_micros)
+        );
+
+        let remaining_entries = engine.liveness_schedule.len();
+        for _ in 0..100 {
+            assert!(
+                engine
+                    .next_scheduled_review_micros()
+                    .is_some_and(|due| due <= now_micros)
+            );
+        }
+        assert_eq!(
+            engine.liveness_schedule.len(),
+            remaining_entries,
+            "health/deadline observation must not drain deferred cleanup"
+        );
+
+        let mut passes = 1;
+        while engine.liveness_schedule.len() > POPULATION {
+            let before = engine.liveness_schedule.len();
+            assert_eq!(
+                engine.pop_due_agents(now_micros, MAX_LIVENESS_REVIEWS_PER_TICK),
+                [] as [String; 0]
+            );
+            let popped = before - engine.liveness_schedule.len();
+            assert!((1..=MAX_LIVENESS_SCHEDULE_POPS_PER_TICK).contains(&popped));
+            passes += 1;
+            assert!(passes <= (POPULATION * 2).div_ceil(MAX_LIVENESS_SCHEDULE_POPS_PER_TICK));
+        }
+        assert_eq!(engine.next_scheduled_review_micros(), Some(1_000_000));
+        assert_eq!(engine.scheduled_agent_count(), POPULATION);
+
+        let mut reviewed = HashSet::new();
+        while !engine.liveness_schedule.is_empty() {
+            let due = engine.pop_due_agents(1_000_000, MAX_LIVENESS_REVIEWS_PER_TICK);
+            assert_ne!(due, [] as [String; 0]);
+            for agent in due {
+                assert!(
+                    reviewed.insert(agent),
+                    "cleanup must not duplicate valid work"
+                );
+            }
+        }
+        assert_eq!(
+            reviewed.len(),
+            POPULATION,
+            "cleanup must preserve every valid review"
+        );
     }
 
     #[test]
@@ -12314,6 +14507,48 @@ mod alien_enhancement_tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn unknown_outcome_identities_do_not_grow_per_agent_calibration() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config {
+            atc_enabled: true,
+            ..Default::default()
+        };
+        reset_global_atc_state_for_test(&config);
+        atc_register_agent("Tracked", "codex-cli");
+        atc_record_outcome(AtcSubsystem::Liveness, Some("Tracked"), 1.0, 100.0, false);
+        for index in 0..1_000 {
+            atc_record_outcome(
+                AtcSubsystem::Liveness,
+                Some(&format!("Untracked{index}")),
+                1.0,
+                100.0,
+                false,
+            );
+        }
+        atc_record_outcome(
+            AtcSubsystem::Liveness,
+            Some(&"x".repeat(ATC_POPULATION_MAX_NAME_BYTES + 1)),
+            1.0,
+            100.0,
+            false,
+        );
+        let engine = ATC_ENGINE.get().unwrap().lock().unwrap();
+        assert_eq!(engine.agents.len(), 1);
+        assert_eq!(engine.eprocess.per_agent.len(), 1);
+        assert!(engine.eprocess.per_agent.contains_key("Tracked"));
+        assert_eq!(ATC_THRESHOLDS.get().unwrap().lock().unwrap().len(), 1);
+        assert!(engine.eprocess.miscalibrated());
+        assert!(
+            engine.calibration.is_safe_mode(),
+            "refused per-agent detail must not discard aggregate safety evidence"
+        );
+        drop(engine);
+        reset_global_atc_state_for_test(&config);
     }
 
     #[test]

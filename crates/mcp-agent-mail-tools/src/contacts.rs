@@ -16,8 +16,8 @@ use crate::messaging::{
     enqueue_agent_semantic_index, enqueue_message_semantic_index, try_write_message_archive,
 };
 use crate::tool_util::{
-    db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool, get_db_pool, legacy_tool_error,
-    resolve_agent, resolve_existing_project, resolve_project, tool_error_code,
+    db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool, get_db_pool_for_request,
+    legacy_tool_error, resolve_agent, resolve_existing_project, resolve_project, tool_error_code,
 };
 
 /// Contact link state (tool-facing).
@@ -91,12 +91,27 @@ pub struct RespondContactResponse {
 /// Valid contact policy values.
 pub const VALID_CONTACT_POLICIES: &[&str] = &["open", "auto", "contacts_only", "block_all"];
 
-/// Contact links are authorization state. Retired identities must not create,
-/// approve, block, or refresh that state until they are explicitly unretired.
+/// Contact links are authorization state. Inactive identities must not create,
+/// approve, block, or refresh that state.
 fn require_active_contact_participant(
     agent: &mcp_agent_mail_db::AgentRow,
     role: &'static str,
 ) -> McpResult<()> {
+    // Imported Python tombstones need not also carry retired_at. Transaction
+    // admission separately checks the authoritative deregistration ledger.
+    if mcp_agent_mail_db::models::task_description_uses_reserved_deregistered_prefix(
+        &agent.task_description,
+    ) {
+        return Err(legacy_tool_error(
+            "AGENT_DEREGISTERED",
+            format!(
+                "{role} agent {} is deregistered and cannot change contact authorization",
+                agent.name
+            ),
+            false,
+            serde_json::json!({ "agent": agent.name, "role": role }),
+        ));
+    }
     if let Some(retired_at) = agent.retired_at {
         return Err(legacy_tool_error(
             "AGENT_RETIRED",
@@ -406,7 +421,7 @@ pub(crate) async fn request_contact_with_intro(
         Some(resolve_existing_project(ctx, &read_pool, &project_key).await?)
     };
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
 
     let project = if existing_source_project.is_some() {
         resolve_existing_project(ctx, &pool, &project_key).await?
@@ -625,7 +640,7 @@ pub(crate) async fn send_contact_approved_notice(
     target_project_key: &str,
     target_agent: &str,
 ) -> McpResult<()> {
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let source_project = resolve_project(ctx, &pool, source_project_key).await?;
     let target_project = resolve_project(ctx, &pool, target_project_key).await?;
     let from_row = resolve_agent(
@@ -698,12 +713,66 @@ pub async fn respond_contact(
     accept: bool,
     ttl_seconds: Option<i64>,
 ) -> McpResult<String> {
+    respond_contact_with_mode(
+        ctx,
+        project_key,
+        to_agent,
+        from_agent,
+        from_project,
+        ContactResponseMode::Explicit { accept },
+        ttl_seconds,
+    )
+    .await
+}
+
+/// The handshake has already requested contact, but only the recipient's
+/// explicit decision may lift a block committed before automatic approval.
+pub(crate) async fn approve_contact_unless_blocked(
+    ctx: &McpContext,
+    project_key: String,
+    to_agent: String,
+    from_agent: String,
+    from_project: Option<String>,
+    ttl_seconds: Option<i64>,
+) -> McpResult<String> {
+    respond_contact_with_mode(
+        ctx,
+        project_key,
+        to_agent,
+        from_agent,
+        from_project,
+        ContactResponseMode::Automatic,
+        ttl_seconds,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ContactResponseMode {
+    Explicit { accept: bool },
+    Automatic,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn respond_contact_with_mode(
+    ctx: &McpContext,
+    project_key: String,
+    to_agent: String,
+    from_agent: String,
+    from_project: Option<String>,
+    mode: ContactResponseMode,
+    ttl_seconds: Option<i64>,
+) -> McpResult<String> {
+    let accept = match mode {
+        ContactResponseMode::Explicit { accept } => accept,
+        ContactResponseMode::Automatic => true,
+    };
     // Normalize names
     let to_agent = mcp_agent_mail_core::models::normalize_agent_name(&to_agent).unwrap_or(to_agent);
     let from_agent =
         mcp_agent_mail_core::models::normalize_agent_name(&from_agent).unwrap_or(from_agent);
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
 
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
@@ -753,17 +822,33 @@ pub async fn respond_contact(
         }
         _ => 2_592_000, // 30 days default
     };
-    let respond_out = mcp_agent_mail_db::queries::respond_contact(
-        ctx.cx(),
-        &pool,
-        source_project_id,
-        from_row.id.unwrap_or(0),
-        project_id,
-        to_row.id.unwrap_or(0),
-        accept,
-        ttl,
-    )
-    .await;
+    let respond_out = match mode {
+        ContactResponseMode::Explicit { accept } => {
+            mcp_agent_mail_db::queries::respond_contact(
+                ctx.cx(),
+                &pool,
+                source_project_id,
+                from_row.id.unwrap_or(0),
+                project_id,
+                to_row.id.unwrap_or(0),
+                accept,
+                ttl,
+            )
+            .await
+        }
+        ContactResponseMode::Automatic => {
+            mcp_agent_mail_db::queries::approve_contact_unless_blocked(
+                ctx.cx(),
+                &pool,
+                source_project_id,
+                from_row.id.unwrap_or(0),
+                project_id,
+                to_row.id.unwrap_or(0),
+                ttl,
+            )
+            .await
+        }
+    };
     if let Outcome::Err(ref err) = respond_out {
         tracing::error!(
             from_agent = %from_agent,
@@ -802,7 +887,7 @@ pub async fn respond_contact(
     let response = RespondContactResponse {
         from: from_agent,
         to: to_agent,
-        approved: accept,
+        approved: link_row.status.eq_ignore_ascii_case("approved"),
         expires_ts: link_row.expires_ts.map(micros_to_iso),
         updated,
     };
@@ -957,7 +1042,7 @@ pub async fn set_contact_policy(
     let agent_name =
         mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
@@ -1003,6 +1088,33 @@ pub async fn set_contact_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contact_lifecycle_rejects_retirement_and_imported_deregistration() {
+        let mut agent = mcp_agent_mail_db::AgentRow {
+            id: Some(81),
+            project_id: 71,
+            name: "BlueLake".into(),
+            ..Default::default()
+        };
+        for role in ["requester", "target", "recipient"] {
+            require_active_contact_participant(&agent, role).unwrap();
+        }
+        agent.retired_at = Some(5_000_000);
+        for role in ["requester", "target", "recipient"] {
+            let error = require_active_contact_participant(&agent, role).unwrap_err();
+            assert_eq!(tool_error_code(&error), Some("AGENT_RETIRED"));
+        }
+        for retired_at in [None, Some(5_000_000)] {
+            agent.retired_at = retired_at;
+            agent.task_description =
+                "[DEREGISTERED at 2026-10-01 00:00:00] imported identity".into();
+            for role in ["requester", "target", "recipient"] {
+                let error = require_active_contact_participant(&agent, role).unwrap_err();
+                assert_eq!(tool_error_code(&error), Some("AGENT_DEREGISTERED"));
+            }
+        }
+    }
 
     // ── normalize_contact_policy ──
 

@@ -47,15 +47,19 @@ const MAX_RETRY_IDS: usize = 1024;
 const MAX_RETRIES_PER_PASS: usize = 16;
 const MAX_IDS_PER_PASS: usize = 32;
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(60);
+// Yield between messages even when every candidate needs the guarded slow
+// path. A filesystem or Git call is not preemptible, so this is a cooperative
+// turn budget, not a hard deadline on an individual repair.
+const MAX_BATCH_TURN: Duration = Duration::from_secs(1);
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct DeferredRetry {
     id: i64,
     attempts: u32,
     ready_at: Instant,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct StartupTail {
     after: i64,
     ceiling: i64,
@@ -97,6 +101,18 @@ impl ReconcileFailure {
             optimistic_observation_changed: true,
         }
     }
+
+    fn optimistic_stamp_unavailable(error: crate::StorageError) -> Self {
+        // The stamp is only an optimization for reporting an unchanged
+        // bundle. A busy index writer or local mutation denies that
+        // observation, not the existing guarded repair protocol. Repeatedly
+        // retaining healthy IDs here can fill the retry lane and starve the
+        // unvisited crash window (GH#374). Keep every other error fail-closed.
+        let unavailable = matches!(error, crate::StorageError::LockContention { .. });
+        let mut failure = Self::from(error);
+        failure.optimistic_observation_changed = unavailable;
+        failure
+    }
 }
 
 impl From<String> for ReconcileFailure {
@@ -125,7 +141,8 @@ impl From<crate::StorageError> for ReconcileFailure {
         ) || matches!(&error, crate::StorageError::Io(error)
             if matches!(error.kind(),
                 ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::ResourceBusy
-                    | ErrorKind::StorageFull | ErrorKind::QuotaExceeded | ErrorKind::OutOfMemory));
+                    | ErrorKind::StorageFull | ErrorKind::QuotaExceeded | ErrorKind::OutOfMemory)
+                || crate::recovery::is_file_descriptor_exhaustion(error));
         Self {
             detail: error.to_string(),
             transient,
@@ -139,7 +156,7 @@ impl From<crate::StorageError> for ReconcileFailure {
 /// Cursors are only hints: restarting or wrapping always safely checks again.
 /// The startup-aware worker cursor checkpoints its hints; `Default` remains
 /// in-memory for independent one-shot scans and callers without a startup anchor.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ReconcileCursor {
     source_identity: String,
     tail_after: Option<i64>,
@@ -174,6 +191,14 @@ pub struct ReconcileCursor {
     // A failed checkpoint must not replace newer in-memory retry debt with
     // an older disk snapshot on the next pass. A successful save clears this.
     checkpoint_dirty: bool,
+    // Independently sampled from the live DB, never restored from a sidecar.
+    // A legacy/unwritable checkpoint cannot detect an in-place generation
+    // change for the process, so bind its in-memory progress as well.
+    checkpoint_database_generation: Option<String>,
+    // Pool cache generations can change without changing the mailbox. Only
+    // this independently captured live binding can authorize carrying hints
+    // across that change; a checkpoint cannot supply this process-local proof.
+    checkpoint_source_binding: Option<checkpoint::Binding>,
 }
 
 impl ReconcileCursor {
@@ -194,6 +219,17 @@ impl ReconcileCursor {
             persist_progress: true,
             ..Self::default()
         }
+    }
+
+    /// Earliest retained retry, not permission to reuse an earlier source read.
+    #[must_use]
+    pub fn next_retry_at(&self) -> Option<Instant> {
+        self.retries.iter().map(|retry| retry.ready_at).min()
+    }
+
+    #[must_use]
+    pub fn has_retry_capacity(&self) -> bool {
+        self.retries.len() < MAX_RETRY_IDS
     }
 
     fn advance(&mut self, id: i64, tail: bool) {
@@ -269,6 +305,8 @@ pub struct ReconcileReport {
     pub deferred_transient: usize,
     pub deferred_conflict: usize,
     pub retry_len: usize,
+    /// A scan watermark advanced, including a page of cooling retry IDs.
+    pub scan_advanced: bool,
     /// Serialized payload bytes admitted to archive work, excluding rejected
     /// oversized projections (whose SQL input has a separate byte bound).
     pub payload_bytes: usize,
@@ -490,21 +528,44 @@ fn select_ids(
             ..Default::default()
         };
     }
-    let conn = outcome(block_on(pool.acquire(cx)))?;
-    let mode = conn
-        .query_sync("PRAGMA query_only", &[])
-        .map_err(source_error)?;
+    // Discovery precedes every per-message retry. Returning its failed pager
+    // to the one-slot maintenance pool can strand the entire retry queue.
+    // Use the same quarantine/panic boundary as payload reads, and publish
+    // scheduling changes only after the complete bounded selection succeeds.
+    let mut pending = cursor.clone();
+    let selected = source::with_source_connection(cx, pool, |conn| {
+        select_ids_from_connection(conn, &mut pending, cutoff)
+    })
+    .map_err(|error| error.detail)?;
+    *cursor = pending;
+    Ok(selected)
+}
+
+fn select_ids_from_connection(
+    conn: &mcp_agent_mail_db::DbConn,
+    cursor: &mut ReconcileCursor,
+    cutoff: i64,
+) -> Result<SelectedIds, ReconcileFailure> {
+    let query = |sql: &str, params: &[mcp_agent_mail_db::sqlmodel_core::Value]| {
+        #[cfg(test)]
+        tests::discovery_read_fault(conn)?;
+        conn.query_sync(sql, params)
+            .map_err(ReconcileFailure::source_unavailable)
+    };
+    let mode = query("PRAGMA query_only", &[])?;
     let query_only = mode
         .first()
         .ok_or_else(|| "source query-only mode was not reported".to_string())?
         .get_as::<i64>(0)
         .map_err(source_error)?;
     if query_only != 0 {
-        return Err("query-only snapshots cannot authorize message archive repair".to_string());
+        return Err(
+            "query-only snapshots cannot authorize message archive repair"
+                .to_string()
+                .into(),
+        );
     }
-    let rows = conn
-        .query_sync("SELECT COALESCE(MAX(id), 0) AS max_id FROM messages", &[])
-        .map_err(source_error)?;
+    let rows = query("SELECT COALESCE(MAX(id), 0) AS max_id FROM messages", &[])?;
     let max_id = rows
         .first()
         .ok_or_else(|| "message ID aggregate returned no row".to_string())?
@@ -523,12 +584,10 @@ fn select_ids(
             && cursor.settled_before_us > 0
             && let Some(after) = cursor.tail_after
         {
-            let rows = conn
-                .query_sync(
-                    "SELECT id FROM messages WHERE id > ? AND created_ts <= ? ORDER BY id DESC LIMIT 1",
-                    &[after.into(), cursor.settled_before_us.into()],
-                )
-                .map_err(source_error)?;
+            let rows = query(
+                "SELECT id FROM messages WHERE id > ? AND created_ts <= ? ORDER BY id DESC LIMIT 1",
+                &[after.into(), cursor.settled_before_us.into()],
+            )?;
             cursor.startup_tail = rows
                 .first()
                 .map(|row| row.get_named::<i64>("id").map_err(source_error))
@@ -546,12 +605,10 @@ fn select_ids(
         // this lane even after its grace expires. Read one bounded ID page
         // and stop at the first unsettled row instead. History and due retries
         // still make independent progress beyond that scheduling barrier.
-        let rows = conn
-            .query_sync(
-                "SELECT id, created_ts FROM messages WHERE id > ? ORDER BY id ASC LIMIT ?",
-                &[after.into(), (IDS_PER_LANE + 1).into()],
-            )
-            .map_err(source_error)?;
+        let rows = query(
+            "SELECT id, created_ts FROM messages WHERE id > ? ORDER BY id ASC LIMIT ?",
+            &[after.into(), (IDS_PER_LANE + 1).into()],
+        )?;
         let mut tail = Vec::with_capacity(rows.len());
         for row in rows {
             if row.get_named::<i64>("created_ts").map_err(source_error)? > cutoff {
@@ -574,21 +631,17 @@ fn select_ids(
         // both reads to the already observed maximum: an older request that
         // commits after the barrier read must remain future forward work, not
         // let this newest page jump over an intervening younger commit.
-        let first_unsettled = conn
-            .query_sync(
+        let first_unsettled = query(
                 "SELECT id FROM messages WHERE id > 0 AND id <= ? AND created_ts > ? ORDER BY id ASC LIMIT 1",
                 &[max_id.into(), cutoff.into()],
-            )
-            .map_err(source_error)?
+            )?
             .first()
             .map(|row| row.get_named::<i64>("id").map_err(source_error))
             .transpose()?;
-        let mut tail = conn
-            .query_sync(
+        let mut tail = query(
                 "SELECT id FROM messages WHERE id > 0 AND id <= ? AND created_ts <= ? ORDER BY id DESC LIMIT ?",
                 &[max_id.into(), cutoff.into(), IDS_PER_LANE.into()],
-            )
-            .map_err(source_error)?
+            )?
             .into_iter()
             .map(|row| row.get_named::<i64>("id").map_err(source_error))
             .collect::<Result<Vec<_>, _>>()?;
@@ -601,16 +654,14 @@ fn select_ids(
         (tail, None)
     };
     tail.sort_unstable();
-    let history = conn
-        .query_sync(
+    let history = query(
             "SELECT id FROM messages WHERE id > 0 AND id <= ? AND created_ts <= ? ORDER BY id DESC LIMIT ?",
             &[
                 cursor.backfill_ceiling.unwrap_or(max_id).into(),
                 cutoff.into(),
                 IDS_PER_LANE.into(),
             ],
-        )
-        .map_err(source_error)?
+        )?
         .into_iter()
         .map(|row| row.get_named::<i64>("id").map_err(source_error))
         .collect::<Result<Vec<_>, _>>()?;
@@ -621,7 +672,7 @@ fn select_ids(
         cursor.startup_backfill_complete = true;
     }
     let startup = if let Some(range) = &cursor.startup_tail {
-        conn.query_sync(
+        query(
             "SELECT id FROM messages WHERE id > ? AND id <= ? AND created_ts <= ? ORDER BY id DESC LIMIT ?",
             &[
                 range.after.into(),
@@ -629,8 +680,7 @@ fn select_ids(
                 cursor.settled_before_us.into(),
                 IDS_PER_LANE.into(),
             ],
-        )
-        .map_err(source_error)?
+        )?
         .into_iter()
         .map(|row| row.get_named::<i64>("id").map_err(source_error))
         .collect::<Result<Vec<_>, _>>()?
@@ -801,7 +851,7 @@ fn reconcile_prepared_inner(
         match verify_prepared_without_mutation(config, prepared, control) {
             Ok(true) => return Ok(ReconcileResult::default()),
             Ok(false) => {}
-            // An optimistic observation invalidated by another writer proves
+            // An optimistic observation unavailable or invalidated by a writer proves
             // neither completion nor a conflict. Recheck through the existing
             // guarded path instead of pinning healthy retry debt indefinitely.
             // All other failures retain their classification and refusal.
@@ -809,16 +859,28 @@ fn reconcile_prepared_inner(
             Err(error) => return Err(error),
         }
     }
-    // Admit before ensure_archive: even creating a missing archive must not
-    // wait behind an unrelated publisher while retaining the DB source lease.
-    // Keep mutable metadata collection in one native mutation window. Bundle
-    // repair revalidates the captured bytes before publishing, so release this
-    // window before its immutable Git-history proof: scanning old messages must
-    // not exclude unrelated live archive writers.
-    let metadata_mutation = control
-        .map(|control| control.begin_at(&config.storage_root))
-        .transpose()?;
-    let archive = crate::ensure_archive(config, &prepared.project_slug)?;
+    // A warm archive needs only read-only metadata selection here. Its
+    // surviving files, pinned Git objects and private index snapshot carry no
+    // publication authority: the bundle path revalidates all destinations and
+    // identities under the final native fence and project lock. Do not make
+    // every repair win a separate fence window just to read that metadata.
+    // A cold archive still needs guarded creation/configuration. Reuse the
+    // existing initialization predicate, including per-process migrations,
+    // and preserve the test-harness refusal on the warm path as well.
+    let archive = match crate::open_archive(config, &prepared.project_slug)? {
+        Some(archive) if crate::repo_cache_contains(&archive.repo_root) => {
+            crate::refuse_default_storage_root_under_test_harness(&archive.repo_root)?;
+            archive
+        }
+        _ => {
+            // Never wait for creation behind an unrelated publisher while
+            // retaining the database source lease.
+            let _initialization = control
+                .map(|control| control.begin_at(&config.storage_root))
+                .transpose()?;
+            crate::ensure_archive(config, &prepared.project_slug)?
+        }
+    };
     let paths = crate::message_paths_for_bundle(
         &archive,
         &prepared.message,
@@ -928,7 +990,6 @@ fn reconcile_prepared_inner(
         recipients: &prepared.recipients,
         extra_paths: &[],
     };
-    drop(metadata_mutation);
     match control {
         Some(control) => super::reconcile_message_bundle_cancellable(
             control.cx,
@@ -960,7 +1021,9 @@ fn verify_prepared_without_mutation(
     let Some(archive) = crate::open_archive(config, &prepared.project_slug)? else {
         return Ok(false);
     };
-    let Some(before) = crate::archive_epoch_read_stamp(&archive.repo_root)? else {
+    let Some(before) = crate::archive_epoch_read_stamp(&archive.repo_root)
+        .map_err(ReconcileFailure::optimistic_stamp_unavailable)?
+    else {
         return Ok(false);
     };
     let changed = ReconcileFailure::optimistic_observation_changed;
@@ -1011,7 +1074,10 @@ fn verify_prepared_without_mutation(
     }
     super::checkpoint(control)?;
     if !committed.same_head(&archive)?
-        || crate::archive_epoch_read_stamp(&archive.repo_root)?.as_ref() != Some(&before)
+        || crate::archive_epoch_read_stamp(&archive.repo_root)
+            .map_err(ReconcileFailure::optimistic_stamp_unavailable)?
+            .as_ref()
+            != Some(&before)
     {
         return Err(changed());
     }
@@ -1154,7 +1220,8 @@ impl CommittedMessages {
 /// catch-up reads one additional ID to distinguish a full page from its end;
 /// this lookahead performs no payload or archive work in the pass. At most
 /// four successful repairs and 16 MiB of serialized payload are admitted to
-/// archive work per pass. SQL projections are separately bounded before JSON
+/// archive work per pass, yielding between messages after one second of work.
+/// SQL projections are separately bounded before JSON
 /// serialization; an expanded payload that cannot fit any batch is deferred
 /// without pinning the cursor. These are work bounds, not deadlines on SQL,
 /// filesystem or libgit2 calls. Normal archive writes receive a 30-second grace
@@ -1164,7 +1231,8 @@ impl CommittedMessages {
 /// archive refusals retain a bounded FIFO retry lane; conflicts stay on backfill
 /// with a cooldown. Retries never bypass source or archive authority checks.
 /// Database-promotion contention defers before consuming a candidate. A busy
-/// global archive fence or project lock defers that message within the finite
+/// global archive fence receives at most 50 ms of cancellation-aware admission
+/// attempts, and a busy project lock defers immediately within the finite
 /// scan; other messages can progress and the next pass revisits it. Shutdown
 /// reaches the archive admission path as well as the outer loop. Blocking I/O and Git
 /// operations still have no hard deadline.
@@ -1195,10 +1263,28 @@ pub fn reconcile_message_batch(
     stop: &AtomicBool,
 ) -> Result<ReconcileReport, String> {
     if cursor.persist_progress {
+        // Check before checkpoint restoration can change scheduling hints or
+        // publish them. The inner pass samples again before row selection.
+        if !stop.load(Ordering::Acquire)
+            && cx.checkpoint().is_ok()
+            && !corruption_circuit_breaker().is_tripped()
+        {
+            sample_archive_lag_for_reconciliation()?;
+        }
         checkpoint::run(cx, pool, config, cursor, stop)
     } else {
         reconcile_message_batch_inner(cx, pool, config, cursor, stop)
     }
+}
+
+fn sample_archive_lag_for_reconciliation() -> Result<crate::ArchiveLagSnapshot, String> {
+    crate::try_archive_lag_snapshot().map_err(|unavailable| {
+        tracing::debug!(
+            unavailable_lock = unavailable.unavailable_lock,
+            "message reconciliation admission deferred: archive queue evidence is unavailable"
+        );
+        "message reconciliation deferred: recovery promotion or admission contention".to_string()
+    })
 }
 
 fn reconcile_message_batch_inner(
@@ -1236,10 +1322,14 @@ fn reconcile_message_batch_at(
             "message reconciliation refused: source corruption breaker is open".to_string(),
         );
     }
+    // An unavailable queue cannot establish a safe cutoff. Defer admission
+    // without selecting rows or changing the cursor; never wait behind a
+    // wedged queue owner before the worker can observe cancellation again.
+    let archive_lag = sample_archive_lag_for_reconciliation()?;
     let cutoff = normal_archive_cutoff(
         now_us,
         cursor.settled_before_us,
-        crate::archive_lag_snapshot().oldest_unmaterialized_us,
+        archive_lag.oldest_unmaterialized_us,
     );
     let selected = {
         // The selection itself must not enter a pool while promotion owns
@@ -1257,6 +1347,8 @@ fn reconcile_message_batch_at(
     let selected_identity = cursor.source_identity.clone();
     let tail_started_after = selected.tail_started_after;
     let tail_next_id = selected.tail_next_id;
+    let history_started_at = cursor.backfill_ceiling;
+    let startup_started_at = cursor.startup_tail.as_ref().map(|range| range.ceiling);
     let now = Instant::now();
     let mut retries = cursor
         .retries
@@ -1286,7 +1378,10 @@ fn reconcile_message_batch_at(
         if corruption_circuit_breaker().is_tripped() {
             return Err("message reconciliation stopped: source corruption observed".to_string());
         }
-        if report.repaired >= MAX_REPAIRS_PER_BATCH || report.scanned >= MAX_IDS_PER_PASS {
+        if report.repaired >= MAX_REPAIRS_PER_BATCH
+            || report.scanned >= MAX_IDS_PER_PASS
+            || (report.scanned > 0 && now.elapsed() >= MAX_BATCH_TURN)
+        {
             report.budget_exhausted = true;
             break;
         }
@@ -1406,10 +1501,16 @@ fn reconcile_message_batch_at(
     // crash left no older orphans. Continue this finite startup history round
     // using the worker's existing one-second catch-up poll. No loop, SQL page,
     // repair count, payload bound, retry cooldown, or publication guard changes.
-    // A cancelled or wholly blocked pass does not request extra polling here.
+    // Consuming a page of cooling conflicts also advances that finite round:
+    // no payload is scanned, but an older unvisited orphan can be on its next
+    // page. Keep the short cadence without retrying a cooling ID early. A
+    // cancelled or wholly blocked pass does not request extra polling here.
+    let startup_scan_advanced = cursor.backfill_ceiling != history_started_at
+        || cursor.startup_tail.as_ref().map(|range| range.ceiling) != startup_started_at;
+    report.scan_advanced = startup_scan_advanced || cursor.tail_after != tail_started_after;
     if cursor.persist_progress
         && (!cursor.startup_backfill_complete || cursor.startup_tail.is_some())
-        && report.scanned > 0
+        && (report.scanned > 0 || startup_scan_advanced)
         && !report.interrupted
     {
         report.budget_exhausted = true;
@@ -1746,6 +1847,39 @@ pub fn prune_archived_message_batch(
 mod tests {
     use super::*;
 
+    std::thread_local! {
+        static DISCOVERY_READ_FAULT: std::cell::Cell<Option<(usize, bool)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    // Fail one chosen SQL boundary on the owning test thread. Real queries,
+    // source rows and archive publication remain on the production path.
+    pub(super) fn discovery_read_fault(
+        conn: &mcp_agent_mail_db::DbConn,
+    ) -> Result<(), ReconcileFailure> {
+        let fault = DISCOVERY_READ_FAULT.with(|slot| {
+            let (remaining, panic) = slot.get()?;
+            slot.set((remaining > 1).then_some((remaining.saturating_sub(1), panic)));
+            (remaining == 1).then_some(panic)
+        });
+        let Some(panic) = fault else {
+            return Ok(());
+        };
+        // This connection-local mark proves that the failed handle is retired,
+        // instead of the next pass borrowing that same handle again.
+        conn.execute_raw("PRAGMA query_only = ON").unwrap();
+        assert_eq!(
+            conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                .get_as::<i64>(0)
+                .unwrap(),
+            1
+        );
+        assert!(!panic, "private-discovery-source-panic-payload");
+        conn.query_sync("SELECT * FROM missing_message_discovery_probe", &[])
+            .map(|_| ())
+            .map_err(ReconcileFailure::source_unavailable)
+    }
+
     fn prepared() -> PreparedMessage {
         let message = json!({
             "id": 9, "from": "BlueLake", "to": ["GreenStone"], "cc": [], "bcc": ["RedFox"],
@@ -2001,6 +2135,61 @@ mod tests {
     }
 
     #[test]
+    fn an_existing_project_directory_cannot_bypass_cold_repository_admission() {
+        if super::super::cancellable_tests::isolated() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            storage_root: temp.path().to_path_buf(),
+            ..Config::default()
+        };
+        let original = prepared();
+        // The directory alone is not proof that repository initialization and
+        // per-process configuration have completed.
+        let project = temp.path().join("projects").join(&original.project_slug);
+        std::fs::create_dir_all(&project).unwrap();
+        assert!(
+            crate::open_archive(&config, &original.project_slug)
+                .unwrap()
+                .is_some()
+        );
+        assert!(!crate::repo_cache_contains(&config.storage_root));
+        let epoch = crate::archive_mutation_epoch();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            crate::with_archive_snapshot_publication_fence(|| {
+                ready_tx.send(()).unwrap();
+                release_rx.recv_timeout(std::time::Duration::from_secs(20))
+            })
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let cx = Cx::for_testing();
+        let stop = AtomicBool::new(false);
+        let result = reconcile_prepared_inner(
+            &config,
+            &original,
+            Some(RepairControl {
+                cx: &cx,
+                stop: &stop,
+            }),
+            true,
+        );
+        let initialized = temp.path().join(".git").exists();
+        let unchanged_epoch = crate::archive_mutation_epoch() == epoch;
+        let _ = release_tx.send(());
+        assert!(owner.join().unwrap().is_ok());
+        let error = result.unwrap_err();
+        assert!(error.transient, "{error:?}");
+        assert!(error.detail.contains("publication fence busy"), "{error:?}");
+        assert!(!initialized && unchanged_epoch);
+        assert!(!crate::repo_cache_contains(&config.storage_root));
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn prepared_repair_releases_metadata_fence_and_rechecks_surviving_reply() {
         use super::super::cancellable_tests::{ObserveScan, isolated};
@@ -2049,10 +2238,38 @@ mod tests {
             let survivor = paths.inbox[0].clone();
             let visited = std::sync::Arc::new(AtomicBool::new(false));
             let hook_visited = visited.clone();
+            let metadata_read_while_busy = std::sync::Arc::new(AtomicBool::new(false));
+            let hook_metadata_read_while_busy = metadata_read_while_busy.clone();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (released_tx, released_rx) = std::sync::mpsc::channel();
+            let owner = std::thread::spawn(move || {
+                let result = crate::with_archive_snapshot_publication_fence(|| {
+                    ready_tx.send(()).unwrap();
+                    release_rx.recv_timeout(std::time::Duration::from_secs(30))
+                });
+                let _ = released_tx.send(());
+                result
+            });
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let release_for_hook = release_tx.clone();
             let observer = ObserveScan::new(move |stage| {
                 if stage != "git blob" || hook_visited.swap(true, Ordering::AcqRel) {
                     return;
                 }
+                // This scan follows real surviving-metadata selection. A
+                // preliminary try-fence would have refused before reaching
+                // it; the final publication still needs its own admission.
+                hook_metadata_read_while_busy.store(
+                    crate::archive_publication_fence_holder().is_some(),
+                    Ordering::Release,
+                );
+                release_for_hook.send(()).unwrap();
+                released_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
                 let op = op.clone();
                 let result = std::thread::spawn(move || crate::write_op_sync_direct(&op))
                     .join()
@@ -2078,7 +2295,13 @@ mod tests {
                 true,
             );
             drop(observer);
+            // Release and reap even if an older implementation refused before
+            // the observer, so a causal failure leaves no publisher behind.
+            let _ = release_tx.send(());
+            let owner_released = owner.join().unwrap();
+            assert!(owner_released.is_ok(), "waited for the owner's timeout");
             assert!(visited.load(Ordering::Acquire));
+            assert!(metadata_read_while_busy.load(Ordering::Acquire));
             let reservation: Value = serde_json::from_slice(
                 &fs::read(other.root.join("file_reservations/id-1.json")).unwrap(),
             )
@@ -2606,6 +2829,110 @@ mod tests {
         });
     }
 
+    fn exercise_failed_discovery(panic: bool) {
+        for failing_query in 1..=6 {
+            retention_fixture(2, |cx, pool, config| {
+                let before = admission_tests::database_evidence(cx, pool);
+                let mut cursor = ReconcileCursor {
+                    source_identity: pool.sqlite_identity_key(),
+                    tail_after: Some(900),
+                    // An empty history lane changes its wrap state before the
+                    // final startup query. A late failure must not publish that
+                    // incomplete selection or forget retained retry debt.
+                    backfill_ceiling: Some(899),
+                    settled_before_us: mcp_agent_mail_db::now_micros(),
+                    persist_progress: true,
+                    ..Default::default()
+                };
+                cursor.defer_transient(901, Instant::now());
+                let saved = format!("{cursor:?}");
+                DISCOVERY_READ_FAULT.with(|slot| slot.set(Some((failing_query, panic))));
+                let error = select_ids(cx, pool, &mut cursor, i64::MAX)
+                    .err()
+                    .expect("the selected discovery read must fail");
+                assert!(DISCOVERY_READ_FAULT.with(|slot| slot.get().is_none()));
+                assert_eq!(format!("{cursor:?}"), saved);
+                if panic {
+                    assert!(error.contains("panicked"), "{error}");
+                    assert!(!error.contains("private-discovery-source-panic-payload"));
+                }
+                let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+                assert_eq!(
+                    conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                        .get_as::<i64>(0)
+                        .unwrap(),
+                    0,
+                    "failed discovery reader was returned to the one-slot pool"
+                );
+                drop(conn);
+                assert_eq!(admission_tests::database_evidence(cx, pool), before);
+
+                let repaired =
+                    reconcile_message_batch(cx, pool, config, &mut cursor, &AtomicBool::new(false))
+                        .unwrap();
+                assert_eq!(repaired.repaired, 2, "{repaired:?}");
+                assert_eq!(repaired.files_created, 8, "{repaired:?}");
+                assert_eq!(repaired.deferred, 0, "{repaired:?}");
+                assert_eq!(repaired.retry_len, 0, "{repaired:?}");
+                let archive = crate::open_archive(config, "project").unwrap().unwrap();
+                for id in [901, 902] {
+                    let prepared = prepare_message(cx, pool, id).unwrap();
+                    assert_eq!(prepared.message["reply_to"], 700);
+                    assert!(
+                        verify_retention_archive(&archive, &prepared, &mut 0)
+                            .unwrap()
+                            .is_some(),
+                        "every canonical, outbox and BCC-safe inbox copy must match Git"
+                    );
+                }
+                assert_eq!(admission_tests::database_evidence(cx, pool), before);
+            });
+        }
+    }
+
+    #[test]
+    fn failed_discovery_queries_retire_readers_preserve_cursors_and_resume_archive_repair() {
+        exercise_failed_discovery(false);
+    }
+
+    #[test]
+    fn discovery_panics_retire_readers_preserve_cursors_and_resume_archive_repair() {
+        exercise_failed_discovery(true);
+    }
+
+    #[test]
+    fn discovery_query_only_refusal_keeps_the_healthy_reader_and_cursor() {
+        retention_fixture(2, |cx, pool, config| {
+            let before = admission_tests::database_evidence(cx, pool);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("PRAGMA query_only = ON").unwrap();
+            drop(conn);
+            let mut cursor = ReconcileCursor {
+                source_identity: pool.sqlite_identity_key(),
+                tail_after: Some(900),
+                ..Default::default()
+            };
+            let saved = format!("{cursor:?}");
+            let error = select_ids(cx, pool, &mut cursor, i64::MAX)
+                .err()
+                .expect("a read-only source cannot authorize repair");
+            assert!(error.contains("query-only"), "{error}");
+            assert_eq!(format!("{cursor:?}"), saved);
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            assert_eq!(
+                conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
+                    .get_as::<i64>(0)
+                    .unwrap(),
+                1,
+                "a valid refusal must not retire a healthy connection"
+            );
+            conn.execute_raw("PRAGMA query_only = OFF").unwrap();
+            drop(conn);
+            assert!(crate::open_archive(config, "project").unwrap().is_none());
+            assert_eq!(admission_tests::database_evidence(cx, pool), before);
+        });
+    }
+
     /// br-kp1in.14: mail committed moments before a crash is repaired on the
     /// restarted reconciler's first pass. The 30 s grace still shields rows
     /// that this process's own write-behind queue may be writing.
@@ -3113,6 +3440,146 @@ mod tests {
     }
 
     #[test]
+    fn startup_cooling_pages_keep_catch_up_until_an_unvisited_orphan() {
+        retention_fixture(32, |cx, pool, config| {
+            archive_fixture_range(cx, pool, config, 902..933);
+            let stop = AtomicBool::new(false);
+            let now = Instant::now();
+            let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            cursor.source_identity = pool.sqlite_identity_key();
+            // The forward cursor is already caught up, so its lookahead
+            // cannot request another pass. Recent history is covered by
+            // cooldowns retained from an earlier forward observation.
+            cursor.tail_after = Some(932);
+            cursor.backfill_ceiling = Some(932);
+            cursor.conflict_backoff = (917..933).map(|id| (id, now + MAX_RETRY_BACKOFF)).collect();
+
+            let cooling = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(
+                (
+                    cooling.scanned,
+                    cooling.repaired,
+                    cooling.deferred,
+                    cooling.retry_len,
+                ),
+                (0, 0, 0, 0),
+                "cooldowns must not be bypassed or turned into attempted repairs"
+            );
+            assert_eq!(cursor.tail_after, Some(932));
+            assert_eq!(cursor.backfill_ceiling, Some(916));
+            assert!(cursor.startup_tail.is_none());
+            assert!(
+                cooling.budget_exhausted,
+                "cursor-only startup progress must retain the short follow-up for older orphans"
+            );
+            assert_eq!(cooling.checkpoint_saved, Some(true));
+
+            // Resume the real checkpoint with a fresh worker. The old orphan
+            // is next-page history; no client read or message resend repairs it.
+            let mut restarted = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            let repaired =
+                reconcile_message_batch(cx, pool, config, &mut restarted, &stop).unwrap();
+            assert!(repaired.checkpoint_restored);
+            assert_eq!(repaired.repaired, 1);
+            assert_eq!(repaired.files_created, 4);
+            assert_eq!(repaired.deferred, 0);
+            assert_eq!(restarted.conflict_backoff.len(), 16);
+            assert!(repaired.scanned <= MAX_IDS_PER_PASS);
+            assert!(repaired.payload_bytes <= MAX_BATCH_PAYLOAD_BYTES);
+            let original = prepare_message(cx, pool, 901).unwrap();
+            assert_eq!(
+                reconcile_prepared(config, &original).unwrap(),
+                ReconcileResult::default()
+            );
+            assert!(
+                verify_retention_archive(
+                    &crate::open_archive(config, "project").unwrap().unwrap(),
+                    &original,
+                    &mut 0,
+                )
+                .unwrap()
+                .is_some()
+            );
+            assert_eq!(
+                retained_message_ids(cx, pool),
+                (901..933).collect::<Vec<_>>()
+            );
+        });
+    }
+
+    #[test]
+    fn cooling_startup_tail_keeps_catch_up_behind_a_young_forward_barrier() {
+        retention_fixture(40, |cx, pool, config| {
+            let anchor = mcp_agent_mail_db::now_micros();
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw(&format!(
+                "UPDATE messages SET created_ts = {} WHERE id = 902",
+                anchor + 3_600_000_000,
+            ))
+            .unwrap();
+            drop(conn);
+            let mut cursor = ReconcileCursor::settled_before(anchor);
+            cursor.source_identity = pool.sqlite_identity_key();
+            cursor.tail_after = Some(901);
+            cursor.backfill_ceiling = Some(0);
+            cursor.conflict_backoff = (925..941)
+                .map(|id| (id, Instant::now() + MAX_RETRY_BACKOFF))
+                .collect();
+            let stop = AtomicBool::new(false);
+
+            let cooling = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(
+                (cooling.scanned, cooling.deferred, cooling.retry_len),
+                (0, 0, 0)
+            );
+            assert!(cursor.startup_backfill_complete);
+            assert_eq!(
+                cursor.tail_after,
+                Some(901),
+                "young mail still blocks the forward lane"
+            );
+            assert_eq!(
+                cursor.startup_tail.as_ref().map(|range| range.ceiling),
+                Some(924)
+            );
+            assert!(
+                cooling.budget_exhausted,
+                "the startup-tail lane still has older settled mail"
+            );
+            assert_eq!(cooling.checkpoint_saved, Some(true));
+
+            let repaired = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(repaired.repaired, MAX_REPAIRS_PER_BATCH);
+            assert_eq!(repaired.deferred, 0);
+            assert_eq!(cursor.tail_after, Some(901));
+            assert_eq!(cursor.conflict_backoff.len(), 16);
+            let older = prepare_message(cx, pool, 924).unwrap();
+            assert_eq!(
+                reconcile_prepared(config, &older).unwrap(),
+                ReconcileResult::default()
+            );
+            let young = prepare_message(cx, pool, 902).unwrap();
+            let archive = crate::open_archive(config, "project").unwrap().unwrap();
+            let paths = crate::message_paths_for_bundle(
+                &archive,
+                &young.message,
+                &young.sender,
+                &young.recipients,
+            )
+            .unwrap()
+            .0;
+            assert!(
+                !paths.canonical.exists(),
+                "the young forward barrier was bypassed"
+            );
+            assert_eq!(
+                retained_message_ids(cx, pool),
+                (901..941).collect::<Vec<_>>()
+            );
+        });
+    }
+
+    #[test]
     fn startup_priority_has_a_fixed_bound_and_cannot_advance_over_young_tail_rows() {
         retention_fixture(40, |cx, pool, _config| {
             let anchor = 2_000_000;
@@ -3397,6 +3864,7 @@ mod tests {
             assert_eq!(cooling.deferred, 0);
             assert_eq!(cooling.retry_len, 0);
             assert!(cooling.budget_exhausted);
+            assert!(cooling.scan_advanced);
             assert_eq!(cursor.tail_after, Some(916));
 
             // The unconsumed sentinel is an actual DB-only message, not proof
@@ -3425,6 +3893,62 @@ mod tests {
                 retained_message_ids(cx, pool),
                 (901..918).collect::<Vec<_>>()
             );
+        });
+    }
+
+    #[test]
+    fn gh383_cooling_retry_survives_checkpoint_restart_while_new_tail_converges() {
+        retention_fixture(2, |cx, pool, config| {
+            let stop = AtomicBool::new(false);
+            let ready_at = Instant::now() + MAX_RETRY_BACKOFF;
+            let mut cursor = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            cursor.source_identity = pool.sqlite_identity_key();
+            cursor.tail_after = Some(900);
+            cursor.backfill_ceiling = Some(900);
+            cursor.retries.push_back(DeferredRetry {
+                id: 901,
+                attempts: 6,
+                ready_at,
+            });
+
+            let first = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(first.repaired, 1);
+            assert!(first.scan_advanced);
+            assert_eq!(first.retry_len, 1);
+            assert_eq!(first.checkpoint_saved, Some(true));
+            assert_eq!(cursor.next_retry_at(), Some(ready_at));
+            assert!(cursor.has_retry_capacity());
+            let archive = crate::open_archive(config, "project").unwrap().unwrap();
+            let repaired = prepare_message(cx, pool, 902).unwrap();
+            assert!(
+                verify_retention_archive(&archive, &repaired, &mut 0)
+                    .unwrap()
+                    .is_some()
+            );
+            let cooling = prepare_message(cx, pool, 901).unwrap();
+            let paths = crate::message_paths_for_bundle(
+                &archive,
+                &cooling.message,
+                &cooling.sender,
+                &cooling.recipients,
+            )
+            .unwrap()
+            .0;
+            assert!(!paths.canonical.exists());
+            drop(cursor);
+
+            let mut restarted = ReconcileCursor::settled_before(mcp_agent_mail_db::now_micros());
+            let resumed = reconcile_message_batch(cx, pool, config, &mut restarted, &stop).unwrap();
+            assert!(resumed.checkpoint_restored);
+            assert_eq!(resumed.checkpoint_saved, Some(true));
+            assert_eq!(resumed.repaired, 0);
+            assert_eq!(resumed.retry_len, 1);
+            assert_eq!(restarted.retries[0].id, 901);
+            assert_eq!(restarted.retries[0].attempts, 6);
+            assert!(restarted.next_retry_at().unwrap() > Instant::now());
+            assert!(restarted.has_retry_capacity());
+            assert!(!paths.canonical.exists());
+            assert_eq!(retained_message_ids(cx, pool), [901, 902]);
         });
     }
 
@@ -3458,6 +3982,9 @@ mod tests {
                 assert_eq!(blocked.scanned, 0);
                 assert_eq!(blocked.repaired, 0);
                 assert_eq!(blocked.retry_len, MAX_RETRY_IDS);
+                assert!(!cursor.has_retry_capacity());
+                assert!(cursor.next_retry_at().is_some());
+                assert!(!blocked.scan_advanced);
                 assert!(!blocked.budget_exhausted);
                 assert_eq!(cursor.tail_after, Some(900));
             }

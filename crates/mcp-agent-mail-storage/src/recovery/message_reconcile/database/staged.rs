@@ -45,7 +45,9 @@ struct StagedMessages {
 impl StagedMessages {
     fn open(repo: &Repository) -> Result<Option<Self>, ReconcileFailure> {
         let path = repo.path().join("index");
-        if crate::path_existing_prefix_has_symlink(&path).map_err(|error| error.to_string())? {
+        if crate::path_existing_prefix_has_symlink(&path).map_err(|error| {
+            index_io_failure("staged archive index authority is unavailable", error)
+        })? {
             return Err("staged archive index has a symlinked authority"
                 .to_string()
                 .into());
@@ -616,11 +618,19 @@ mod tests {
 
             let stop = AtomicBool::new(false);
             let mut cursor = ReconcileCursor::default();
-            let repaired = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
-            assert_eq!(
-                (repaired.repaired, repaired.files_created, repaired.deferred),
-                (3, 12, 0)
-            );
+            // A batch yields after one second of work, so a slow host may need
+            // several batches. The totals, not the batch count, are the contract.
+            let mut totals = (0, 0, 0);
+            for _ in 0..64 {
+                let batch = reconcile_message_batch(cx, pool, config, &mut cursor, &stop).unwrap();
+                totals.0 += batch.repaired;
+                totals.1 += batch.files_created;
+                totals.2 += batch.deferred;
+                if !batch.budget_exhausted {
+                    break;
+                }
+            }
+            assert_eq!(totals, (3, 12, 0));
             assert_eq!(mailbox_evidence(cx, pool), before);
             let verified = Repository::open(&archive.repo_root).unwrap();
             let tree = verified.head().unwrap().peel_to_tree().unwrap();

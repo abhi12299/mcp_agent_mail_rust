@@ -26,8 +26,8 @@ use crate::messaging::InboxMessage;
 use crate::reservations::ReservationResponse;
 use crate::search::{ExampleMessage, ThreadSummary};
 use crate::tool_util::{
-    db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool, get_db_pool, legacy_tool_error,
-    resolve_agent, resolve_existing_project, resolve_project, tool_error_code,
+    db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool, get_db_pool_for_request,
+    legacy_tool_error, resolve_agent, resolve_existing_project, resolve_project, tool_error_code,
 };
 use mcp_agent_mail_db::micros_to_iso;
 use serde::de::DeserializeOwned;
@@ -363,7 +363,7 @@ pub async fn macro_prepare_thread(
     // gate refuses to serve while any writer lease is active, so holding
     // `pool` across their awaits self-deadlocks until the 120 s snapshot
     // deadline (br-097bj).
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project_row = resolve_project(ctx, &pool, &project_key).await?;
     let project = ProjectResponse {
         id: project_row.id.unwrap_or(0),
@@ -802,7 +802,7 @@ pub async fn macro_contact_handshake(
     }
 
     ctx.ensure_live()?;
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     // register_if_missing=false means nothing is created implicitly: a missing
     // source project is NOT_FOUND here, before the contact flow's own check.
     let source_project = if register_if_missing == Some(false) {
@@ -854,17 +854,19 @@ pub async fn macro_contact_handshake(
     )
     .await?;
     let request_val: Value = parse_json(request_json, "request")?;
+    #[cfg(test)]
+    contact_handshake_tests::pause_after_request(&source_project_key);
     // `request_contact` leaves a blocked link blocked. auto_accept approves a
     // request on the target's behalf; it must not turn the target's explicit
     // block back into an approval (that would let the blocked requester
     // deliver into the target's project, GH#335 review).
-    let link_blocked = request_val
+    let mut link_blocked = request_val
         .get("status")
         .and_then(Value::as_str)
         .is_some_and(|status| status.eq_ignore_ascii_case("blocked"));
 
     let response_val = if should_auto_accept && !link_blocked {
-        let respond_json = crate::contacts::respond_contact(
+        let respond_json = crate::contacts::approve_contact_unless_blocked(
             ctx,
             target_project_key.clone(),
             target_agent_name.clone(),
@@ -874,20 +876,26 @@ pub async fn macro_contact_handshake(
             } else {
                 None
             },
-            true,
             Some(ttl),
         )
         .await?;
         let response_val: Value = parse_json(respond_json, "response")?;
-        crate::contacts::send_contact_approved_notice(
-            ctx,
-            &source_project_key,
-            &from_agent,
-            &target_project_key,
-            &target_agent_name,
-        )
-        .await?;
-        Some(response_val)
+        if response_val.get("approved").and_then(Value::as_bool) == Some(true) {
+            crate::contacts::send_contact_approved_notice(
+                ctx,
+                &source_project_key,
+                &from_agent,
+                &target_project_key,
+                &target_agent_name,
+            )
+            .await?;
+            Some(response_val)
+        } else {
+            // The recipient's block won after the request snapshot. Preserve
+            // the same silent blocked outcome as a block observed up front.
+            link_blocked = true;
+            None
+        }
     } else {
         None
     };
@@ -997,6 +1005,9 @@ pub async fn macro_contact_handshake(
 }
 
 // removed generate_slug (unused; slug derivation handled by ensure_project)
+
+#[cfg(test)]
+mod contact_handshake_tests;
 
 #[cfg(test)]
 mod tests {

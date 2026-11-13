@@ -103,11 +103,11 @@ We only use **Cargo** in this project, NEVER any other package manager.
 |-------|---------|
 | `asupersync` (`=0.5.0`, crates.io) | Structured async runtime (channels, sync, regions, HTTP, testing) |
 | `fastmcp-rust` (`0.13.0`, crates.io; imported as `fastmcp`) | MCP protocol implementation; `Cargo.lock` selects the 0.13.0 registry family on Asupersync 0.5 |
-| `sqlmodel` (`=0.5.0`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; registry FrankenSQLite `=0.4.10` is the runtime `DbConn`. The `[patch]` Git revision `2633b38a` in `Cargo.toml` applies only to embedded Beads' separate 0.3.18 engine |
-| `sqlmodel-sqlite` (`=0.5.0`, bundles C SQLite statically) | `CanonicalDbConn`: verification and recovery cross-checks only (doctor double-probe, reconstruct, legacy import); never the runtime mailbox path |
+| `sqlmodel` (`=0.5.1`, crates.io) + `sqlmodel-frankensqlite` | SQLite ORM; pool/core use immutable revision `c9967106` for cancellation-safe waiter cleanup and cooperative acquisition deadlines. Registry FrankenSQLite `=0.4.13` is the runtime `DbConn` |
+| `sqlmodel-sqlite` (`=0.5.1`, bundles C SQLite statically) | `CanonicalDbConn`: verification and recovery cross-checks only (doctor double-probe, reconstruct, legacy import); never the runtime mailbox path |
 | `ftui` / `ftui-*` (`0.7.0`, FrankenTUI) | TUI rendering for operations console; facade defaults disabled, platform-specific backends selected by the server |
 | `frankensearch` (`0.6.1`, git revision `616c9a7a6bdada97d81f760808996911ba3be294`, aligned with dist.yml's `FRANKENSEARCH_COMMIT`) | Optional `hybrid` integration for semantic retrieval and reranking; portable lexical Search V3 uses the local `TantivyBridge`. Cargo uses the immutable revision directly; no sibling checkout is required. Its reranker shares the Asupersync 0.5 caller context, and its rustix 1.1.5 requirement agrees with FastMCP |
-| `beads_rust` (`=0.6.0`, default features disabled) | Issue tracking integration; separate patched FrankenSQLite 0.3.18 engine |
+| `br` (installed external CLI) | Issue tracking integration; database-free directory discovery through `br --no-db config path --json`, then workspace-pinned read-only queries. No embedded Beads storage engine |
 | `franken-agent-detection` (`0.3.7`) | Installed coding-agent detection for setup/doctor |
 | `serde` + `serde_json` | JSON serialization for MCP protocol |
 | `chrono` | Timestamp handling (i64 microseconds since epoch) |
@@ -314,7 +314,7 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 | Verb | Mutates? | Default exit |
 |------|----------|--------------|
-| `am doctor check` (`--json`, `--verbose`, `[PROJECT]`) | No | 0 healthy / 1 findings |
+| `am doctor check` (`--json`, `--verbose`, `[PROJECT]`) | No | Table: 0 healthy / 1 findings; JSON/TOON: 0 report produced (inspect `healthy`) |
 | `am doctor drain` | No (read-only) | 0 |
 | `am doctor locks` (`--json`) | No (read-only owner intelligence — D1) | 0 |
 | `am doctor fix --yes` | Yes (via `mutate()`) | 0 / 2 / 3 / 4 |

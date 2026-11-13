@@ -17,7 +17,7 @@ members = [
 exclude = ["experimental/*", "crates/mcp-agent-mail-dashboard-wasm"]
 
 [workspace.package]
-version = "0.3.39"
+version = "0.3.40"
 edition = "2024"
 license = "LicenseRef-MIT-Rider"
 license-file = "LICENSE"
@@ -34,19 +34,20 @@ fastmcp-transport = "0.13.0"
 fastmcp-protocol = "0.13.0"
 
 # br-5lgwn: the mailbox engine, SQLModel and FastMCP share Asupersync 0.5.
-# The embedded Beads library retains its older private runtime graph.
 asupersync = { version = "=0.5.0", features = ["tls-webpki-roots"] }
-fsqlite = "=0.4.10"
-fsqlite-types = "=0.4.10"
+# GH#372: 0.4.13 fixes descending-key index page amplification in persisted
+# tool metrics. Existing bloated mailboxes need an explicit offline VACUUM.
+fsqlite = "=0.4.13"
+fsqlite-types = "=0.4.13"
 
-sqlmodel = "=0.5.0"
-sqlmodel-core = "=0.5.0"
-sqlmodel-query = "=0.5.0"
-sqlmodel-schema = "=0.5.0"
-sqlmodel-session = "=0.5.0"
-sqlmodel-pool = "=0.5.0"
-sqlmodel-frankensqlite = "=0.5.0"
-sqlmodel-sqlite = "=0.5.0"
+sqlmodel = "=0.5.1"
+sqlmodel-core = "=0.5.1"
+sqlmodel-query = "=0.5.1"
+sqlmodel-schema = "=0.5.1"
+sqlmodel-session = "=0.5.1"
+sqlmodel-pool = "=0.5.1"
+sqlmodel-frankensqlite = "=0.5.1"
+sqlmodel-sqlite = "=0.5.1"
 
 ftui = { version = "0.7.0", default-features = false, features = ["runtime", "extras"] }
 ftui-runtime = { version = "0.7.0" }
@@ -55,7 +56,6 @@ ftui-widgets = { version = "0.7.0", features = ["debug-overlay", "regex-search"]
 ftui-tty = "0.7.0"
 ftui-harness = "0.7.0"
 ftui-render = "0.7.0"
-beads_rust = { version = "=0.6.0", default-features = false }
 toon = { version = "0.2.4", package = "tru" }
 # GH#161: global allocator for the long-running serve-http daemon to avoid
 # glibc per-thread arena fragmentation (multi-GB retained RSS under load).
@@ -114,7 +114,7 @@ age = { version = "=0.11.3", default-features = false, features = ["armor"] }
 rpassword = "=7.4.0"
 zeroize = "1.9.0"
 blake2 = "0.11"
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "9.1.3", default-features = false, features = ["deflate"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 loom = "0.7"
 proptest = "1"
@@ -201,41 +201,28 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
-# beads_rust 0.6.0 still embeds the 0.3 engine. Preserve its qualified WAL,
-# read-only snapshot, DDL, prepared binding and Windows identity fixes.
-# The mailbox uses registry FrankenSQLite 0.4.10 (no patch).
-fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-ast = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-btree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-core = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-error = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-ext-fts5 = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-ext-icu = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-ext-json = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-ext-misc = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-ext-rtree = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-func = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-mvcc = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-observability = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-pager = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-parser = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-planner = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-types = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-vdbe = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-vfs = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-fsqlite-wal = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "2633b38a26bde68db23172b12aa402ed698cc309" }
-# The mailbox runtime uses registry Asupersync 0.5.0, SQLModel 0.5.0,
-# registry FrankenSQLite 0.4.10 and registry FastMCP 0.13.0.
+# br-kp1in.87: published 0.5.1 still leaks pending-request accounting when
+# an acquisition future is dropped. Pin upstream's waiter guard and full
+# acquisition deadline fix. Patch core too so the pool's workspace dependency
+# and registry drivers share one Connection trait. Core's only source change
+# from registry 0.5.1 documents interrupted retirement; the API is unchanged.
+sqlmodel-pool = { git = "https://github.com/Dicklesworthstone/sqlmodel_rust", rev = "c996710674d92c00d23f30fe17ecc5d9644818c7" }
+sqlmodel-core = { git = "https://github.com/Dicklesworthstone/sqlmodel_rust", rev = "c996710674d92c00d23f30fe17ecc5d9644818c7" }
+# Beads directory discovery and queries use the installed br CLI. Do not embed
+# a separate storage engine for filesystem discovery: its old Git source
+# carried a submodule that prevented strict clean-source releases (br-kp1in.45).
+# The mailbox runtime uses registry Asupersync 0.5.0, SQLModel 0.5.1
+# (pool/core pinned above for cancellation cleanup),
+# registry FrankenSQLite 0.4.13 and registry FastMCP 0.13.0.
 # 0.4.9 carries the AM SQL-compatibility, NOCASE, INSERT SELECT UPSERT and
 # Linux descriptor repairs the former db458bfb patch backported to 0.4.4, plus
 # the short-record decoder fix for rows made short by ADD COLUMN (br-2hpuk).
 # 0.4.10 adds the b-tree insert-in-transaction (bd-obwsy) and retried-fsync
 # (bd-alyrn) integrity fixes and max-rowid parity (br-9pnpe).
+# 0.4.13 adds balanced descending index splits, including promoted dividers
+# and minimum-size cells (FrankenSQLite GH#521; Agent Mail GH#372).
 # No mutable sibling checkout is required.
 #
-# beads_rust =0.6.0 is published and resolves from crates.io. Do not patch it
-# to a mutable sibling: even an unused patch adds that checkout to remote
-# source discovery, and a matching sibling version changes locked resolution.
 # ftui 0.7.0, franken-agent-detection 0.3.7, and tru 0.2.5 resolve from
 # crates.io. Their former path patches made builds depend on whatever state
 # each machine's sibling checkout happened to be in.

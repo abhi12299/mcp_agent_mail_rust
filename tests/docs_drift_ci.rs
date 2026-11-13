@@ -114,8 +114,22 @@ mod container_release_contract {
             "if printf '%s' \"${AM_REF}\" | grep -Eq '^[0-9a-f]{40}$'; then",
             "git fetch --depth 1 origin \"${AM_REF}\";",
             "git checkout -q FETCH_HEAD;",
+            "    cargo build --release --locked \\\n",
         ] {
             require_exactly_once(source_dockerfile, needle)?;
+        }
+        for obsolete in [
+            "SIBLING_REF",
+            "FRANKENSEARCH_COMMIT",
+            "/build/frankensearch-rel-0332",
+            "/build/beads_rust",
+        ] {
+            if source_dockerfile.contains(obsolete) {
+                return Err(format!("obsolete container dependency input: {obsolete}"));
+            }
+        }
+        if workflow.contains("sibling_ref") {
+            return Err("obsolete sibling_ref workflow input remains".to_string());
         }
 
         let release_instructions = release_dockerfile
@@ -144,8 +158,7 @@ mod container_release_contract {
 
     /// Extract the value assigned on the first line starting with `prefix`.
     ///
-    /// Lines are trimmed first, e.g. `FRANKENSEARCH_COMMIT: <sha>` in a
-    /// workflow or `ARG FRANKENSEARCH_COMMIT=<sha>` in a Dockerfile.
+    /// Lines are trimmed first, e.g. `FRANKENSEARCH_COMMIT: <sha>` in a workflow.
     fn assigned_value<'a>(text: &'a str, prefix: &str, separator: char) -> Option<&'a str> {
         text.lines().map(str::trim).find_map(|line| {
             line.strip_prefix(prefix)
@@ -154,41 +167,56 @@ mod container_release_contract {
         })
     }
 
-    /// The source Dockerfile must build against the frankensearch revision
-    /// dist.yml pins.
-    ///
-    /// Cloning the sibling at a floating ref broke
-    /// every `docker build` once the live frankensearch tree moved to a
-    /// newer asupersync than the rest of the workspace can follow.
+    /// Check Cargo's actual workspace declarations against the release pin.
+    /// The source container consumes these declarations with `--locked`.
     #[test]
-    fn source_dockerfile_pins_frankensearch_to_the_dist_commit() {
+    fn cargo_frankensearch_declarations_match_the_dist_commit() {
         let dist = read(".github/workflows/dist.yml");
-        let dockerfile = read("Dockerfile");
-
         let dist_commit = assigned_value(&dist, "FRANKENSEARCH_COMMIT", ':')
             .expect("dist.yml declares FRANKENSEARCH_COMMIT");
-        let dockerfile_commit = assigned_value(&dockerfile, "ARG FRANKENSEARCH_COMMIT", '=')
-            .expect("Dockerfile declares ARG FRANKENSEARCH_COMMIT");
-
         assert_eq!(dist_commit.len(), 40, "dist.yml commit must be a full SHA");
         assert!(
-            dist_commit.bytes().all(|b| b.is_ascii_hexdigit()),
-            "dist.yml commit must be hex"
+            dist_commit
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "dist.yml commit must be lowercase hex"
         );
-        assert_eq!(
-            dockerfile_commit, dist_commit,
-            "Dockerfile ARG FRANKENSEARCH_COMMIT drifted from dist.yml"
-        );
+        let result = std::process::Command::new("cargo")
+            .args([
+                "metadata",
+                "--locked",
+                "--offline",
+                "--format-version",
+                "1",
+                "--no-deps",
+            ])
+            .current_dir(workspace_root())
+            .output()
+            .expect("Cargo must be available for workspace dependency inspection");
         assert!(
-            dockerfile.contains(
-                "frankensearch.git \"${FRANKENSEARCH_COMMIT}\" /build/frankensearch-rel-0332"
-            ),
-            "Dockerfile must clone frankensearch at FRANKENSEARCH_COMMIT, not a sibling ref"
+            result.status.success(),
+            "Cargo metadata failed: {}",
+            String::from_utf8_lossy(&result.stderr)
         );
-        assert!(
-            !dockerfile.contains("frankensearch.git \"${SIBLING_REF}\""),
-            "frankensearch must not float with SIBLING_REF"
-        );
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&result.stdout).expect("Cargo emits valid metadata JSON");
+        let expected =
+            format!("git+https://github.com/Dicklesworthstone/frankensearch?rev={dist_commit}");
+        let mut declarations = 0;
+        for package in metadata["packages"].as_array().expect("workspace packages") {
+            for dependency in package["dependencies"].as_array().expect("dependencies") {
+                let name = dependency["name"].as_str().expect("dependency name");
+                if name == "frankensearch" || name.starts_with("frankensearch-") {
+                    assert_eq!(
+                        dependency["source"].as_str(),
+                        Some(expected.as_str()),
+                        "Cargo declaration for {name} drifted from dist.yml"
+                    );
+                    declarations += 1;
+                }
+            }
+        }
+        assert!(declarations > 0, "no FrankenSearch declarations inspected");
     }
 
     #[test]
@@ -302,16 +330,25 @@ mod container_release_contract {
             );
         }
 
-        let source_dockerfile_mutation =
-            source_dockerfile.replacen("git checkout -q FETCH_HEAD;", "git checkout -q main;", 1);
-        assert_ne!(
-            source_dockerfile_mutation, source_dockerfile,
-            "source Dockerfile mutation anchor must exist"
-        );
-        assert!(
-            validate(&workflow, &release_dockerfile, &source_dockerfile_mutation).is_err(),
-            "source Dockerfile checkout mutation unexpectedly passed"
-        );
+        let source_dockerfile_mutations = [
+            source_dockerfile.replacen("git checkout -q FETCH_HEAD;", "git checkout -q main;", 1),
+            source_dockerfile.replacen(
+                "cargo build --release --locked",
+                "cargo build --release",
+                1,
+            ),
+            format!("{source_dockerfile}\nARG SIBLING_REF=main\n"),
+        ];
+        for mutation in source_dockerfile_mutations {
+            assert_ne!(
+                mutation, source_dockerfile,
+                "source Dockerfile mutation anchor must exist"
+            );
+            assert!(
+                validate(&workflow, &release_dockerfile, &mutation).is_err(),
+                "source Dockerfile contract mutation unexpectedly passed"
+            );
+        }
     }
 }
 

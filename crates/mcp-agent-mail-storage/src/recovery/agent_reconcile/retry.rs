@@ -1,18 +1,23 @@
-//! Bounded, ID-only retry debt for lifecycle profile recovery.
+//! Bounded retry debt and source-aware conflict hints for profile recovery.
 //!
 //! A transient archive failure must not disappear behind the roster watermark.
 //! Retaining a profile payload would be unsafe: retirement or deregistration
 //! can change before the next attempt. Every scheduled ID is read afresh by
 //! the ordinary source and publication checks in the parent module.
+//! Stable conflicts retain only an ID and digest of freshly observed authority,
+//! never an archived payload or permission to skip the next authority read.
 
 mod checkpoint;
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 use crate::StorageError;
 
 const MAX_RETRY_IDS: usize = 1024;
+const MAX_CONFLICT_IDS: usize = 1024;
 const MAX_READY_PER_BATCH: usize = 16;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -20,6 +25,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 pub(super) struct Failure {
     pub(super) detail: String,
     pub(super) transient: bool,
+    pub(super) conflict_fingerprint: Option<String>,
 }
 
 impl Failure {
@@ -31,6 +37,17 @@ impl Failure {
         Self {
             detail,
             transient: true,
+            conflict_fingerprint: None,
+        }
+    }
+
+    /// Only a conflict proven from bounded, readable source/archive evidence
+    /// can supply this witness. Rendered error text alone grants no suppression.
+    pub(super) const fn conflict(detail: String, fingerprint: String) -> Self {
+        Self {
+            detail,
+            transient: false,
+            conflict_fingerprint: Some(fingerprint),
         }
     }
 }
@@ -40,6 +57,7 @@ impl From<String> for Failure {
         Self {
             detail,
             transient: false,
+            conflict_fingerprint: None,
         }
     }
 }
@@ -66,7 +84,7 @@ fn retryable_io_error(error: &std::io::Error) -> bool {
             | ErrorKind::StorageFull
             | ErrorKind::QuotaExceeded
             | ErrorKind::OutOfMemory
-    )
+    ) || crate::recovery::is_file_descriptor_exhaustion(error)
 }
 
 impl From<StorageError> for Failure {
@@ -83,7 +101,68 @@ impl From<StorageError> for Failure {
         Self {
             detail: error.to_string(),
             transient,
+            conflict_fingerprint: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ConflictEntry {
+    id: i64,
+    fingerprint: String,
+}
+
+impl ConflictEntry {
+    fn is_valid(&self) -> bool {
+        self.id > 0
+            && self.fingerprint.len() == 64
+            && self
+                .fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+}
+
+/// Best-effort suppression, separate from mandatory transient retry debt.
+/// Entries are FIFO and bounded: more than 1024 distinct conflicts can evict
+/// old hints and therefore repeat their diagnostics. Saturation never blocks
+/// roster progress, removes retry obligations, or changes archive evidence.
+#[derive(Debug, Default)]
+pub(super) struct ConflictCache {
+    entries: VecDeque<ConflictEntry>,
+}
+
+impl ConflictCache {
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(super) fn matches(&self, id: i64, fingerprint: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.id == id && entry.fingerprint == fingerprint)
+    }
+
+    pub(super) fn forget(&mut self, id: i64) {
+        self.entries.retain(|entry| entry.id != id);
+    }
+
+    /// Return whether retaining this new witness evicted another ID. Repeated
+    /// observations of the same witness do not refresh its FIFO position.
+    pub(super) fn remember(&mut self, id: i64, fingerprint: String) -> bool {
+        if self.matches(id, &fingerprint) {
+            return false;
+        }
+        let entry = ConflictEntry { id, fingerprint };
+        debug_assert!(entry.is_valid(), "conflict witnesses must be canonical");
+        self.forget(id);
+        let evicted = self.entries.len() == MAX_CONFLICT_IDS;
+        if evicted {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(entry);
+        evicted
     }
 }
 
@@ -103,6 +182,14 @@ pub(super) struct RetryQueue {
 }
 
 impl RetryQueue {
+    pub(super) fn next_ready_at(&self) -> Option<Instant> {
+        self.entries.iter().map(|entry| entry.ready_at).min()
+    }
+
+    pub(super) fn has_capacity(&self) -> bool {
+        self.entries.len() < MAX_RETRY_IDS
+    }
+
     pub(super) fn len(&self) -> usize {
         self.entries.len()
     }
@@ -115,7 +202,7 @@ impl RetryQueue {
     /// The single cursor owner cannot consume this slot concurrently. A full
     /// queue stops new scan work, not retries, and never evicts unresolved debt.
     pub(super) fn can_admit(&self, id: i64) -> bool {
-        self.entries.len() < MAX_RETRY_IDS || self.contains(id)
+        self.has_capacity() || self.contains(id)
     }
 
     /// Select without removing. Cancellation, exhausted repair budgets, and
@@ -199,6 +286,73 @@ pub(super) fn interleave(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conflict_witnesses_are_scoped_to_id_and_exact_inputs() {
+        let mut conflicts = ConflictCache::default();
+        let before = "a".repeat(64);
+        let after = "b".repeat(64);
+        assert!(!conflicts.remember(7, before.clone()));
+        assert!(conflicts.matches(7, &before));
+        assert!(!conflicts.matches(8, &before));
+        assert!(!conflicts.matches(7, &after));
+        assert!(!conflicts.remember(8, before.clone()));
+        assert!(!conflicts.remember(7, after.clone()));
+        assert_eq!(conflicts.len(), 2);
+        assert!(!conflicts.matches(7, &before));
+        assert!(conflicts.matches(7, &after));
+        conflicts.forget(7);
+        assert_eq!(conflicts.len(), 1);
+        assert!(!conflicts.matches(7, &after));
+        assert!(conflicts.matches(8, &before));
+    }
+
+    #[test]
+    fn conflict_cache_is_bounded_fifo_without_refresh_on_unchanged_observations() {
+        let mut conflicts = ConflictCache::default();
+        let limit = i64::try_from(MAX_CONFLICT_IDS).unwrap();
+        let fingerprint = "a".repeat(64);
+        for id in 1..=limit {
+            assert!(!conflicts.remember(id, fingerprint.clone()));
+        }
+        for _ in 0..316 {
+            assert!(conflicts.matches(1, &fingerprint));
+            assert!(!conflicts.remember(1, fingerprint.clone()));
+        }
+        assert!(conflicts.remember(limit + 1, fingerprint.clone()));
+        assert_eq!(conflicts.len(), MAX_CONFLICT_IDS);
+        assert!(!conflicts.matches(1, &fingerprint));
+        assert!(conflicts.matches(2, &fingerprint));
+        assert!(conflicts.matches(limit + 1, &fingerprint));
+        assert!(conflicts.remember(limit + 2, fingerprint.clone()));
+        assert!(!conflicts.matches(2, &fingerprint));
+        conflicts.forget(3);
+        assert!(!conflicts.remember(limit + 3, fingerprint));
+        assert_eq!(conflicts.len(), MAX_CONFLICT_IDS);
+    }
+
+    #[test]
+    fn failure_text_and_typed_infrastructure_errors_never_supply_conflict_witnesses() {
+        let detail = "archived deregistration conflicts with the live ledger; preserved";
+        for failure in [
+            Failure::from(detail),
+            Failure::from(StorageError::InvalidPath(detail.into())),
+            Failure::from(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                detail,
+            ))),
+            Failure::transient(detail.into()),
+        ] {
+            assert!(failure.conflict_fingerprint.is_none());
+        }
+        let fingerprint = "a".repeat(64);
+        let conflict = Failure::conflict(detail.into(), fingerprint.clone());
+        assert!(!conflict.transient);
+        assert_eq!(
+            conflict.conflict_fingerprint.as_deref(),
+            Some(fingerprint.as_str())
+        );
+    }
 
     #[test]
     fn retry_backoff_is_bounded_and_selection_does_not_consume_debt() {
@@ -308,6 +462,10 @@ mod tests {
     fn resource_pressure_keeps_lifecycle_debt_without_erasing_other_ids() {
         use std::io::ErrorKind;
 
+        #[cfg(any(unix, windows))]
+        for error in crate::recovery::descriptor_exhaustion_errors() {
+            assert!(Failure::from(StorageError::Io(error)).transient);
+        }
         for kind in [
             ErrorKind::Interrupted,
             ErrorKind::ResourceBusy,

@@ -306,9 +306,9 @@ Downloads the right binary for your platform, installs to `~/.local/bin`, option
 
 In both models, a missing checksum, SHA-256 implementation, signature witness, or required verifier executable—and any malformed or mismatched signature evidence—aborts the install.
 
-Options: `--version vX.Y.Z`, `--dest DIR`, `--system` (installs to `/usr/local/bin`), `--from-source`, `--verify` (run an additional post-install self-test), `--no-verify` (**unsafe** explicit escape that skips the checksum and signature checks), `--easy-mode` (auto-update PATH), `--force`, `--no-service` (never install/modify/restart the background service; also implied automatically by a non-default `--dest`), `--uninstall`, `--yes`, `--purge`. **`--no-verify` allows unauthenticated downloaded binaries to execute during mandatory version probes before installation; malicious archive bytes can therefore run arbitrary code as the installer user.** Archive verification applies to downloaded release archives, not source builds. Every downloaded archive must still contain exactly the two expected flat, non-empty regular-file members, and both staged binaries and both installed binaries must report the exact requested version. Those member/version checks are mandatory even with `--no-verify`; the flag also does not disable the optional broader `--verify` post-install self-test. A failed archive download never silently changes into a source build. Explicit `--from-source` checks out the exact requested tag, obtains immutable sibling revisions from that tag's release workflow, builds with `cargo --locked`, and subjects the staged and installed pair to the same exact-version and byte-preserving transactional replacement gates.
+Options: `--version vX.Y.Z`, `--dest DIR`, `--system` (installs to `/usr/local/bin`), `--from-source`, `--verify` (run an additional post-install self-test), `--no-verify` (**unsafe** explicit escape that skips the checksum and signature checks), `--easy-mode` (auto-update PATH), `--force`, `--no-service` (never install/modify/restart the background service; also implied automatically by a non-default `--dest`), `--uninstall`, `--yes`, `--purge`. **`--no-verify` allows unauthenticated downloaded binaries to execute during mandatory version probes before installation; malicious archive bytes can therefore run arbitrary code as the installer user.** Archive verification applies to downloaded release archives, not source builds. Every downloaded archive must contain the two expected flat, non-empty regular-file binaries and may also contain flat regular-file `README.md` and `LICENSE` entries; duplicate or other members are rejected. Both staged binaries and both installed binaries must report the exact requested version. Those member/version checks are mandatory even with `--no-verify`; the flag also does not disable the optional broader `--verify` post-install self-test. A failed archive download never silently changes into a source build. Explicit `--from-source` checks out the exact requested tag, obtains immutable sibling revisions from that tag's release workflow, builds with `cargo --locked`, and subjects the staged and installed pair to the same exact-version and byte-preserving transactional replacement gates.
 
-A successful source install prints the path of a mode-private `source-receipt` retained inside its committed transaction-history directory. The hash-witnessed receipt binds the normalized release tag, the exact Agent Mail/frankensearch/fast_cmaes/beads_rust commits, and both installed binary SHA-256 digests. On current source, the Beads commit records an additional installer checkout; the compiled `beads_rust` package comes from the registry version and checksum in `Cargo.lock`. Release tags that predate the immutable dependency-pin record fail closed rather than building mutable sibling branches. Interrupted or rolled-back transactions retain their evidence under an explicitly non-committed history name and are never reported as installed source provenance.
+A successful source install prints the path of a mode-private `source-receipt` retained inside its committed transaction-history directory. The hash-witnessed receipt binds the normalized release tag, the exact Agent Mail/frankensearch/fast_cmaes/beads_rust commits, and both installed binary SHA-256 digests. On current source, the Beads commit records an additional installer checkout; Agent Mail's Beads integration uses the installed external `br` CLI rather than embedding its Rust library. Release tags that predate the immutable dependency-pin record fail closed rather than building mutable sibling branches. Interrupted or rolled-back transactions retain their evidence under an explicitly non-committed history name and are never reported as installed source provenance.
 
 ### Windows One-Liner (PowerShell)
 
@@ -316,7 +316,7 @@ A successful source install prints the path of a mode-private `source-receipt` r
 iwr -useb "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.ps1?$(Get-Random)" | iex
 ```
 
-PowerShell enforces the same per-release trust contract before `Expand-Archive`: for releases v0.3.31 and later it verifies the minisign-signed `SHA256SUMS` manifest with the same pinned maintainer key (a `minisign` executable on `PATH` is required; `cosign` is not consulted), and for older releases it requires the same stable `cosign` v3.1.3-or-newer-in-v3 verifier, forces modern-bundle parsing, and isolates verification from the three custom Sigstore trust environment variables named above. The ZIP must contain exactly flat `am.exe` and `mcp-agent-mail.exe`, and their staged and post-install version lines must exactly match the requested release. Both executables are replaced under one per-destination installer mutex and rollback domain; backups remain until byte-for-byte installed-digest and version checks pass. Options: `-Version vX.Y.Z`, `-Dest PATH`, `-Force`, `-Verify` (explicitly request the already-default cryptographic checks), and `-NoVerify` (the **unsafe** escape that skips only those checksum and signature checks). Archive-member and exact-version checks still run with `-NoVerify`, which means unauthenticated downloaded executables run during version probes and may execute arbitrary code as the installer user.
+PowerShell enforces the same per-release trust contract before `Expand-Archive`: for releases v0.3.31 and later it verifies the minisign-signed `SHA256SUMS` manifest with the same pinned maintainer key (a `minisign` executable on `PATH` is required; `cosign` is not consulted), and for older releases it requires the same stable `cosign` v3.1.3-or-newer-in-v3 verifier, forces modern-bundle parsing, and isolates verification from the three custom Sigstore trust environment variables named above. The ZIP must contain `am.exe` and `mcp-agent-mail.exe`, with optional `README.md` and `LICENSE` entries. Every member must be a flat, non-empty regular file; duplicate or other members are rejected. The binaries' staged and post-install version lines must exactly match the requested release. Both executables are replaced under one per-destination installer mutex and rollback domain; backups remain until byte-for-byte installed-digest and version checks pass. Options: `-Version vX.Y.Z`, `-Dest PATH`, `-Force`, `-Verify` (explicitly request the already-default cryptographic checks), and `-NoVerify` (the **unsafe** escape that skips only those checksum and signature checks). Archive-member and exact-version checks still run with `-NoVerify`, which means unauthenticated downloaded executables run during version probes and may execute arbitrary code as the installer user.
 
 ### Container (Docker or Podman)
 
@@ -349,7 +349,7 @@ Requires Rust nightly (see `rust-toolchain.toml`). Current `main` records [Frank
 
 A manual build needs no FrankenSearch, fast_cmaes, or Beads sibling checkout. Use `cargo build --locked` to retain the checked-in dependency graph. Earlier release tags may still require the gated `../frankensearch-rel-0332` and `../fast_cmaes` checkouts; `install.sh --from-source` provisions their recorded revisions. The installer and container recipes retain those additional checkouts for provenance compatibility, while current Cargo builds consume the pinned git source.
 
-The mailbox uses registry FrankenSQLite `=0.4.10` through SQLModel 0.5.0 on Asupersync 0.5.0. `Cargo.lock` selects the FastMCP 0.13.0 family from crates.io, with `fastmcp-rust` imported as `fastmcp`. Registry `beads_rust =0.6.0` retains its separate FrankenSQLite 0.3.18 engine, patched to an immutable Git revision, with default features disabled. See [`UPGRADE_LOG.md`](UPGRADE_LOG.md) for engine qualification results.
+The mailbox uses registry FrankenSQLite `=0.4.13` through SQLModel 0.5.1 on Asupersync 0.5.0. SQLModel's pool and core are pinned to [revision `c9967106`](https://github.com/Dicklesworthstone/sqlmodel_rust/commit/c996710674d92c00d23f30fe17ecc5d9644818c7) for cancellation-safe waiter cleanup and cooperative acquisition deadlines; published 0.5.1 lacks this pool fix. Synchronous driver work must still yield for a deadline to interrupt it. No SQLModel sibling checkout is needed. `Cargo.lock` selects the FastMCP 0.13.0 family from crates.io, with `fastmcp-rust` imported as `fastmcp`. Beads discovery and queries use the installed `br` CLI; discovery runs its database-free config-path command, and Agent Mail no longer embeds a second storage engine. See [`UPGRADE_LOG.md`](UPGRADE_LOG.md) for engine qualification results. If persisted tool metrics have already bloated your mailbox, stop the server and follow the [offline recovery procedure](docs/RECOVERY_RUNBOOK.md) before running `am doctor vacuum --yes`; upgrading does not compact existing pages.
 
 ### Platforms
 
@@ -824,6 +824,27 @@ Keys recorded before the normalized path-set fingerprint update can return
 `IDEMPOTENCY_KEY_CONFLICT` after an upgrade, even within their retention window.
 The original grants remain unchanged; inspect them before making a new attempt.
 
+### Agent identities
+
+Omit `name` from `register_agent` (or `name_hint` from `create_agent_identity`)
+to get an automatically generated adjective+noun name such as `GreenLake`.
+For a stable task identity, supply a name such as `app-x-refactor`, `worker_42`,
+or `api.review`.
+
+Explicit task identifiers start with an ASCII letter or digit, contain at
+least one `.`, `_`, or `-`, and use only ASCII letters, digits, and those
+separators, up to 128 characters. They preserve their spelling. Vocabulary
+names still normalize to PascalCase. Both forms are unique within a project
+without regard to case: registering `APP-X-REFACTOR` after `app-x-refactor`
+updates the same identity and returns its original canonical spelling.
+`create_agent_identity` instead rejects a name that is already in use.
+
+Path separators, address delimiters, consecutive or trailing dots, template
+placeholders, Windows device names, and reserved program/model/operator
+identities are rejected. Broadcast tokens remain unsupported. A dot inside
+an identity is part of its name; cross-project recipients still use
+`Name@project` or `project:project#Name` and require the usual contact approval.
+
 ### 25 MCP Resources
 
 Read-only resources span environment/config inspection, project and agent discovery, inbox and thread views, reservation views, and tooling diagnostics. They are there so agents can fetch state cheaply without mutating anything.
@@ -1011,6 +1032,30 @@ another agent holds an active lease, the hook fails closed (exit 2) naming what
 was skipped and which variable to raise, the same way every other unfinished
 inspection does. `AGENT_MAIL_GUARD_MODE=warn` turns that into a warning.
 
+Installing with `am guard install <project> <repo> --prepush` also installs a
+composed post-commit hook. It independently checks the exact committed snapshot
+against active reservations, including both rename endpoints and every merge
+parent. A complete check in block mode records a private, signed admission in
+the repository's Git metadata. A later editing lease can then protect the next
+editor's work without vetoing publication of that already admitted commit.
+The pre-commit guard still checks staged changes; publishing never modifies
+the index or working tree.
+
+Pre-push skips only individually admitted commit objects. It still checks
+unadmitted ancestors and commits created without a successful admission, using
+the same scan bounds. Commit timestamps, branch names, replacement refs and
+grafts do not establish admission. Receipts are bound to the canonical
+repository, project and archive authority and the generated guard policy;
+copying receipts to another repository or changing that authority cannot reuse
+them. A failed or incomplete post-commit check leaves the commit unadmitted
+and prints a warning, since Git cannot veto a commit from that hook.
+Explicit bypass, disabled enforcement and warn mode never record admission.
+Ambiguous or malformed reservation evidence cannot record it either. Existing
+user hooks remain composed and are restored when the guard is uninstalled.
+Reinstall with `--prepush` to enable admission in repositories with older hooks.
+Shallow repositories, and platforms without directory-relative no-follow file
+operations, retain the ordinary pre-push reservation check without admission.
+
 | Area | Reserve glob |
 |------|-------------|
 | Core types/config | `crates/mcp-agent-mail-core/src/**` |
@@ -1074,9 +1119,52 @@ It includes `schema_version`, `complete`, `project`, `agents`, `captured_ts`,
 `active_only`, `count`, and `reservations`. Set `active_only=false` to include
 released and expired leases. Snapshot mode accepts no `limit` or `offset` and
 refuses results exceeding 10,000 reservations, 10,000 holder identities, or
-4 MiB of JSON. The CLI rejects incomplete snapshots and older servers that only
-return pages; it does not display a truncated set as complete. Explicit resource
-reads without `snapshot=true` retain their existing pagination behavior.
+4 MiB of JSON. For history reads (`active_only=false`), a CLI receiving this
+specific capacity refusal negotiates `snapshot_pages=true` with the same
+authenticated server. The server captures a larger bounded set once, then
+returns immutable pages of at most 250 rows and 4 MiB each. This supports
+`am file_reservations list <project> --all` beyond the single-response limits
+without opening another database connection in the CLI.
+
+Paged snapshots allow at most 100,000 reservations and holder identities and
+64 MiB of serialized pages, including repeated identity metadata. All rows,
+holder names, release states, and ordering (`created_ts`, then `id`) come from
+one database read snapshot. Changes after capture appear only in a new read.
+Each page includes `consistency: "materialized_snapshot"`, `snapshot_token`,
+`captured_ts`, `total_count`, `offset`, `count`, and an explicit `next_offset`
+(null on the terminal page), alongside `project`, `agents`, `active_only`, and
+`reservations`. `captured_ts` marks capture start, not an exact historical query
+timestamp. Continue with the same URI plus `snapshot_token=<token>` and
+`offset=<next_offset>`; do not supply `snapshot` or `limit` in paged mode.
+
+Tokens expire 300 seconds after publication, do not survive server restart,
+and remain bound to the mailbox engine generation, project identity, and
+active/history scope. Every continuation requires normal server authentication.
+New pages advertise `supports_release: true`. Once a client finishes or abandons
+the read, it can free the snapshot using the same URI with its `snapshot_token`
+and `snapshot_release=true`, omitting `offset`. Release is authenticated, scoped,
+and idempotent; page retries remain valid until release or expiry. The CLI makes
+this best-effort cleanup request after success or a pagination failure, with a
+two-second request timeout. Cleanup failure does not replace the listing or its
+original error; expiry handles crashes, lost connectivity, and older paged servers
+that do not advertise release.
+The server retains at most four snapshots within a 128 MiB serialized cache
+budget; in-progress captures reserve capacity too. A full cache, expired token,
+oversized individual row/identity metadata, or exceeded aggregate bound is an
+explicit error. The CLI validates every page, permits at most 1,024 requests
+within a 300-second history-read budget, and displays nothing until the entire
+set and final project identity checks succeed. Retry a failed read from the
+beginning; partial results are never reported as complete.
+
+This path requires both the updated CLI and server. Older servers that return
+only ordinary arrays cannot provide the paged snapshot guarantee; the CLI
+retains the original size refusal and gives an upgrade/restart hint. Existing
+small legacy reads still require a short explicit page to prove completeness.
+Active-only safety reads retain the original single-snapshot limits. Ordinary
+resource reads without either snapshot mode keep independent `limit`/`offset`
+pagination and are not a consistent snapshot. Server rejection diagnostics
+retain the numeric error code and sanitized reason; only actual HTTP
+authentication failures receive authentication guidance.
 
 ---
 
@@ -1231,10 +1319,12 @@ for the shipped replay boundary and the still-deferred live parity contract.
 |-------|-------------|
 | `/mail/` and `/mail/unified-inbox` | Unified inbox across all projects with importance filtering and related-project context |
 | `/mail/projects` | Project inventory page for browsing into one mailbox at a time |
-| `/mail/{project}` | Project overview with search entry point, agent roster, and quick links |
+| `/mail/{project}` | Project overview with the six most recently active conversations, search, agent roster, and quick links |
+| `/mail/{project}/threads` | All project conversations, with subjects, canonical IDs, message counts, timestamps, and older/newer navigation |
 | `/mail/{project}/inbox/{agent}` | Reverse-chronological inbox for one agent with pagination and mark-read actions |
 | `/mail/{project}/message/{id}` | Full message detail with metadata, recipients, thread preview, and attachments |
 | `/mail/{project}/thread/{thread_id}` | Full thread rendering with chronological conversation context |
+| `/mail/{project}/thread?thread_id=...` | Query-form conversation link, including dot-only identifiers that browsers normalize in URL paths |
 | `/mail/{project}/search?q=...` | Search V3-powered query route with field filters (`subject:foo`, `body:"multi word"`) |
 | `/mail/{project}/file_reservations` | Active and historical file reservations |
 | `/mail/{project}/attachments` | Messages with attachments and provenance |
@@ -1250,6 +1340,25 @@ server beyond loopback. With auth configured,
 `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=true` explicitly permits the guarded local
 bypass; it is not needed for no-token operation. These transport controls do not
 isolate hostile clients sharing the same OS account or bearer credential.
+
+### Browsing conversations
+
+Open **Threads** or **Browse all threads** from a project to browse its conversations
+without searching first. The browser defaults to 50 conversations per page;
+`?limit=...` accepts up to 200. Conversations are ordered by their latest message's
+timestamp and message ID. Older/newer links retain a message watermark, so new
+messages do not move conversations between pages during a browsing session. Use
+**Latest conversations** to refresh that view.
+
+Each nonblank explicit thread ID is preserved exactly. A message with no thread
+ID uses its decimal message ID as its conversation key, joining replies with that
+same key. Numeric keys never expand into an unrelated named conversation; `42`
+and `0042` stay distinct. Thread links in search, message details, and inboxes use
+the same identity rules and remain scoped to the message's project.
+
+The conversation list reads indexed message metadata and hydrates only the selected
+subjects. It does not load message bodies or change read/acknowledgement receipts.
+The dynamic browser is omitted from static-export project pages.
 
 ### Human Overseer
 
@@ -1329,7 +1438,7 @@ All configuration via environment variables. The server reads them at startup vi
 | `DB_MAINTENANCE_ENABLED` | `true` | Enable checkpoint/ANALYZE/VACUUM/journal-size maintenance within the integrity guard; `false` leaves checks and backups enabled |
 | `DB_CHECKPOINT_INTERVAL_SECS` | `300` | Passive WAL checkpoint cadence (`0` disables that op) |
 | `DB_ANALYZE_INTERVAL_SECS` | `21600` | `ANALYZE` planner-stats refresh cadence (`0` disables) |
-| `DB_VACUUM_INTERVAL_SECS` | `86400` | `VACUUM` reclaim/defragment cadence (`0` disables) |
+| `DB_VACUUM_INTERVAL_SECS` | `86400` | Isolated ATC telemetry sidecar `VACUUM` cadence (`0` disables). Main-mailbox compaction requires a stopped server and explicit `am doctor vacuum --yes`. |
 | `DB_JOURNAL_SIZE_LIMIT_BYTES` | `16777216` | `journal_size_limit` WAL truncation cap (16 MiB); an automatic checkpoint over the cap truncates the WAL |
 | `AM_GIT_BINARY` | (resolver) | Override the `git` binary for all in-process shell-outs (mitigates the git 2.51.0 index race) |
 | `AM_GIT_FLOCK_TIMEOUT_SECS` | `60` | Bounded wait for the per-repo `am.git-serialize.lock` before a git shell-out fails `EX_TEMPFAIL` (75) |
@@ -1797,7 +1906,7 @@ The canonical realism and closure policy lives in [docs/VERIFICATION_COVERAGE_LE
 | `sqlmodel_rust` / `sqlmodel` | SQLite ORM (schema, queries, migrations, pool) |
 | `frankentui` | TUI rendering (widgets, themes, accessibility, markdown, syntax highlighting) |
 | `frankensearch` | Hybrid search engine (lexical + semantic, two-tier fusion, reranking) |
-| `beads_rust` | Issue tracking integration |
+| `br` (external CLI) | Issue tracking integration |
 | `toon` | Token-efficient compact encoding for robot mode output |
 
 ---

@@ -1,9 +1,10 @@
-//! Reconstruct missing stable ACTIVE reservation artifacts without client traffic.
+//! Reconstruct missing or incompletely renewed ACTIVE reservation artifacts.
 //!
-//! Publication is create-only: ordinary reservation writers do not all take the
-//! project lock, so an active repair must never replace an existing file. A
-//! concurrent release/renewal wins the destination instead. Only generation-
-//! stamped stable paths are repaired; reusable digest aliases are never written.
+//! Missing files use create-only publication. An existing generation-stamped
+//! artifact can advance only its expiry, with matching owner, creation, intent
+//! and live database authority. Ordinary reservation writers and repair hold the
+//! same publication fence and project locks; a published terminal release or
+//! newer expiry always wins. Reusable digest aliases are never written.
 //! Transient failures retain bounded ID-only retry debt, independently of the
 //! finite discovery round. Retrying never restores a captured ACTIVE payload.
 
@@ -28,6 +29,7 @@ use super::agent_reconcile::{committed_artifact, head_tree, read_artifact};
 use retry::RetryQueue;
 
 const IDS_PER_PASS: i64 = 32;
+const DISCOVERY_ROWS_PER_PASS: usize = 128;
 const WRITES_PER_PASS: usize = 4;
 const SOURCE_BYTES: i64 = 32 * 1024;
 const ARTIFACT_BYTES: usize = 128 * 1024;
@@ -223,6 +225,9 @@ pub struct ActiveReservationReport {
     pub deferred: usize,
     pub deferred_transient: usize,
     pub retry_len: usize,
+    /// The finite metadata scan advanced, even when no eligible lease needed
+    /// a payload read. This is not a repair or permission to skip a candidate.
+    pub discovery_advanced: bool,
     /// Discovery has more candidates, or retained retry debt still exists.
     /// Cooling retries remain debt even when this pass scans no payloads.
     pub more: bool,
@@ -277,7 +282,8 @@ impl From<crate::StorageError> for RepairFailure {
                         | std::io::ErrorKind::ResourceBusy
                         | std::io::ErrorKind::StorageFull
                         | std::io::ErrorKind::QuotaExceeded
-                        | std::io::ErrorKind::OutOfMemory));
+                        | std::io::ErrorKind::OutOfMemory)
+                    || crate::recovery::is_file_descriptor_exhaustion(error));
         // AlreadyExists can be a concurrent create-only publisher. A retry
         // revalidates its file; it never changes noclobber into replacement.
         // Resource pressure likewise proves no conflicting lease. Every
@@ -369,23 +375,8 @@ fn read_source(cx: &Cx, pool: &DbPool, id: i64) -> Result<Option<Source>, Repair
 fn read_source_connection(conn: &DbConn, id: i64) -> Result<Option<Source>, RepairFailure> {
     // One SQL snapshot supplies the holder, generation and both release stores.
     // The size predicate bounds materialized strings, not the SQL engine's work.
-    let rows = conn.query_sync(
-        "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                fr.created_ts, fr.expires_ts, CAST(fr.released_ts AS TEXT) AS hot_release, \
-                rr.released_ts AS ledger_release, p.slug, p.human_key, a.name, d.generation_id \
-         FROM file_reservations fr JOIN projects p ON p.id = fr.project_id \
-         JOIN agents a ON a.id = fr.agent_id AND a.project_id = fr.project_id \
-         LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
-         LEFT JOIN db_identity d ON d.singleton = 0 \
-         WHERE fr.id = ? AND length(CAST(fr.path_pattern AS BLOB)) + length(CAST(fr.reason AS BLOB)) + \
-               length(CAST(p.slug AS BLOB)) + length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
-               length(CAST(fr.created_ts AS BLOB)) + length(CAST(fr.expires_ts AS BLOB)) + \
-               length(CAST(fr.\"exclusive\" AS BLOB)) + \
-               COALESCE(length(CAST(fr.released_ts AS BLOB)), 0) + \
-               COALESCE(length(CAST(rr.released_ts AS BLOB)), 0) + \
-               COALESCE(length(CAST(d.generation_id AS BLOB)), 0) <= ?",
-        &[id.into(), SOURCE_BYTES.into()],
-    ).map_err(RepairFailure::source_unavailable)?;
+    let rows = super::query_reservation_source(conn, id, SOURCE_BYTES)
+        .map_err(RepairFailure::source_unavailable)?;
     let [row] = rows.as_slice() else {
         return Err(
             "active reservation source missing, oversized, or without holder authority".into(),
@@ -472,6 +463,10 @@ fn read_source_connection(conn: &DbConn, id: i64) -> Result<Option<Source>, Repa
 }
 
 fn validate_evidence(source: &Source, value: &Value) -> crate::Result<()> {
+    // Share ordinary writers' lifecycle checks, including the guard's
+    // agent_name/path aliases. The stricter checks below also require every
+    // canonical identity field before recovery can replace existing evidence.
+    crate::validate_reservation_publication_version(source.id, &source.artifact, value)?;
     for field in [
         "id",
         "project",
@@ -613,15 +608,35 @@ fn repair_one(
             validate_evidence(original, &artifact.value)?;
         }
         let bytes = if let Some(working) = &working {
-            // Existing files are never rewritten, even to extend an old expiry.
-            for field in ["expires_ts", "reason"] {
-                if working.value[field] != original.artifact[field] {
+            // An expiry is monotone; a reason or exclusivity change has no
+            // durable revision ordering. Restrict replacement to a lost renewal
+            // with the same intent, retaining every unknown surviving field.
+            if working.value["reason"] != original.artifact["reason"] {
+                return Err(invalid(
+                    "existing active reservation intent differs; renewal repair refused",
+                ));
+            }
+            if timestamp(&working.value["expires_ts"])
+                == timestamp(&original.artifact["expires_ts"])
+            {
+                working.bytes.clone()
+            } else {
+                // validate_evidence already proved that the surviving expiry
+                // is valid and strictly older than the live source. Unlike a
+                // commit-only retry, replacing an existing artifact also needs
+                // agreement from any surviving committed intent.
+                if committed
+                    .as_ref()
+                    .is_some_and(|a| a.value["reason"] != original.artifact["reason"])
+                {
                     return Err(invalid(
-                        "existing active artifact differs; create-only repair refused",
+                        "committed active reservation intent differs; renewal repair refused",
                     ));
                 }
+                let mut renewed = working.value.clone();
+                renewed["expires_ts"] = original.artifact["expires_ts"].clone();
+                serde_json::to_vec_pretty(&renewed)?
             }
-            working.bytes.clone()
         } else {
             let mut value = committed
                 .as_ref()
@@ -642,9 +657,28 @@ fn repair_one(
         if bytes.len() > ARTIFACT_BYTES {
             return Err(invalid("active reservation artifact exceeds byte bound"));
         }
-        if working.is_some() && committed.as_ref().is_some_and(|a| a.bytes == bytes) {
+        if working.as_ref().is_some_and(|a| a.bytes == bytes)
+            && committed.as_ref().is_some_and(|a| a.bytes == bytes)
+        {
             return Ok(false);
         }
+        let staged_renewal = if working.as_ref().is_some_and(|a| a.bytes != bytes) {
+            // All ordinary grant/renew/release writers converge on
+            // publish_reservation_writes, which takes this same fence, process
+            // mutex and .archive.lock before its renames. Stage within that
+            // ownership, then recheck the live source and exact destination
+            // after the potentially slow fsync. A cancelled or superseded
+            // candidate drops its private stage without publishing it.
+            checkpoint(cx, stop)?;
+            *attempted = true;
+            let staged = crate::StagedArchiveWrites::stage(vec![(path.clone(), bytes.clone())])?;
+            #[cfg(test)]
+            tests::after_renewal_stage(conn.as_ref().expect("retained source connection"), &path);
+            Some(staged)
+        } else {
+            None
+        };
+        checkpoint(cx, stop)?;
         if read_source_connection(
             conn.as_ref().expect("retained source connection"),
             original.id,
@@ -663,19 +697,27 @@ fn repair_one(
         // Publication needs the outer generation lease, not a pool slot.
         // Release capacity before filesystem syncs and Git commit work.
         drop(conn.take());
+        if read_artifact(&path)?.as_ref().map(|a| &a.bytes) != working.as_ref().map(|a| &a.bytes) {
+            return Err(invalid(
+                "active reservation artifact changed during verification; preserved",
+            ));
+        }
         checkpoint(cx, stop)?;
         *attempted = true;
-        if working.is_none() {
+        if let Some(staged) = staged_renewal {
+            staged.publish()?;
+            #[cfg(unix)]
+            fs::File::open(path.parent().expect("reservation parent"))?.sync_all()?;
+        } else if working.is_none() {
             publish_missing(&path, &bytes)?;
         }
-        // The commit helper reads the current file, not the captured ACTIVE
-        // payload. A racing terminal writer can therefore only supersede it;
-        // no stale active WriteOp is ever queued for a later overwrite.
+        // The commit helper reads the current file under the same project
+        // ownership. No captured ACTIVE WriteOp is queued for later overwrite.
         checkpoint(cx, stop)?;
         crate::commit_paths_with_retry(
             repo_root,
             config,
-            &format!("repair: missing active reservation {}", original.id),
+            &format!("repair: active reservation {} coverage", original.id),
             &[relative.as_str()],
         )?;
         let verified = Repository::open(repo_root)?;
@@ -724,14 +766,23 @@ fn checkpoint(cx: &Cx, stop: &AtomicBool) -> crate::Result<()> {
     Ok(())
 }
 
+struct ActiveSelection {
+    ids: Vec<i64>,
+    started_after: i64,
+    ineligible_prefix: i64,
+    examined_through: i64,
+    more: bool,
+}
+
 // The caller owns database admission throughout source binding and selection.
-// Keep the existing finite ID window and all active/grace/release predicates.
+// Bound the primary-key page before applying eligibility: a LIMIT on matching
+// leases alone can scan an entire released history while holding admission.
 fn select_ids(
     cx: &Cx,
     pool: &DbPool,
     config: &Config,
     cursor: &mut ActiveReservationCursor,
-) -> Result<Vec<i64>, String> {
+) -> Result<ActiveSelection, String> {
     validate_source(cx, pool, config)?;
     let identity = pool.sqlite_identity_key();
     if cursor.identity != identity {
@@ -741,34 +792,74 @@ fn select_ids(
         };
     }
     let conn = outcome(block_on(pool.acquire(cx)))?;
-    if cursor.ceiling.is_none() {
+    let (after, ceiling) = if let Some(ceiling) = cursor.ceiling {
+        (cursor.after, ceiling)
+    } else {
         let rows = conn
             .query_sync("SELECT COALESCE(MAX(id), 0) FROM file_reservations", &[])
             .map_err(source_error)?;
-        cursor.ceiling = Some(
+        (
+            0,
             rows.first()
                 .ok_or("reservation ID aggregate missing")?
                 .get_as::<i64>(0)
                 .map_err(source_error)?,
-        );
-        cursor.after = 0;
-    }
+        )
+    };
+    let now = mcp_agent_mail_db::now_micros();
     let rows = conn.query_sync(
-        "SELECT id FROM file_reservations WHERE id > ? AND id <= ? AND expires_ts > ? \
-         AND created_ts <= ? AND (released_ts IS NULL OR released_ts <= 0) \
+        "SELECT id, CASE WHEN expires_ts > ?3 AND created_ts <= ?4 \
+         AND (released_ts IS NULL OR released_ts <= 0) \
          AND NOT EXISTS (SELECT 1 FROM file_reservation_releases rr WHERE rr.reservation_id = file_reservations.id) \
-         ORDER BY id LIMIT ?",
-        &[cursor.after.into(), cursor.ceiling.unwrap_or(0).into(),
-          mcp_agent_mail_db::now_micros().into(),
-          mcp_agent_mail_db::now_micros().saturating_sub(GRANT_GRACE_US).into(), IDS_PER_PASS.into()],
+         THEN 1 ELSE 0 END AS eligible \
+         FROM file_reservations WHERE id > ?1 AND id <= ?2 ORDER BY id LIMIT ?5",
+        &[after.into(), ceiling.into(), now.into(),
+          now.saturating_sub(GRANT_GRACE_US).into(),
+          i64::try_from(DISCOVERY_ROWS_PER_PASS).expect("small discovery bound").into()],
     ).map_err(source_error)?;
-    rows.iter()
-        .map(|row| row.get_named::<i64>("id").map_err(source_error))
-        .collect()
+    let mut ids = Vec::new();
+    let mut last = after;
+    let mut ineligible_prefix = after;
+    let mut examined_through = after;
+    let mut truncated = false;
+    for row in &rows {
+        let id = row.get_named::<i64>("id").map_err(source_error)?;
+        let eligible = row.get_named::<i64>("eligible").map_err(source_error)?;
+        if id <= last || id > ceiling || !matches!(eligible, 0 | 1) {
+            return Err("active reservation page contains invalid selection evidence".into());
+        }
+        last = id;
+        if truncated {
+            continue;
+        }
+        if eligible == 1 {
+            if ids.len() == usize::try_from(IDS_PER_PASS).expect("small ID bound") {
+                truncated = true;
+                continue;
+            }
+            ids.push(id);
+        } else if ids.is_empty() {
+            ineligible_prefix = id;
+        }
+        examined_through = id;
+    }
+    // Publish a new round only after the complete metadata page decoded. Its
+    // eligible IDs remain unconsumed until the ordinary source/publication loop.
+    cursor.after = after;
+    cursor.ceiling = Some(ceiling);
+    Ok(ActiveSelection {
+        ids,
+        started_after: after,
+        ineligible_prefix,
+        examined_through,
+        more: truncated || (rows.len() == DISCOVERY_ROWS_PER_PASS && last < ceiling),
+    })
 }
 
-/// Repair missing generation-stamped stable artifacts for settled active leases.
-/// The pass never modifies database rows or overwrites an occupied destination.
+/// Repair missing artifacts and lost renewals for settled active leases.
+/// The pass never modifies database rows. Existing generation-stamped artifacts
+/// may only advance their expiry with matching identity and unchanged intent;
+/// terminal, newer, malformed or conflicting evidence remains untouched.
 /// Thirty-second-old grants are eligible; expired, released, unversioned and
 /// ambiguous sources remain untouched. Row selection and writes are bounded,
 /// but this is not a hard deadline on SQLite, Git or filesystem operations.
@@ -795,15 +886,23 @@ pub fn reconcile_active_reservations(
     if corruption_circuit_breaker().is_tripped() {
         return Err("active reservation repair refused: corruption breaker open".into());
     }
-    let ids = {
+    let selected = {
         let _selection = mcp_agent_mail_db::write_barrier::try_begin_write_activity().ok_or(
             "active reservation repair deferred: recovery promotion or admission contention",
         )?;
         select_ids(cx, pool, config, cursor)?
     };
+    if checkpoint(cx, stop).is_err() {
+        report.interrupted = true;
+        report.retry_len = cursor.retries.len();
+        report.more = true;
+        return Ok(report);
+    }
     let selected_identity = cursor.identity.clone();
-    let mut scan_more = ids.len() == usize::try_from(IDS_PER_PASS).expect("small ID bound");
-    let mut scan = ids.into_iter().peekable();
+    let mut scan_more = selected.more;
+    let last_selected = selected.ids.last().copied();
+    cursor.after = selected.ineligible_prefix;
+    let mut scan = selected.ids.into_iter().peekable();
     let mut retries = cursor.retries.due(Instant::now()).into_iter();
     let mut seen = HashSet::new();
     loop {
@@ -908,6 +1007,13 @@ pub fn reconcile_active_reservations(
             cursor.after = id;
         }
     }
+    // Only a fully consumed eligible prefix permits skipping its following
+    // ineligible metadata. A write/payload limit must retain every unvisited
+    // eligible ID, including one already taken from the iterator before yield.
+    if !report.interrupted && last_selected.is_none_or(|id| cursor.after >= id) {
+        cursor.after = selected.examined_through;
+    }
+    report.discovery_advanced = cursor.after > selected.started_after;
     // Discovery wraps independently of retry debt. A cooling retry must not
     // pin a completed round or restart it early while there are unvisited IDs.
     if !scan_more && !report.interrupted {
@@ -920,13 +1026,57 @@ pub fn reconcile_active_reservations(
 
 #[cfg(test)]
 mod tests {
+    use super::super::RESERVATION_SOURCE_SQL as SOURCE_SQL;
     use super::*;
+    use mcp_agent_mail_db::sqlmodel_core::Value as SqlValue;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    // Keep the pre-GH#354 projection as a runtime equivalence oracle. These
+    // tests execute both statements against the same real FrankenSQLite DB;
+    // timing is deliberately not a unit-test assertion.
+    const PREVIOUS_SOURCE_SQL: &str = "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
+                fr.created_ts, fr.expires_ts, CAST(fr.released_ts AS TEXT) AS hot_release, \
+                rr.released_ts AS ledger_release, p.slug, p.human_key, a.name, d.generation_id \
+         FROM file_reservations fr JOIN projects p ON p.id = fr.project_id \
+         JOIN agents a ON a.id = fr.agent_id AND a.project_id = fr.project_id \
+         LEFT JOIN file_reservation_releases rr ON rr.reservation_id = fr.id \
+         LEFT JOIN db_identity d ON d.singleton = 0 \
+         WHERE fr.id = ? AND length(CAST(fr.path_pattern AS BLOB)) + length(CAST(fr.reason AS BLOB)) + \
+               length(CAST(p.slug AS BLOB)) + length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
+               length(CAST(fr.created_ts AS BLOB)) + length(CAST(fr.expires_ts AS BLOB)) + \
+               length(CAST(fr.\"exclusive\" AS BLOB)) + \
+               COALESCE(length(CAST(fr.released_ts AS BLOB)), 0) + \
+               COALESCE(length(CAST(rr.released_ts AS BLOB)), 0) + \
+               COALESCE(length(CAST(d.generation_id AS BLOB)), 0) <= ?";
+
+    fn assert_source_projection_unchanged(conn: &DbConn, id: i64) {
+        let project = |sql| -> Vec<Vec<SqlValue>> {
+            conn.query_sync(sql, &[id.into(), SOURCE_BYTES.into()])
+                .unwrap()
+                .iter()
+                .map(|row| row.values().cloned().collect())
+                .collect()
+        };
+        assert_eq!(project(SOURCE_SQL), project(PREVIOUS_SOURCE_SQL), "id={id}");
+    }
+
+    type RenewalStageHook = Box<dyn FnOnce(&DbConn, &Path)>;
 
     std::thread_local! {
         static CHECKOUT_PENDING: std::cell::RefCell<Option<mpsc::Sender<()>>> =
             const { std::cell::RefCell::new(None) };
+        static AFTER_RENEWAL_STAGE: std::cell::RefCell<Option<RenewalStageHook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    // Observe the actual fsynced candidate before its final source/destination
+    // checks. The hook changes real SQL/files; it never supplies a source read
+    // or replaces the archive publication result.
+    pub(super) fn after_renewal_stage(conn: &DbConn, path: &Path) {
+        if let Some(hook) = AFTER_RENEWAL_STAGE.with(|slot| slot.borrow_mut().take()) {
+            hook(conn, path);
+        }
     }
 
     // Observe a real blocked checkout without substituting its outcome.
@@ -1127,6 +1277,220 @@ mod tests {
         conn.query_sync("PRAGMA query_only", &[]).unwrap()[0]
             .get_as::<i64>(0)
             .unwrap()
+    }
+
+    #[test]
+    fn active_source_point_lookup_preserves_projection_with_unrelated_history() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            let expires = mcp_agent_mail_db::now_micros() + 3_600_000_000;
+            conn.execute_sync(
+                "UPDATE file_reservations SET expires_ts = ? WHERE id = 401",
+                &[expires.into()],
+            )
+            .unwrap();
+            conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(72, 'other-project', '/other-project', 1)").unwrap();
+            conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(82, 72, 'RedFox', 'test', 'test', 1, 1)").unwrap();
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            for start in (1_000..3_048).step_by(128) {
+                let reservations = (start..start + 128)
+                    .map(|id| {
+                        format!(
+                            "({id},72,82,'other/*.rs',1,'unrelated history',1000000,9000000,NULL)"
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                conn.execute_raw(&format!(
+                    "INSERT INTO file_reservations(id,project_id,agent_id,path_pattern,\"exclusive\",reason,created_ts,expires_ts,released_ts) VALUES {reservations}"
+                )).unwrap();
+                let releases = (start..start + 128)
+                    .step_by(2)
+                    .map(|id| format!("({id},5000000)"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                conn.execute_raw(&format!(
+                    "INSERT INTO file_reservation_releases(reservation_id,released_ts) VALUES {releases}"
+                )).unwrap();
+            }
+            conn.execute_raw("COMMIT").unwrap();
+
+            for id in [401, 1_000, 1_001, 3_047, 9_999] {
+                assert_source_projection_unchanged(&conn, id);
+            }
+            let source = read_source_connection(&conn, 401).unwrap().unwrap();
+            assert_eq!(
+                (source.id, source.project_id, source.agent_id),
+                (401, 71, 81)
+            );
+            assert_eq!(source.slug, "project");
+            assert_eq!(source.generation, "aabb");
+            assert_eq!(
+                source.artifact,
+                json!({
+                    "id": 401, "project": "/project", "agent": "BlueLake",
+                    "path_pattern": "src/*.rs", "exclusive": true, "reason": "active-test",
+                    "created_ts": mcp_agent_mail_db::micros_to_iso(1_000_000),
+                    "expires_ts": mcp_agent_mail_db::micros_to_iso(expires),
+                    "db_generation": "aabb",
+                })
+            );
+            assert!(read_source_connection(&conn, 1_000).unwrap().is_none());
+            assert!(read_source_connection(&conn, 1_001).unwrap().is_none());
+            assert!(!read_source_connection(&conn, 9_999).unwrap_err().transient);
+            assert!(!config.storage_root.join(".git").exists());
+        });
+    }
+
+    #[test]
+    fn active_source_point_lookup_preserves_byte_bound_holder_and_release_authority() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            let expires = mcp_agent_mail_db::now_micros() + 3_600_000_000;
+            conn.execute_sync(
+                "UPDATE file_reservations SET expires_ts = ? WHERE id = 401",
+                &[expires.into()],
+            )
+            .unwrap();
+            // Account for every projected source byte independently of the
+            // SQL expression. A multibyte prefix distinguishes BLOB length
+            // from character count at the exact inclusive boundary.
+            let fixed_bytes = [
+                "src/*.rs", "project", "/project", "BlueLake", "1000000", "1", "aabb",
+            ]
+            .into_iter()
+            .map(str::len)
+            .sum::<usize>()
+                + expires.to_string().len();
+            let reason_bytes = usize::try_from(SOURCE_BYTES).unwrap() - fixed_bytes;
+            let mut reason = format!("é{}", "x".repeat(reason_bytes - "é".len()));
+            conn.execute_sync(
+                "UPDATE file_reservations SET reason = ? WHERE id = 401",
+                &[reason.clone().into()],
+            )
+            .unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            assert_eq!(
+                read_source_connection(&conn, 401)
+                    .unwrap()
+                    .unwrap()
+                    .artifact["reason"],
+                reason
+            );
+            reason.push('x');
+            conn.execute_sync(
+                "UPDATE file_reservations SET reason = ? WHERE id = 401",
+                &[reason.into()],
+            )
+            .unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            let oversized = read_source_connection(&conn, 401).unwrap_err();
+            assert!(!oversized.transient);
+            assert!(oversized.detail.contains("oversized"));
+            conn.execute_raw("UPDATE file_reservations SET reason = 'active-test' WHERE id = 401")
+                .unwrap();
+
+            // The agent exists, but belongs to another project. Neither the
+            // old nor new join can authorize it as this reservation's holder.
+            conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(72, 'other-project', '/other-project', 1)").unwrap();
+            conn.execute_raw("INSERT INTO agents(id, project_id, name, program, model, inception_ts, last_active_ts) VALUES(82, 72, 'RedFox', 'test', 'test', 1, 1)").unwrap();
+            conn.execute_raw("UPDATE file_reservations SET agent_id = 82 WHERE id = 401")
+                .unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            assert!(!read_source_connection(&conn, 401).unwrap_err().transient);
+            conn.execute_raw(
+                "UPDATE file_reservations SET agent_id = 81, released_ts = 5000000 WHERE id = 401",
+            )
+            .unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            assert!(read_source_connection(&conn, 401).unwrap().is_none());
+            conn.execute_raw("UPDATE file_reservations SET released_ts = 'invalid' WHERE id = 401")
+                .unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            assert!(
+                read_source_connection(&conn, 401)
+                    .unwrap_err()
+                    .detail
+                    .contains("malformed reservation release timestamp")
+            );
+            conn.execute_raw("UPDATE file_reservations SET released_ts = NULL WHERE id = 401")
+                .unwrap();
+            conn.execute_raw("INSERT INTO file_reservation_releases(reservation_id,released_ts) VALUES(401,5000000)").unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            assert!(read_source_connection(&conn, 401).unwrap().is_none());
+            conn.execute_raw(
+                "UPDATE file_reservation_releases SET released_ts = 0 WHERE reservation_id = 401",
+            )
+            .unwrap();
+            assert_source_projection_unchanged(&conn, 401);
+            assert!(
+                read_source_connection(&conn, 401)
+                    .unwrap_err()
+                    .detail
+                    .contains("malformed reservation release ledger")
+            );
+            assert!(!config.storage_root.join(".git").exists());
+        });
+    }
+
+    #[test]
+    fn mailbox_scale_active_repair_converges_with_bounded_source_queries() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            super::super::tests::seed_reservation_history(&conn, 71, 81, 401);
+            let active = [401, 1024, 2048, 3072, 4096, 5120, 6144, 8192, 9482];
+            let expires = mcp_agent_mail_db::now_micros() + 3_600_000_000;
+            conn.execute_raw(&format!(
+                "UPDATE file_reservations SET expires_ts={expires} \
+                 WHERE id IN (1024,2048,3072,4096,5120,6144,8192,9482)"
+            ))
+            .unwrap();
+            drop(conn);
+            let mut cursor = ActiveReservationCursor::default();
+            for round in 0..2 {
+                super::super::tests::reset_reservation_source_queries();
+                let started = Instant::now();
+                let (mut passes, mut scanned, mut repaired, mut unchanged) = (0, 0, 0, 0);
+                loop {
+                    let report = reconcile_active_reservations(
+                        cx,
+                        pool,
+                        config,
+                        &mut cursor,
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap();
+                    passes += 1;
+                    scanned += report.scanned;
+                    repaired += report.repaired;
+                    unchanged += report.unchanged;
+                    assert_eq!((report.deferred, report.retry_len), (0, 0), "{report:?}");
+                    assert!(report.scanned <= IDS_PER_PASS as usize);
+                    assert!(report.attempted <= WRITES_PER_PASS);
+                    assert!(passes <= 80, "finite discovery round did not converge");
+                    if !report.more {
+                        break;
+                    }
+                }
+                let queries = super::super::tests::reservation_source_queries();
+                assert_eq!(scanned, active.len());
+                assert_eq!(repaired, if round == 0 { active.len() } else { 0 });
+                assert_eq!(unchanged, if round == 0 { 0 } else { active.len() });
+                // Initial observation plus two fresh publication rechecks for
+                // repairs; already committed rows need only the first recheck.
+                // Expired history must never cause a source payload lookup.
+                assert_eq!(queries, active.len() * if round == 0 { 3 } else { 2 });
+                eprintln!(
+                    "GH354 active round={round} reservations=9482 passes={passes} \
+                     source_queries={queries} repaired={repaired} unchanged={unchanged} \
+                     wall_us={}",
+                    started.elapsed().as_micros()
+                );
+                for id in active {
+                    assert_committed(cx, pool, config, id);
+                }
+            }
+        });
     }
 
     #[test]
@@ -1376,10 +1740,10 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_publication_is_committed_but_existing_expiry_is_never_rewritten() {
+    fn interrupted_publication_and_lost_renewal_both_converge_without_client_traffic() {
         fixture(|cx, pool, config| {
             let source = read_source(cx, pool, 401).unwrap().unwrap();
-            crate::ensure_archive(config, &source.slug).unwrap();
+            let archive = crate::ensure_archive(config, &source.slug).unwrap();
             let path = target(config);
             let mut value = source.artifact.clone();
             value["operator_note"] = json!("retain exact surviving formatting");
@@ -1393,9 +1757,469 @@ mod tests {
             )
             .unwrap();
             drop(conn);
+            let renewed = read_source(cx, pool, 401).unwrap().unwrap();
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let before = repo.head().unwrap().target().unwrap();
             let report = pass(cx, pool, config);
-            assert_eq!((report.repaired, report.deferred), (0, 1));
-            assert_eq!(fs::read(path).unwrap(), bytes);
+            assert_eq!(
+                (report.attempted, report.repaired, report.deferred),
+                (1, 1, 0)
+            );
+            value["expires_ts"] = renewed.artifact["expires_ts"].clone();
+            let repaired = read_artifact(&path).unwrap().unwrap();
+            assert_eq!(repaired.value, value, "renewal changes only the expiry");
+            assert_ne!(repaired.bytes, bytes);
+            let relative = crate::rel_path_cached(&archive.canonical_repo_root, &path).unwrap();
+            let tree = head_tree(&repo).unwrap().unwrap();
+            assert_eq!(
+                committed_artifact(&repo, Some(&tree), &relative)
+                    .unwrap()
+                    .unwrap()
+                    .bytes,
+                repaired.bytes,
+            );
+            assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), renewed);
+            let repaired_head = repo.head().unwrap().target().unwrap();
+            assert_ne!(repaired_head, before);
+            let repeated = pass(cx, pool, config);
+            assert_eq!((repeated.unchanged, repeated.repaired), (1, 0));
+            assert_eq!(repo.head().unwrap().target().unwrap(), repaired_head);
+
+            // A renewed HEAD alone is not complete when the working artifact
+            // still has its pre-renewal bytes (for example after restoration).
+            fs::write(&path, &bytes).unwrap();
+            assert_eq!(pass(cx, pool, config).repaired, 1);
+            assert_eq!(fs::read(path).unwrap(), repaired.bytes);
+        });
+    }
+
+    fn seed_lost_renewal(cx: &Cx, pool: &DbPool, config: &Config) -> Source {
+        let source = read_source(cx, pool, 401).unwrap().unwrap();
+        let archive = crate::ensure_archive(config, &source.slug).unwrap();
+        let path = target(config);
+        publish_missing(&path, &serde_json::to_vec(&source.artifact).unwrap()).unwrap();
+        let relative = crate::rel_path_cached(&archive.canonical_repo_root, &path).unwrap();
+        crate::commit_paths_with_retry(
+            &archive.repo_root,
+            config,
+            "fixture: original grant",
+            &[&relative],
+        )
+        .unwrap();
+        let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+        conn.execute_raw("UPDATE file_reservations SET expires_ts=expires_ts+1000000 WHERE id=401")
+            .unwrap();
+        drop(conn);
+        read_source(cx, pool, 401).unwrap().unwrap()
+    }
+
+    #[test]
+    fn lost_renewals_share_the_four_write_budget_and_finish_the_round() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            for id in 402..=409 {
+                conn.execute_raw(&format!("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) SELECT {id}, project_id, agent_id, 'src/{id}.rs', \"exclusive\", reason, created_ts, expires_ts, NULL FROM file_reservations WHERE id=401")).unwrap();
+            }
+            drop(conn);
+            let archive = crate::ensure_archive(config, "project").unwrap();
+            let mut paths = Vec::new();
+            for id in 401..=409 {
+                let source = read_source(cx, pool, id).unwrap().unwrap();
+                let path = archive
+                    .root
+                    .join("file_reservations")
+                    .join(reservation_artifact_filename(Some("aabb"), id));
+                publish_missing(&path, &serde_json::to_vec(&source.artifact).unwrap()).unwrap();
+                paths.push(crate::rel_path_cached(&archive.canonical_repo_root, &path).unwrap());
+            }
+            crate::commit_paths_with_retry(
+                &archive.repo_root,
+                config,
+                "fixture: original grant batch",
+                &paths.iter().map(String::as_str).collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE file_reservations SET expires_ts=expires_ts+1000000 WHERE id BETWEEN 401 AND 409")
+                .unwrap();
+            drop(conn);
+            let mut cursor = ActiveReservationCursor::default();
+            for expected in [4, 4, 1] {
+                let report = reconcile_active_reservations(
+                    cx,
+                    pool,
+                    config,
+                    &mut cursor,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+                assert_eq!(
+                    (report.attempted, report.repaired, report.deferred),
+                    (expected, expected, 0)
+                );
+                assert!(report.scanned <= usize::try_from(IDS_PER_PASS).unwrap());
+                assert_eq!(report.more, expected == 4);
+            }
+            for id in 401..=409 {
+                assert_committed(cx, pool, config, id);
+            }
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let head = repo.head().unwrap().target().unwrap();
+            let repeated = pass(cx, pool, config);
+            assert_eq!(
+                (repeated.unchanged, repeated.attempted, repeated.repaired),
+                (9, 0, 0)
+            );
+            assert_eq!(repo.head().unwrap().target().unwrap(), head);
+        });
+    }
+
+    #[test]
+    fn renewal_refuses_terminal_newer_foreign_or_conflicting_surviving_evidence() {
+        if isolated() {
+            return;
+        }
+        for field in [
+            "released_ts",
+            "expires_ts",
+            "db_generation",
+            "project",
+            "agent",
+            "agent_name",
+            "path_pattern",
+            "created_ts",
+            "exclusive",
+            "reason",
+            "missing_expiry",
+            "malformed",
+        ] {
+            fixture(|cx, pool, config| {
+                let source = seed_lost_renewal(cx, pool, config);
+                let path = target(config);
+                let mut value = read_artifact(&path).unwrap().unwrap().value;
+                match field {
+                    "released_ts" => value[field] = json!("1970-01-01T00:00:05Z"),
+                    "expires_ts" => {
+                        value[field] = json!(timestamp(&source.artifact[field]).unwrap() + 1)
+                    }
+                    "db_generation" => value[field] = json!("ccdd"),
+                    "project" => value[field] = json!("/other-project"),
+                    "agent" | "agent_name" => value[field] = json!("RedFox"),
+                    "path_pattern" => value[field] = json!("other/*.rs"),
+                    "created_ts" => value[field] = json!(2_000_000),
+                    "exclusive" => value[field] = json!(false),
+                    "reason" => value[field] = json!("different reservation intent"),
+                    "missing_expiry" => value["expires_ts"] = Value::Null,
+                    "malformed" => {}
+                    _ => unreachable!(),
+                }
+                let bytes = if field == "malformed" {
+                    b"{not valid reservation JSON".to_vec()
+                } else {
+                    serde_json::to_vec(&value).unwrap()
+                };
+                fs::write(&path, &bytes).unwrap();
+                let repo = Repository::open(&config.storage_root).unwrap();
+                let head = repo.head().unwrap().target().unwrap();
+                let report = pass(cx, pool, config);
+                assert_eq!(
+                    (report.attempted, report.repaired, report.deferred),
+                    (0, 0, 1),
+                    "{field}"
+                );
+                assert_eq!(fs::read(path).unwrap(), bytes, "{field}");
+                assert_eq!(repo.head().unwrap().target().unwrap(), head, "{field}");
+                assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
+            });
+        }
+    }
+
+    #[test]
+    fn renewal_preserves_conflicting_intent_that_survives_only_in_head() {
+        fixture(|cx, pool, config| {
+            let source = seed_lost_renewal(cx, pool, config);
+            let archive = crate::ensure_archive(config, &source.slug).unwrap();
+            let path = target(config);
+            let working = read_artifact(&path).unwrap().unwrap();
+            let mut conflicting = working.value;
+            conflicting["reason"] = json!("different committed reservation intent");
+            fs::write(&path, serde_json::to_vec(&conflicting).unwrap()).unwrap();
+            let relative = crate::rel_path_cached(&archive.canonical_repo_root, &path).unwrap();
+            crate::commit_paths_with_retry(
+                &archive.repo_root,
+                config,
+                "fixture: committed intent conflicts",
+                &[&relative],
+            )
+            .unwrap();
+            fs::write(&path, &working.bytes).unwrap();
+            let repo = Repository::open(&archive.repo_root).unwrap();
+            let head = repo.head().unwrap().target().unwrap();
+            let report = pass(cx, pool, config);
+            assert_eq!(
+                (report.attempted, report.repaired, report.deferred),
+                (0, 0, 1)
+            );
+            assert_eq!(fs::read(path).unwrap(), working.bytes);
+            assert_eq!(repo.head().unwrap().target().unwrap(), head);
+            assert_eq!(read_source(cx, pool, 401).unwrap().unwrap(), source);
+        });
+    }
+
+    #[test]
+    fn staged_renewal_observes_independent_source_commits_and_preserves_archive_winners() {
+        if isolated() {
+            return;
+        }
+        for change in [
+            "release",
+            "renewal",
+            "generation",
+            "terminal_file",
+            "newer_file",
+            "cancel",
+        ] {
+            fixture(|cx, pool, config| {
+                let source = seed_lost_renewal(cx, pool, config);
+                let path = target(config);
+                let before = fs::read(&path).unwrap();
+                let repo = Repository::open(&config.storage_root).unwrap();
+                let head = repo.head().unwrap().target().unwrap();
+                let mut winner = source.artifact.clone();
+                if change == "terminal_file" {
+                    winner["released_ts"] = json!("1970-01-01T00:00:05Z");
+                } else {
+                    winner["expires_ts"] =
+                        json!(timestamp(&source.artifact["expires_ts"]).unwrap() + 1);
+                }
+                let winner_bytes = serde_json::to_vec(&winner).unwrap();
+                let expected = if change.ends_with("_file") {
+                    winner_bytes.clone()
+                } else {
+                    before
+                };
+                let database = pool.sqlite_path().to_string();
+                let stop = std::sync::Arc::new(AtomicBool::new(false));
+                let stop_after_stage = std::sync::Arc::clone(&stop);
+                AFTER_RENEWAL_STAGE.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move |held, path| {
+                        // The repair already read through this retained native
+                        // connection. An independent writer must invalidate that
+                        // observation before the final publication check.
+                        assert!(read_source_connection(held, 401).unwrap().is_some());
+                        if change == "cancel" {
+                            stop_after_stage.store(true, Ordering::Release);
+                            return;
+                        }
+                        if change.ends_with("_file") {
+                            fs::write(path, &winner_bytes).unwrap();
+                            return;
+                        }
+                        let writer = DbConn::open_file(&database).unwrap();
+                        writer.execute_raw("BEGIN IMMEDIATE").unwrap();
+                        writer.execute_raw(match change {
+                            "release" => "INSERT INTO file_reservation_releases(reservation_id, released_ts) VALUES(401, 5000000)",
+                            "renewal" => "UPDATE file_reservations SET expires_ts=expires_ts+1000000 WHERE id=401",
+                            "generation" => "UPDATE db_identity SET generation_id='ccdd' WHERE singleton=0",
+                            _ => unreachable!(),
+                        }).unwrap();
+                        writer.execute_raw("COMMIT").unwrap();
+                        mcp_agent_mail_db::close_db_conn(writer, "independent renewal race writer");
+                    }));
+                });
+                let mut attempted = false;
+                let result = repair_one(cx, pool, config, &source, &mut attempted, &stop);
+                assert!(
+                    result.is_err(),
+                    "stale renewal published after {change}: {result:?}"
+                );
+                assert!(attempted, "the native renewal stage must have been reached");
+                AFTER_RENEWAL_STAGE.with(|slot| assert!(slot.borrow().is_none()));
+                assert_eq!(fs::read(path).unwrap(), expected, "{change}");
+                assert_eq!(repo.head().unwrap().target().unwrap(), head, "{change}");
+                assert!(
+                    fs::read_dir(target(config).parent().unwrap())
+                        .unwrap()
+                        .all(|entry| !entry
+                            .unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".tmp-")),
+                    "a refused {change} must discard only its private stage"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn renewal_and_ordinary_terminal_writer_share_publication_ownership() {
+        fixture(|cx, pool, config| {
+            let source = seed_lost_renewal(cx, pool, config);
+            let archive = crate::ensure_archive(config, &source.slug).unwrap();
+            let mut terminal = source.artifact.clone();
+            terminal["released_ts"] = json!("1970-01-01T00:00:05Z");
+            let writer_archive = archive.clone();
+            let writer_config = config.clone();
+            let writer_record = terminal.clone();
+            AFTER_RENEWAL_STAGE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |_, path| {
+                    let before = fs::read(path).unwrap();
+                    let blocked = crate::write_file_reservation_record(
+                        &writer_archive,
+                        &writer_config,
+                        &writer_record,
+                    );
+                    assert!(
+                        matches!(blocked, Err(crate::StorageError::LockContention { .. })),
+                        "{blocked:?}"
+                    );
+                    assert_eq!(fs::read(path).unwrap(), before);
+                }));
+            });
+            assert_eq!(pass(cx, pool, config).repaired, 1);
+            AFTER_RENEWAL_STAGE.with(|slot| assert!(slot.borrow().is_none()));
+            // Once repair returns ownership, the real ordinary terminal writer
+            // wins. Later recovery cannot resurrect the still-active DB row.
+            crate::write_file_reservation_record(&archive, config, &terminal).unwrap();
+            let published = fs::read(target(config)).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&published).unwrap(),
+                terminal
+            );
+            let report = pass(cx, pool, config);
+            assert_eq!(
+                (report.attempted, report.repaired, report.deferred),
+                (0, 0, 1)
+            );
+            assert_eq!(fs::read(target(config)).unwrap(), published);
+        });
+    }
+
+    #[test]
+    fn sparse_active_discovery_bounds_history_and_retains_unpublished_eligible_ids() {
+        fixture(|cx, pool, config| {
+            let future = mcp_agent_mail_db::now_micros() + 3_600_000_000;
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE file_reservations SET expires_ts=9000000 WHERE id=401")
+                .unwrap();
+            for id in 402..=610 {
+                conn.execute_raw(&format!("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) SELECT {id}, project_id, agent_id, 'src/{id}.rs', \"exclusive\", reason, created_ts, expires_ts, NULL FROM file_reservations WHERE id=401")).unwrap();
+            }
+            conn.execute_raw(&format!(
+                "UPDATE file_reservations SET expires_ts={future}, released_ts=5000000 WHERE id=500"
+            ))
+            .unwrap();
+            conn.execute_raw(&format!(
+                "UPDATE file_reservations SET expires_ts={future} WHERE id=501 OR id BETWEEN 600 AND 605"
+            ))
+            .unwrap();
+            conn.execute_raw("INSERT INTO file_reservation_releases(reservation_id, released_ts) VALUES(501, 5000000)").unwrap();
+            conn.execute_raw(&format!(
+                "UPDATE file_reservations SET created_ts={future}, expires_ts={} WHERE id=502",
+                future + 3_600_000_000,
+            ))
+            .unwrap();
+            let before = conn
+                .query_sync("SELECT id, created_ts, expires_ts, released_ts FROM file_reservations WHERE id <= 610 ORDER BY id", &[])
+                .unwrap()
+                .into_iter()
+                .map(|row| (
+                    row.get_named::<i64>("id").unwrap(),
+                    row.get_named::<i64>("created_ts").unwrap(),
+                    row.get_named::<i64>("expires_ts").unwrap(),
+                    row.get_named::<Option<i64>>("released_ts").unwrap(),
+                ))
+                .collect::<Vec<_>>();
+            drop(conn);
+            let stop = AtomicBool::new(false);
+            let mut cursor = ActiveReservationCursor::default();
+            let first =
+                reconcile_active_reservations(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!((first.scanned, first.attempted, first.repaired), (0, 0, 0));
+            assert_eq!(
+                cursor.after, 528,
+                "discovery must stop after 128 metadata rows"
+            );
+            assert_eq!(cursor.ceiling, Some(610));
+            assert!(first.discovery_advanced && first.more);
+
+            // New arrivals cannot expand the captured round. This lease must
+            // remain untouched while the old sparse history catches up.
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) SELECT 900, project_id, agent_id, 'new.rs', \"exclusive\", reason, created_ts, expires_ts, NULL FROM file_reservations WHERE id=600").unwrap();
+            drop(conn);
+            let second =
+                reconcile_active_reservations(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!(
+                (second.scanned, second.attempted, second.repaired),
+                (4, 4, 4)
+            );
+            assert_eq!(
+                cursor.after, 603,
+                "a metadata page cannot consume an unpublished lease"
+            );
+            assert!(second.discovery_advanced && second.more);
+            let third =
+                reconcile_active_reservations(cx, pool, config, &mut cursor, &stop).unwrap();
+            assert_eq!((third.scanned, third.attempted, third.repaired), (2, 2, 2));
+            assert_eq!(cursor.after, 610);
+            assert!(cursor.ceiling.is_none());
+            assert!(third.discovery_advanced && !third.more);
+            for id in 600..=605 {
+                assert_committed(cx, pool, config, id);
+            }
+            for id in [401, 500, 501, 502, 900] {
+                assert!(
+                    !config
+                        .storage_root
+                        .join(format!(
+                            "projects/project/file_reservations/id-{id}-gaabb.json"
+                        ))
+                        .exists()
+                );
+            }
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            let after = conn
+                .query_sync("SELECT id, created_ts, expires_ts, released_ts FROM file_reservations WHERE id <= 610 ORDER BY id", &[])
+                .unwrap()
+                .into_iter()
+                .map(|row| (
+                    row.get_named::<i64>("id").unwrap(),
+                    row.get_named::<i64>("created_ts").unwrap(),
+                    row.get_named::<i64>("expires_ts").unwrap(),
+                    row.get_named::<Option<i64>>("released_ts").unwrap(),
+                ))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                after, before,
+                "discovery and repair must not mutate source rows"
+            );
+        });
+    }
+
+    #[test]
+    fn active_discovery_caps_candidates_without_consuming_the_metadata_page_tail() {
+        fixture(|cx, pool, config| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            for id in 402..=440 {
+                conn.execute_raw(&format!("INSERT INTO file_reservations(id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) SELECT {id}, project_id, agent_id, 'src/{id}.rs', \"exclusive\", reason, created_ts, expires_ts, NULL FROM file_reservations WHERE id=401")).unwrap();
+            }
+            drop(conn);
+            let mut cursor = ActiveReservationCursor::default();
+            let first = select_ids(cx, pool, config, &mut cursor).unwrap();
+            assert_eq!(first.ids, (401..=432).collect::<Vec<_>>());
+            assert_eq!(first.ineligible_prefix, 0);
+            assert_eq!(first.examined_through, 432);
+            assert!(first.more);
+            assert_eq!(
+                cursor.after, 0,
+                "selection alone cannot consume eligible IDs"
+            );
+            cursor.after = first.examined_through;
+            let rest = select_ids(cx, pool, config, &mut cursor).unwrap();
+            assert_eq!(rest.ids, (433..=440).collect::<Vec<_>>());
+            assert_eq!(rest.examined_through, 440);
+            assert!(!rest.more);
         });
     }
 
@@ -1771,6 +2595,10 @@ mod tests {
             let (release_tx, release_rx) = mpsc::channel();
             let owner = std::thread::spawn(move || {
                 let _held = process.lock().unwrap();
+                // Latch the real project-lock lookup after mutation admission.
+                // Its window then stays observable until shutdown is requested,
+                // even when a fenced repair only tries the busy project once.
+                let lookup = crate::ARCHIVE_LOCK_MAP.get().unwrap().write();
                 ready_tx.send(()).unwrap();
                 // Observe the actual repair mutation window, not a timed guess
                 // about when the worker will reach the held project mutex.
@@ -1780,6 +2608,7 @@ mod tests {
                 }
                 let observed = crate::archive_mutations_active() > 0;
                 cancel.store(true, Ordering::Release);
+                drop(lookup);
                 let released = release_rx.recv_timeout(Duration::from_secs(10));
                 (observed, released)
             });
@@ -1911,6 +2740,10 @@ mod tests {
 
     #[test]
     fn retry_classification_does_not_turn_conflicts_or_permissions_into_contention() {
+        #[cfg(any(unix, windows))]
+        for error in crate::recovery::descriptor_exhaustion_errors() {
+            assert!(RepairFailure::from(crate::StorageError::Io(error)).transient);
+        }
         for kind in [
             std::io::ErrorKind::WouldBlock,
             std::io::ErrorKind::TimedOut,

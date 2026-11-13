@@ -75,7 +75,9 @@ MINISIGN_BIN=""
 RELEASE_TRUST_MODEL=""
 EXPECTED_RELEASE_VERSION=""
 ARTIFACT_URL="${ARTIFACT_URL:-}"
-LOCK_FILE="/tmp/mcp-agent-mail-install.lock"
+# A private directory within the destination carries the per-user kernel lock.
+# An explicit override adds an auxiliary lock; TMPDIR never selects authority.
+LOCK_FILE="${AM_INSTALL_LOCK_FILE:-}"
 SYSTEM=0
 NO_GUM=0
 NO_VERIFY=0
@@ -604,8 +606,27 @@ capture_command_with_timeout() {
   CAPTURED_CMD_OUTPUT_LOSSLESS=1
   CAPTURED_CMD_STATUS=0
 
-  if command -v python3 >/dev/null 2>&1; then
-    local output_file status_file tmp_root rc
+  # A discovered Python may only be a developer-tools shim. Select a working
+  # runner before launching the command; never retry the command after an
+  # adapter has started it, even if its completion receipt is missing.
+  local native_runner="" runner_probe=""
+  if command -v python3 >/dev/null 2>&1 && \
+     runner_probe=$(python3 -c 'import os, signal, subprocess, time; os.killpg; signal.SIGKILL; subprocess.Popen; time.monotonic(); print("AM_INSTALLER_BOUNDED_RUNNER")' 7<&- 8<&- 2>/dev/null) && \
+     [ "$runner_probe" = AM_INSTALLER_BOUNDED_RUNNER ]; then
+    native_runner=python3
+  elif command -v perl >/dev/null 2>&1 && \
+       runner_probe=$(perl -MConfig -MPOSIX=:sys_wait_h,setsid,_exit -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC,sleep -MErrno=EINTR -e '
+         die "Native fork is required\n" unless $Config{d_fork} eq "define";
+         my $now = clock_gettime(CLOCK_MONOTONIC);
+         die "A monotonic clock is required\n" unless defined($now) && $now >= 0;
+         print "AM_INSTALLER_BOUNDED_RUNNER\n";
+       ' 7<&- 8<&- 2>/dev/null) && \
+       [ "$runner_probe" = AM_INSTALLER_BOUNDED_RUNNER ]; then
+    native_runner=perl
+  fi
+
+  if [ -n "$native_runner" ]; then
+    local output_file status_file tmp_root rc raw_status_size=""
     tmp_root="${TMP:-/tmp}"
     output_file=$(mktemp "${tmp_root%/}/am-install-capture.XXXXXX") || return 1
     status_file=$(mktemp "${tmp_root%/}/am-install-status.XXXXXX") || {
@@ -613,7 +634,10 @@ capture_command_with_timeout() {
       return 1
     }
 
-    if python3 - "$timeout_secs" "$output_file" "$status_file" "$@" <<'PY'
+    # Probes and the processes they launch must not keep installation locks
+    # alive after this installer exits or is killed.
+    if [ "$native_runner" = python3 ]; then
+      if python3 - "$timeout_secs" "$output_file" "$status_file" "$@" 7<&- 8<&- <<'PY'
 import subprocess
 import sys
 import time
@@ -669,10 +693,81 @@ with open(status_path, "w", encoding="utf-8") as handle:
 
 sys.exit(shell_status)
 PY
-    then
-      rc=0
+      then rc=0; else rc=$?; fi
     else
-      rc=$?
+      if perl - "$timeout_secs" "$output_file" "$status_file" "$@" 7<&- 8<&- <<'PERL'
+    use strict;
+    use warnings;
+    use POSIX qw(:sys_wait_h setsid _exit);
+    use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC sleep);
+    use Errno qw(EINTR);
+
+    my ($timeout, $output_path, $status_path, @command) = @ARGV;
+    die "Invalid command deadline\n" unless defined($timeout) &&
+        $timeout =~ /\A(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)\z/ && @command;
+    sub monotonic_time {
+        my $now = eval { clock_gettime(CLOCK_MONOTONIC) };
+        return defined($now) && $now >= 0 ? $now : undef;
+    }
+    my $start = monotonic_time();
+    die "A monotonic clock is required\n" unless defined($start);
+    my $deadline = $start + $timeout;
+    pipe(my $launch_reader, my $launch_writer) or die "Cannot create launch gate: $!\n";
+    $SIG{CHLD} = "DEFAULT";
+    my $pid = fork();
+    die "Cannot fork command: $!\n" unless defined($pid);
+    if ($pid == 0) {
+        close $launch_reader;
+        my $session = setsid();
+        _exit(125) unless defined($session) && $session >= 0;
+        open STDOUT, ">", $output_path or _exit(125);
+        open STDERR, ">&", \*STDOUT or _exit(125);
+        # A successful write proves that setsid preceded the parent's closing
+        # the gate. If the deadline won, never exec or create descendants.
+        my $written = syswrite($launch_writer, "1", 1);
+        close $launch_writer;
+        _exit(125) unless defined($written) && $written == 1;
+        exec { $command[0] } @command or _exit(127);
+    }
+    close $launch_writer;
+    my ($shell_status, $wait_status);
+    while (1) {
+        my $waited = waitpid($pid, WNOHANG);
+        if ($waited == $pid) { $wait_status = $?; last; }
+        if ($waited < 0) {
+            next if $! == EINTR;
+            $shell_status = 125;
+            last;
+        }
+        my $now = monotonic_time();
+        if (!defined($now) || $now >= $deadline) {
+            $shell_status = defined($now) ? 124 : 125;
+            # Keep the PID unreaped until both kills complete. Closing the
+            # gate first prevents a delayed setsid/exec from escaping killpg.
+            close $launch_reader;
+            kill "KILL", -$pid;
+            kill "KILL", $pid;
+            # Reaping is bounded even if the clock or a kernel task is stuck.
+            for (1 .. 100) {
+                my $reaped = waitpid($pid, WNOHANG);
+                last if $reaped == $pid || ($reaped < 0 && $! != EINTR);
+                sleep(0.01);
+            }
+            last;
+        }
+        sleep(0.05);
+    }
+    close $launch_reader if defined(fileno($launch_reader));
+    if (!defined($shell_status)) {
+        $shell_status = WIFEXITED($wait_status) ? WEXITSTATUS($wait_status) :
+            WIFSIGNALED($wait_status) ? 128 + WTERMSIG($wait_status) : 125;
+    }
+    open my $status, ">", $status_path or die "Cannot record command status: $!\n";
+    print {$status} $shell_status or die "Cannot write command status: $!\n";
+    close $status or die "Cannot finish command status: $!\n";
+    exit($shell_status);
+PERL
+      then rc=0; else rc=$?; fi
     fi
 
     if [ -f "$output_file" ]; then
@@ -691,25 +786,39 @@ PY
         CAPTURED_CMD_OUTPUT_LOSSLESS=0
       fi
     fi
-    [ -f "$status_file" ] && CAPTURED_CMD_STATUS=$(cat "$status_file")
+    CAPTURED_CMD_STATUS=""
+    if [ -f "$status_file" ]; then
+      CAPTURED_CMD_STATUS=$(cat "$status_file") || CAPTURED_CMD_STATUS=""
+      raw_status_size=$(LC_ALL=C wc -c <"$status_file" 2>/dev/null | tr -d '[:space:]') || raw_status_size=""
+    fi
     rm -f "$output_file" "$status_file" 2>/dev/null || true
 
-    if [ -z "${CAPTURED_CMD_STATUS:-}" ]; then
-      CAPTURED_CMD_STATUS="$rc"
+    if [[ ! "$CAPTURED_CMD_STATUS" =~ ^[0-9]{1,3}$ ]] || \
+       [ "$raw_status_size" != "${#CAPTURED_CMD_STATUS}" ] || \
+       [ "$CAPTURED_CMD_STATUS" -gt 255 ] || [ "$CAPTURED_CMD_STATUS" -ne "$rc" ]; then
+      CAPTURED_CMD_STATUS=125
     fi
     return "$CAPTURED_CMD_STATUS"
   fi
 
   # Never turn a bounded probe into an unbounded one merely because Python is
-  # absent. GNU timeout is common on Linux; Homebrew installs it as gtimeout on
-  # macOS. Hosts with neither receive a fail-closed, actionable result.
-  local timeout_bin=""
-  if command -v timeout >/dev/null 2>&1; then
-    timeout_bin="timeout"
-  elif command -v gtimeout >/dev/null 2>&1; then
-    timeout_bin="gtimeout"
-  else
-    CAPTURED_CMD_OUTPUT="No bounded command runner is available (requires python3, timeout, or gtimeout)."
+  # unusable. Require GNU's process-group timeout behavior: an executable named
+  # timeout may be uutils, whose older versions leave descendants alive. Ubuntu
+  # also installs GNU as gnutimeout; Homebrew uses gtimeout on macOS.
+  local timeout_bin="" timeout_candidate="" timeout_version=""
+  for timeout_candidate in timeout gtimeout gnutimeout; do
+    if command -v "$timeout_candidate" >/dev/null 2>&1 && \
+       timeout_version=$("$timeout_candidate" --version 7<&- 8<&- 2>/dev/null); then
+      case "$timeout_version" in
+        'timeout (GNU coreutils) '*|'gtimeout (GNU coreutils) '*|'gnutimeout (GNU coreutils) '*)
+          timeout_bin="$timeout_candidate"
+          break
+          ;;
+      esac
+    fi
+  done
+  if [ -z "$timeout_bin" ]; then
+    CAPTURED_CMD_OUTPUT="No bounded command runner is available (requires working Python 3, Perl, or GNU timeout/gtimeout/gnutimeout)."
     CAPTURED_CMD_OUTPUT_EXACT="$CAPTURED_CMD_OUTPUT"
     CAPTURED_CMD_OUTPUT_LOSSLESS=1
     CAPTURED_CMD_STATUS=125
@@ -718,7 +827,7 @@ PY
 
   local fallback_output_file fallback_rc raw_output_size captured_output_size
   fallback_output_file=$(mktemp "${TMP:-/tmp}/am-install-capture.XXXXXX") || return 1
-  if "$timeout_bin" --signal=KILL "$timeout_secs" "$@" >"$fallback_output_file" 2>&1; then
+  if "$timeout_bin" --signal=KILL "$timeout_secs" "$@" 7<&- 8<&- >"$fallback_output_file" 2>&1; then
     fallback_rc=0
   else
     fallback_rc=$?
@@ -1135,7 +1244,7 @@ installed_am_db_query_scalar() {
   local cli_bin="${DEST:-}/${BIN_CLI:-am}"
 
   [ -x "$cli_bin" ] || return 1
-  "$cli_bin" tooling db-query --db "$db_path" --sql "$sql" --first
+  "$cli_bin" tooling db-query --db "$db_path" --sql "$sql" --first 7<&- 8<&-
 }
 
 installed_am_db_exec() {
@@ -1145,9 +1254,9 @@ installed_am_db_exec() {
 
   [ -x "$cli_bin" ] || return 1
   if [ -n "$sql" ]; then
-    "$cli_bin" tooling db-exec --db "$db_path" --sql "$sql" >/dev/null
+    "$cli_bin" tooling db-exec --db "$db_path" --sql "$sql" 7<&- 8<&- >/dev/null
   else
-    "$cli_bin" tooling db-exec --db "$db_path" >/dev/null
+    "$cli_bin" tooling db-exec --db "$db_path" 7<&- 8<&- >/dev/null
   fi
 }
 
@@ -1157,7 +1266,7 @@ installed_am_db_backup() {
   local cli_bin="${DEST:-}/${BIN_CLI:-am}"
 
   [ -x "$cli_bin" ] || return 1
-  "$cli_bin" tooling db-backup --db "$db_path" --output "$output_path" >/dev/null
+  "$cli_bin" tooling db-backup --db "$db_path" --output "$output_path" 7<&- 8<&- >/dev/null
 }
 
 # Copy a SQLite database as a consistent snapshot.
@@ -2364,7 +2473,7 @@ git_authority_probe() (
 git_worktree_root_for_path() {
   local candidate="$1"
   local cursor="$candidate"
-  local root=""
+  local root="" bare=""
 
   [ -n "$candidate" ] || return 2
   command -v git >/dev/null 2>&1 || return 2
@@ -2391,7 +2500,8 @@ git_worktree_root_for_path() {
 
   # A bare repository is also an unsafe destination for token material even
   # though it has no worktree root.
-  if [ "$(git_authority_probe -C "$cursor" rev-parse --is-bare-repository 2>/dev/null || true)" = "true" ]; then
+  bare=$(git_authority_probe -C "$cursor" rev-parse --is-bare-repository 2>/dev/null || true)
+  if [ "$bare" = "true" ]; then
     return 2
   fi
 
@@ -2995,6 +3105,9 @@ validate_installer_owned_regular_file() {
 validate_binary_transaction_directory() {
   local path="$1"
   local owner="" current_uid="" mode=""
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   [ -d "$path" ] && [ ! -L "$path" ] || {
     err "Binary transaction authority is not a non-symlink directory: $path"
     return 1
@@ -3032,6 +3145,9 @@ move_installer_entry_no_replace() {
   local source="$1"
   local destination="$2"
   local label="$3"
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   installer_entry_exists "$source" || {
     err "$label source is missing: $source"
     return 1
@@ -3042,6 +3158,9 @@ move_installer_entry_no_replace() {
   fi
   # Both GNU and BSD mv support -n. It may report success when it skips an
   # occupied target, so the postconditions are authoritative.
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   mv -n "$source" "$destination" 2>/dev/null || return 1
   if installer_entry_exists "$source" || ! installer_entry_exists "$destination"; then
     err "$label was not moved without replacement."
@@ -3052,13 +3171,27 @@ move_installer_entry_no_replace() {
 write_binary_transaction_file_exclusive() {
   local destination="$1"
   local mode="$2"
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   if installer_entry_exists "$destination"; then
     err "Refusing to replace binary transaction entry: $destination"
     return 1
   fi
-  if ! (umask 077; set -o noclobber; exec 9>"$destination"; cat >&9); then
+  if ! (
+    umask 077
+    set -o noclobber
+    if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+      verify_installer_lock_authorities || exit 1
+    fi
+    exec 9>"$destination" || exit 1
+    cat >&9
+  ); then
     err "Could not create binary transaction entry exclusively: $destination"
     return 1
+  fi
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
   fi
   chmod "$mode" "$destination" || return 1
   validate_installer_owned_regular_file "$destination" "Binary transaction entry" "$mode" || return 1
@@ -3597,6 +3730,9 @@ prune_binary_transaction_history() {
   local install_dir="$1"
   local keep="${AM_INSTALL_TRANSACTION_HISTORY_KEEP:-2}"
   local entries="" entry="" name="" kept=0 pruned=0
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   case "$keep" in
     ''|*[!0-9]*) keep=2 ;;
   esac
@@ -3625,6 +3761,11 @@ prune_binary_transaction_history() {
     if binary_transaction_history_in_use "$entry"; then
       info "Keeping install history $name: a running process uses a binary inside it"
       continue
+    fi
+    # The liveness probe can be slow. Recheck the held inode before every
+    # deletion so a replacement destination retains all of its evidence.
+    if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+      verify_installer_lock_authorities || return 1
     fi
     if rm -rf -- "$entry"; then
       pruned=$((pruned + 1))
@@ -3698,6 +3839,9 @@ recover_binary_pair_transaction() {
   local install_dir="$1"
   local inject_after_phase_for_test="${2:-}"
   local rc=0
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   if [ "$BINARY_TRANSACTION_RECOVERY_ACTIVE" -eq 1 ]; then
     err "Binary transaction recovery is already active."
     return 1
@@ -3739,11 +3883,17 @@ publish_binary_transaction_new() {
   local new_hash="$5"
   local staged="$journal/new-$stem"
   local dest="$install_dir/$binary_name"
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   installer_entry_exists "$dest" && {
     err "The $stem destination is occupied before publication."
     return 1
   }
   validate_binary_transaction_hash "$staged" "$new_hash" "Staged $stem binary" || return 1
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   chmod 755 "$staged" || return 1
   sync_installer_paths_durably "$staged" "$journal" || return 1
   move_installer_entry_no_replace "$staged" "$dest" "Publish new $stem binary" || return 1
@@ -3761,6 +3911,9 @@ prepare_binary_pair_transaction() {
   local server_dest="$install_dir/$BIN_SERVER"
   local cli_dest="$install_dir/$BIN_CLI"
   local metadata="" source_path=""
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
 
   active=$(binary_transaction_active_path "$install_dir")
   installer_entry_exists "$active" && {
@@ -3775,7 +3928,13 @@ prepare_binary_pair_transaction() {
       return 1
     fi
   done
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   ensure_real_file_target_path "$server_dest" "$BIN_SERVER install target" || return 1
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   ensure_real_file_target_path "$cli_dest" "$BIN_CLI install target" || return 1
   validate_installer_owned_regular_file "$server_src" "Staged server source" || return 1
   validate_installer_owned_regular_file "$cli_src" "Staged CLI source" || return 1
@@ -3802,14 +3961,38 @@ prepare_binary_pair_transaction() {
   # Apply the private mode in the mkdir syscall itself; chmod alone would
   # leave a caller-umask-dependent window where another user could enter the
   # non-authoritative staging directory before it is published.
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   (umask 077; mkdir "$preparing") || return 1
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
+  fi
   chmod 700 "$preparing" || return 1
   validate_binary_transaction_directory "$preparing" || return 1
   sync_installer_paths_durably "$preparing" "$install_dir" || return 1
-  if ! (umask 077; set -o noclobber; exec 9>"$preparing/new-server"; cat "$server_src" >&9) || \
-     ! (umask 077; set -o noclobber; exec 9>"$preparing/new-cli"; cat "$cli_src" >&9); then
+  if ! (
+    umask 077
+    set -o noclobber
+    if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+      verify_installer_lock_authorities || exit 1
+    fi
+    exec 9>"$preparing/new-server" || exit 1
+    cat "$server_src" >&9
+  ) || ! (
+    umask 077
+    set -o noclobber
+    if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+      verify_installer_lock_authorities || exit 1
+    fi
+    exec 9>"$preparing/new-cli" || exit 1
+    cat "$cli_src" >&9
+  ); then
     err "Could not stage both binaries in the durable transaction journal."
     return 1
+  fi
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    verify_installer_lock_authorities || return 1
   fi
   chmod 700 "$preparing/new-server" "$preparing/new-cli" || return 1
   validate_binary_transaction_hash "$preparing/new-server" "$TXN_NEW_SERVER_HASH" \
@@ -4260,7 +4443,15 @@ activate_mac_python_cli_compat_shell() {
   case "$(basename "$shell_bin")" in
     zsh|bash)
       warn "Launching a fresh interactive shell so 'am' resolves via the Python compatibility entrypoint on this Mac"
-      exec "$shell_bin" -il
+      # exec bypasses EXIT traps. Finish recovery and release both locks before
+      # replacing this process with a shell that can remain open indefinitely.
+      INSTALLER_EXIT_SUCCESS=1
+      if ! cleanup; then
+        return 1
+      fi
+      TMP=""
+      trap - EXIT
+      exec "$shell_bin" -il 7<&- 8<&-
       ;;
     *)
       warn "Open a fresh shell to use the Python compatibility entrypoint for 'am' on this Mac"
@@ -5085,7 +5276,7 @@ ensure_remote_http_client_readiness() {
     return 0
   fi
 
-  if ! "$DEST/$BIN_CLI" service install --help >/dev/null 2>&1; then
+  if ! "$DEST/$BIN_CLI" service install --help 7<&- 8<&- >/dev/null 2>&1; then
     err "This build does not expose 'am service install'; cannot start the required background service."
     err "Start a local HTTP server with: ${DEST}/${BIN_CLI} serve-http --no-tui"
     return 1
@@ -5100,7 +5291,8 @@ ensure_remote_http_client_readiness() {
   info "About to install/enable/restart ${service_unit_desc}"
   info "  via: ${DEST}/${BIN_CLI} service install (ExecStart will point at ${DEST}/${BIN_CLI})"
   local service_output=""
-  if service_output=$("$DEST/$BIN_CLI" service install --host "$(desired_service_bind_host)" --port "$(desired_service_bind_port)" 2>&1); then
+  # A service may outlive this installer; it must not inherit our lock handles.
+  if service_output=$("$DEST/$BIN_CLI" service install --host "$(desired_service_bind_host)" --port "$(desired_service_bind_port)" 7<&- 8<&- 2>&1); then
     while IFS= read -r line; do
       [ -n "$line" ] && verbose "remote_http_readiness:service ${line}"
     done <<< "$service_output"
@@ -5147,7 +5339,7 @@ ensure_remote_http_client_readiness() {
   # unconditionally — otherwise a `if service_output=$(...); then` would drop
   # the diagnostic lines on the floor precisely when they're most needed.
   local service_output=""
-  service_output=$("$DEST/$BIN_CLI" service status 2>&1 || true)
+  service_output=$("$DEST/$BIN_CLI" service status 7<&- 8<&- 2>&1 || true)
   if [ -n "$service_output" ]; then
     while IFS= read -r line; do
       if [ -n "$line" ]; then
@@ -6790,8 +6982,8 @@ setup_claude_code_mcp_via_cli() {
   # change to that CLI's listing format. `claude mcp remove` is a no-op when
   # the entry is absent, so the unconditional call is safe on first install
   # too; both `|| true` fallbacks swallow the expected non-zero exit code.
-  claude mcp remove mcp-agent-mail --scope user >/dev/null 2>&1 \
-    || claude mcp remove mcp-agent-mail >/dev/null 2>&1 \
+  claude mcp remove mcp-agent-mail --scope user 7<&- 8<&- >/dev/null 2>&1 \
+    || claude mcp remove mcp-agent-mail 7<&- 8<&- >/dev/null 2>&1 \
     || true
 
   local -a add_args=(mcp add --scope user --transport http mcp-agent-mail "$desired_url")
@@ -6799,7 +6991,7 @@ setup_claude_code_mcp_via_cli() {
     add_args+=(--header "Authorization: Bearer ${bearer_token}")
   fi
 
-  if claude "${add_args[@]}" >/dev/null 2>&1; then
+  if claude "${add_args[@]}" 7<&- 8<&- >/dev/null 2>&1; then
     ok "[claude-code] Registered mcp-agent-mail via 'claude mcp add' (user scope, HTTP transport)"
     verbose "setup_claude_code_mcp:ok url=${desired_url}"
     return 0
@@ -6886,28 +7078,55 @@ PY
 # cannot be established.
 config_target_is_hardlink_aliased() {
   local path="$1"
+  local verdict=""
   [ -n "$path" ] || return 0
-  if [ ! -e "$path" ]; then
-    return 1
-  fi
-  command -v python3 >/dev/null 2>&1 || return 0
-  if python3 - "$path" <<'PY'
+  # Only a successful, explicit admission from a native metadata provider may
+  # authorize the external writer. `test -e` cannot distinguish an absent leaf
+  # from a dangling symlink, and interpreter errors are not safe verdicts.
+  if command -v python3 >/dev/null 2>&1 && \
+     verdict=$(python3 - "$path" 7<&- 8<&- 2>/dev/null <<'PY'
+import errno
 import os
 import stat
 import sys
 
+path = sys.argv[1]
+safe = False
 try:
-    metadata = os.lstat(sys.argv[1])
-except OSError:
-    raise SystemExit(1)
-if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
-    raise SystemExit(0)
-raise SystemExit(1)
+    metadata = os.lstat(path)
+except OSError as error:
+    if error.errno == errno.ENOENT:
+        # A fresh leaf is writable only beneath a known real parent. Missing
+        # or symlink parents require native setup to establish their authority.
+        try:
+            parent = os.lstat(os.path.dirname(path) or ".")
+            safe = stat.S_ISDIR(parent.st_mode)
+        except OSError:
+            pass
+else:
+    safe = stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1
+print("safe" if safe else "unsafe")
 PY
+  )
   then
-    return 0
+    case "$verdict" in safe) return 1 ;; unsafe) return 0 ;; esac
   fi
-  return 1
+  if command -v perl >/dev/null 2>&1 && \
+     verdict=$(perl -MFcntl=:mode -MErrno=ENOENT -MFile::Basename -e '
+       my $safe = 0;
+       my @metadata = lstat($ARGV[0]);
+       if (@metadata) {
+         $safe = S_ISREG($metadata[2]) && $metadata[3] == 1;
+       } elsif ($! == ENOENT) {
+         my @parent = lstat(File::Basename::dirname($ARGV[0]));
+         $safe = @parent && S_ISDIR($parent[2]);
+       }
+       print $safe ? "safe\n" : "unsafe\n";
+     ' "$path" 7<&- 8<&- 2>/dev/null)
+  then
+    case "$verdict" in safe) return 1 ;; unsafe) return 0 ;; esac
+  fi
+  return 0
 }
 
 # The shell writers embed bearer credentials but cannot establish the native
@@ -7193,7 +7412,7 @@ update_mcp_configs() {
   # A native setup pass is the credential-persistence admission gate for all
   # shell fallback writers. An older binary without this surface must not let
   # the installer publish a bearer token only into client configs.
-  if ! AM_INTERFACE_MODE=cli "$am_cli" setup --help >/dev/null 2>&1; then
+  if ! AM_INTERFACE_MODE=cli "$am_cli" setup --help 7<&- 8<&- >/dev/null 2>&1; then
     verbose "update_mcp_configs:skip reason=no_setup_subcommand"
     warn "The installed 'am' binary has no setup subcommand; MCP client configs were not changed."
     return 1
@@ -7214,13 +7433,13 @@ update_mcp_configs() {
   local setup_token
   setup_token="$(resolve_setup_http_bearer_token)"
   if [ -n "$setup_token" ]; then
-    if setup_out=$(AM_INTERFACE_MODE=cli HTTP_BEARER_TOKEN="$setup_token" "$am_cli" setup run --yes --no-hooks 2>&1); then
+    if setup_out=$(AM_INTERFACE_MODE=cli HTTP_BEARER_TOKEN="$setup_token" "$am_cli" setup run --yes --no-hooks 7<&- 8<&- 2>&1); then
       setup_rc=0
     else
       setup_rc=$?
     fi
   else
-    if setup_out=$(AM_INTERFACE_MODE=cli "$am_cli" setup run --yes --no-hooks 2>&1); then
+    if setup_out=$(AM_INTERFACE_MODE=cli "$am_cli" setup run --yes --no-hooks 7<&- 8<&- 2>&1); then
       setup_rc=0
     else
       setup_rc=$?
@@ -7817,22 +8036,18 @@ uninstall() {
 }
 
 ensure_rust() {
+  local source_root="$1"
   if [ "${RUSTUP_INIT_SKIP:-0}" != "0" ]; then
     info "Skipping rustup install (RUSTUP_INIT_SKIP set)"
     return 0
   fi
-  if command -v cargo >/dev/null 2>&1 && rustc --version 2>/dev/null | grep -q nightly; then return 0; fi
-  if [ "$EASY" -ne 1 ]; then
-    if [ -t 0 ]; then
-      echo -n "Install Rust nightly via rustup? (y/N): "
-      read -r ans
-      case "$ans" in y|Y) :;; *) warn "Skipping rustup install"; return 0;; esac
-    fi
-  fi
-  info "Installing rustup (nightly)"
-  curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --profile minimal
-  export PATH="$HOME/.cargo/bin:$PATH"
-  rustup component add rustfmt clippy || true
+  # Rustup selects the release's pinned compiler from this directory. The
+  # caller may legitimately default to stable; do not change that default.
+  if command -v cargo >/dev/null 2>&1 && \
+     (cd "$source_root" && rustc --version 2>/dev/null | grep -q nightly); then return 0; fi
+  err "Building from source requires an installed Rust nightly toolchain."
+  err "Install it with your trusted toolchain manager, then rerun with --from-source."
+  return 1
 }
 
 checkout_exact_release_source() {
@@ -8356,18 +8571,20 @@ interactive_shell_am_descriptor() {
   local shell_name
   shell_name=$(basename "${SHELL:-/bin/sh}")
 
+  # Startup files can launch persistent agents. They may inspect command
+  # resolution, but must not inherit the installer's exclusive authority.
   case "$shell_name" in
     zsh)
-      zsh -i -c 'command -V am 2>/dev/null || echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND"
+      zsh -i -c 'command -V am 2>/dev/null || echo NOT_FOUND' 7<&- 8<&- 2>/dev/null || echo "NOT_FOUND"
       ;;
     bash)
-      bash -i -c 'command -V am 2>/dev/null || echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND"
+      bash -i -c 'command -V am 2>/dev/null || echo NOT_FOUND' 7<&- 8<&- 2>/dev/null || echo "NOT_FOUND"
       ;;
     fish)
-      fish -i -c 'type -a am 2>/dev/null | head -1; or echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND"
+      fish -i -c 'type -a am 2>/dev/null | head -1; or echo NOT_FOUND' 7<&- 8<&- 2>/dev/null || echo "NOT_FOUND"
       ;;
     *)
-      sh -c 'command -V am 2>/dev/null || echo NOT_FOUND' 2>/dev/null || echo "NOT_FOUND"
+      sh -c 'command -V am 2>/dev/null || echo NOT_FOUND' 7<&- 8<&- 2>/dev/null || echo "NOT_FOUND"
       ;;
   esac
 }
@@ -8587,6 +8804,15 @@ Options:
   --purge            With --uninstall, also delete storage/database data
   --dry-run          Preview what the installer would do without making changes
   --preview          Alias for --dry-run
+
+Environment:
+  TMPDIR                Staging directory (default: /tmp)
+  AM_INSTALL_LOCK_FILE  Optional additional private lock directory (adds .d)
+  LOG_FILE              Installer diagnostic log path
+  AM_LINK_DIR           Convenience symlink directory (default: ~/.local/bin)
+
+The destination directory is locked by inode, independently of TMPDIR or lock overrides.
+Locking requires flock, Python 3, or Perl with native flock support.
 EOFU
 }
 
@@ -8901,67 +9127,169 @@ installer_path_owner_uid() {
   printf '%s' "$owner"
 }
 
-remove_installer_lock_dir() {
-  local lock_dir="$1"
-  local expected_pid="${2:-}"
-  local lock_owner="" current_uid="" observed_pid=""
-  [ -n "$lock_dir" ] || return 0
-  if [ -L "$lock_dir" ]; then
-    warn "Installer lock path is a symlink; refusing cleanup: ${lock_dir}"
-    return 1
-  fi
-  if [ ! -e "$lock_dir" ]; then
+# Inspect every named component without creating anything or following a
+# symlink. Unlike a PID file, this identity cannot be confused by PID reuse.
+installer_directory_identity() {
+  local path="$1" current="" remaining="" part="" identity=""
+  case "$path" in
+    /*) current=/; remaining="${path#/}" ;;
+    *) current=$(pwd -P) || return 1; remaining="$path" ;;
+  esac
+  while [ -n "$remaining" ]; do
+    part="${remaining%%/*}"
+    if [ "$remaining" = "$part" ]; then remaining=""; else remaining="${remaining#*/}"; fi
+    case "$part" in ''|.) continue ;; ..) return 1 ;; esac
+    current="${current%/}/$part"
+    [ ! -L "$current" ] && [ -d "$current" ] || return 1
+  done
+  identity=$(stat -c '%d:%i' -- "$current" 2>/dev/null || exit "$?") \
+    || identity=$(stat -f '%d:%i' "$current" 2>/dev/null || exit "$?") \
+    || return 1
+  [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+  printf '%s' "$identity"
+}
+
+installer_lock_fd_identity() {
+  local fd="$1" identity=""
+  case "$fd" in 7|8) ;; *) return 1 ;; esac
+
+  # macOS /dev/fd reports the devfs device rather than the open directory's
+  # device (GH#376). Inspect the inherited descriptor with native fstat instead.
+  # Dup onto a fixed child-only fd before starting either interpreter: a closed
+  # lock fd must fail in Bash, not accidentally name an interpreter's own file.
+  # Keep stdin for the program so this also works with `curl ... | bash` and
+  # stock macOS Bash 3.2. A failed/unusable Python (e.g. a developer-tools shim)
+  # may fall back to Perl, but only successful, well-formed identities count.
+  if command -v python3 >/dev/null 2>&1 && \
+     identity=$(python3 - 2>/dev/null 3<&"$fd" <<'PY'
+import os
+import stat
+import sys
+
+try:
+    info = os.fstat(3)
+    if not stat.S_ISDIR(info.st_mode):
+        raise SystemExit(1)
+    sys.stdout.write("%d:%d" % (info.st_dev, info.st_ino))
+except OSError:
+    raise SystemExit(1)
+PY
+     ) && [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]]; then
+    printf '%s' "$identity"
     return 0
   fi
-  if [ ! -d "$lock_dir" ]; then
-    warn "Installer lock path is not a directory; refusing cleanup: ${lock_dir}"
-    return 1
+  if command -v perl >/dev/null 2>&1 && \
+     identity=$(perl -MFcntl=:mode -e '
+       open my $handle, "<&=", 3 or exit 1;
+       my @info = stat($handle);
+       @info && S_ISDIR($info[2]) or exit 1;
+       print join(":", @info[0, 1]);
+     ' 2>/dev/null 3<&"$fd") && [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]]; then
+    printf '%s' "$identity"
+    return 0
   fi
-  case "$lock_dir" in
-    "/"|"$HOME"|"/tmp"|"/var/tmp")
-      warn "Refusing unsafe installer lock cleanup path: ${lock_dir}"
+
+  # Minimal Linux hosts may have flock/stat without either interpreter. Linux
+  # procfs resolves an inherited fd to the underlying inode; this fallback is
+  # deliberately unavailable on macOS and never uses the /dev/fd facade.
+  [ "$(uname -s)" = Linux ] && [ -d "/proc/self/fd/$fd" ] || return 1
+  identity=$(stat -Lc '%d:%i' -- /proc/self/fd/3 2>/dev/null 3<&"$fd" || exit "$?") || return 1
+  [[ "$identity" =~ ^[0-9]+:[0-9]+$ ]] || return 1
+  printf '%s' "$identity"
+}
+
+# Native flock locks the inherited open file description, so the installer
+# retains it after this short helper exits. Never emulate it with process-owned
+# fcntl locks: those would disappear with the helper. Supported Linux/macOS
+# kernels implement flock directly; Perl must also have been built to use it.
+installer_kernel_lock() {
+  local fd="$1" operation="$2"
+  case "$fd:$operation" in 7:acquire|8:acquire|7:release|8:release) ;; *) return 1 ;; esac
+  # Command discovery alone cannot establish capability: macOS may expose a
+  # Python developer-tools shim, and an installed flock may be unusable. Each
+  # fallback must perform the same native operation on the same inherited open
+  # file description. Contention still fails every attempt while the owner
+  # holds its lock. Duplicate before startup so a closed fd cannot be reused.
+  if command -v flock >/dev/null 2>&1; then
+    if [ "$operation" = acquire ]; then
+      if flock -n -x 3 2>/dev/null 3<&"$fd"; then return 0; fi
+    else
+      if flock -u 3 2>/dev/null 3<&"$fd"; then return 0; fi
+    fi
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    if python3 - "$operation" 2>/dev/null 3<&"$fd" <<'PY'
+import fcntl
+import sys
+
+try:
+    operation = fcntl.LOCK_EX | fcntl.LOCK_NB if sys.argv[1] == "acquire" else fcntl.LOCK_UN
+    fcntl.flock(3, operation)
+except OSError:
+    raise SystemExit(1)
+PY
+    then return 0; fi
+  fi
+  if command -v perl >/dev/null 2>&1; then
+    if perl -MConfig -MFcntl=:flock -e '
+      die "Perl lacks native flock support\n" unless $Config{d_flock} eq "define";
+      open my $handle, "<&=", 3 or die "Cannot open installer lock descriptor: $!\n";
+      my $operation = $ARGV[0] eq "acquire" ? LOCK_EX | LOCK_NB : LOCK_UN;
+      flock($handle, $operation) or die "Installer kernel lock failed: $!\n";
+    ' "$operation" 2>/dev/null 3<&"$fd"; then return 0; fi
+  fi
+  err "Installer kernel lock $operation failed; a working flock, Python 3, or Perl with native flock support is required."
+  return 1
+}
+
+verify_installer_lock_authorities() {
+  local identity=""
+  if [ "${DESTINATION_LOCKED:-0}" -eq 1 ]; then
+    identity=$(installer_directory_identity "$DESTINATION_TARGET_DIR") || identity=""
+    if [ -z "$identity" ] || [ "$identity" != "$DESTINATION_TARGET_IDENTITY" ] || \
+       [ "$(installer_path_owner_uid "$DESTINATION_TARGET_DIR")" != "$DESTINATION_TARGET_UID" ]; then
+      err "Install destination changed after lock acquisition; refusing pathname mutations: $DESTINATION_TARGET_DIR"
       return 1
+    fi
+    identity=$(installer_directory_identity "$DESTINATION_LOCK_DIR") || identity=""
+    if [ -z "$identity" ] || [ "$identity" != "$DESTINATION_LOCK_IDENTITY" ] || \
+       [ "$(installer_lock_fd_identity 8)" != "$identity" ] || \
+       [ "$(installer_path_owner_uid "$DESTINATION_LOCK_DIR")" != "$DESTINATION_LOCK_UID" ] || \
+       [ "$(installer_path_mode "$DESTINATION_LOCK_DIR")" != 700 ]; then
+      err "Private installer lock authority changed; refusing pathname mutations: $DESTINATION_LOCK_DIR"
+      return 1
+    fi
+  fi
+  if [ "${LOCKED:-0}" -eq 1 ]; then
+    identity=$(installer_directory_identity "$LOCK_DIR") || identity=""
+    if [ -z "$identity" ] || [ "$identity" != "$LOCK_IDENTITY" ] || \
+       [ "$(installer_lock_fd_identity 7)" != "$identity" ]; then
+      err "Additional installer lock authority changed; refusing to continue: $LOCK_DIR"
+      return 1
+    fi
+  fi
+}
+
+release_installer_lock() {
+  local kind="$1" rc=0
+  case "$kind" in
+    initial)
+      [ "${LOCKED:-0}" -eq 1 ] || return 0
+      installer_kernel_lock 7 release || rc=$?
+      exec 7<&-
+      LOCKED=0
       ;;
+    destination)
+      [ "${DESTINATION_LOCKED:-0}" -eq 1 ] || return 0
+      installer_kernel_lock 8 release || rc=$?
+      exec 8<&-
+      DESTINATION_LOCKED=0
+      ;;
+    *) return 1 ;;
   esac
-
-  current_uid=$(id -u 2>/dev/null) || return 1
-  lock_owner=$(installer_path_owner_uid "$lock_dir") || {
-    warn "Could not verify installer lock ownership; refusing cleanup: ${lock_dir}"
-    return 1
-  }
-  if [ "$lock_owner" != "$current_uid" ]; then
-    warn "Installer lock belongs to uid ${lock_owner}, not current uid ${current_uid}; refusing cleanup: ${lock_dir}"
-    return 1
-  fi
-
-  local unexpected
-  unexpected=$(find "$lock_dir" -mindepth 1 ! -name pid -print -quit 2>/dev/null || true)
-  if [ -n "$unexpected" ]; then
-    warn "Installer lock ${lock_dir} contains unexpected entry ${unexpected}; refusing automatic cleanup"
-    return 1
-  fi
-
-  if [ -e "$lock_dir/pid" ] || [ -L "$lock_dir/pid" ]; then
-    if [ -L "$lock_dir/pid" ] || [ ! -f "$lock_dir/pid" ]; then
-      warn "Installer lock ${lock_dir}/pid is not a regular file; refusing automatic cleanup"
-      return 1
-    fi
-    if [ -n "$expected_pid" ]; then
-      if ! observed_pid=$(cat "$lock_dir/pid" 2>/dev/null); then
-        warn "Could not re-read installer lock ownership; refusing cleanup: ${lock_dir}/pid"
-        return 1
-      fi
-      if [ "$observed_pid" != "$expected_pid" ]; then
-        warn "Installer lock owner changed from pid ${expected_pid} to ${observed_pid:-<empty>}; refusing cleanup"
-        return 1
-      fi
-    fi
-    rm -f "$lock_dir/pid" || return 1
-  elif [ -n "$expected_pid" ]; then
-    warn "Installer lock pid disappeared before cleanup; refusing to remove the directory: ${lock_dir}"
-    return 1
-  fi
-  rmdir "$lock_dir"
+  # Explicit unlock also releases any inherited copy held by a child. Do not
+  # unlink a path: it may now name another directory or another acquisition.
+  return "$rc"
 }
 
 remove_installer_tmp_dir() {
@@ -9035,20 +9363,27 @@ cleanup() {
   if [ -n "${TMP:-}" ]; then
     remove_installer_tmp_dir "$TMP" || true
   fi
-  if [ "${LOCKED:-0}" -eq 1 ]; then
-    remove_installer_lock_dir "${LOCK_DIR:-}" "$$" || true
-  fi
+  release_installer_lock initial || true
+  release_installer_lock destination || true
   if [ "$rc" -ne 0 ]; then
     dump_verbose_tail
   fi
   return "$rc"
 }
 
-# Cross-platform locking using mkdir (atomic on all POSIX systems). Install the
-# cleanup trap before acquisition so every later preflight failure releases a
-# lock this invocation actually owns.
-LOCK_DIR="${LOCK_FILE}.d"
+# Open descriptors, not PID records or a shared temporary pathname, carry lock
+# ownership. Install cleanup before acquisition and retain both descriptors
+# until transaction recovery and normal cleanup have finished.
+LOCK_DIR=""
 LOCKED=0
+LOCK_IDENTITY=""
+DESTINATION_LOCK_DIR=""
+DESTINATION_LOCKED=0
+DESTINATION_LOCK_IDENTITY=""
+DESTINATION_LOCK_UID=""
+DESTINATION_TARGET_DIR=""
+DESTINATION_TARGET_IDENTITY=""
+DESTINATION_TARGET_UID=""
 TMP=""
 trap cleanup EXIT
 trap 'handle_binary_transaction_signal HUP 129' HUP
@@ -9056,54 +9391,100 @@ trap 'handle_binary_transaction_signal INT 130' INT
 trap 'handle_binary_transaction_signal QUIT 131' QUIT
 trap 'handle_binary_transaction_signal TERM 143' TERM
 
-publish_installer_lock_pid() {
-  chmod 700 "$LOCK_DIR" || return 1
-  (umask 077; printf '%s\n' "$$" >"$LOCK_DIR/pid")
-}
-
-if mkdir "$LOCK_DIR" 2>/dev/null; then
-  LOCKED=1
-  if ! publish_installer_lock_pid; then
-    err "Could not publish installer lock ownership at $LOCK_DIR"
-    exit 1
+acquire_installer_lock() {
+  local lock_dir="$1"
+  local lock_kind="$2"
+  local identity="" fd="" original_cwd="" acquired=0
+  local target_dir="" target_identity="" target_uid="" lock_uid="" authority_uid=""
+  case "$lock_kind" in initial) fd=7 ;; destination) fd=8 ;; *) return 1 ;; esac
+  if [ "$lock_kind" = destination ]; then
+    target_dir="$lock_dir"
+    target_identity=$(installer_directory_identity "$target_dir") || {
+      err "Install destination is not a non-symlink directory: $target_dir"
+      return 1
+    }
+    lock_uid=$(id -u) || return 1
+    [[ "$lock_uid" =~ ^[0-9]+$ ]] || return 1
+    target_uid=$(installer_path_owner_uid "$target_dir") || return 1
+    # The directory owner and a privileged system installer must rendezvous on
+    # one lock, even when root installs into a user-owned /usr/local/bin.
+    if [ "$lock_uid" != "$target_uid" ] && [ "$lock_uid" != 0 ]; then
+      err "Install destination must be owned by the installing user (or use a privileged installer): $target_dir"
+      return 1
+    fi
+    lock_dir="${target_dir%/}/.mcp-agent-mail-install.lock.${target_uid}.d"
+    # A read-only open of a public bin directory lets an unrelated UID flock
+    # that inode and deny installation. Never lock that public object. Keep
+    # this owner-only authority stable instead; release only its descriptor.
+    if ! (umask 077; ensure_real_directory_tree "$lock_dir" "private installer lock") || \
+       [ "$(installer_path_mode "$lock_dir")" != 700 ]; then
+      err "Installer lock must be an owner-only non-symlink directory: $lock_dir"
+      return 1
+    fi
+    authority_uid=$(installer_path_owner_uid "$lock_dir") || return 1
+    if { [ "$authority_uid" != "$target_uid" ] && [ "$authority_uid" != 0 ]; } || \
+       { [ "$lock_uid" != "$authority_uid" ] && [ "$lock_uid" != 0 ]; }; then
+      err "Installer lock authority belongs to another user; use its privileged owner: $lock_dir"
+      return 1
+    fi
   fi
-else
-  lock_owner=""
-  current_uid=$(id -u 2>/dev/null || printf '')
-  if [ ! -L "$LOCK_DIR" ] && [ -d "$LOCK_DIR" ]; then
-    lock_owner=$(installer_path_owner_uid "$LOCK_DIR" 2>/dev/null || printf '')
+  identity=$(installer_directory_identity "$lock_dir") || {
+    err "Installer lock authority is not a non-symlink directory: $lock_dir"
+    return 1
+  }
+  original_cwd=$(pwd -P) || return 1
+  # Enter the directory before opening '.': a pathname raced to a FIFO/device
+  # cannot hang an open or touch that object. Recheck the named authority after
+  # acquiring the descriptor and again after the kernel grants the lock.
+  cd -P -- "$lock_dir" || return 1
+  case "$lock_kind" in initial) exec 7< . ;; destination) exec 8< . ;; esac
+  cd -P -- "$original_cwd" || return 1
+  if [ "$(installer_lock_fd_identity "$fd")" = "$identity" ] && \
+     [ "$(installer_directory_identity "$lock_dir")" = "$identity" ] && \
+     installer_kernel_lock "$fd" acquire; then
+    acquired=1
   fi
-  if [ -n "$current_uid" ] && [ "$lock_owner" = "$current_uid" ] && \
-     [ -f "$LOCK_DIR/pid" ] && [ ! -L "$LOCK_DIR/pid" ]; then
-    OLD_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || printf '')
-    case "$OLD_PID" in
-      ''|0|*[!0-9]*) ;;
-      *)
-        if ! kill -0 "$OLD_PID" 2>/dev/null; then
-          if remove_installer_lock_dir "$LOCK_DIR" "$OLD_PID" && mkdir "$LOCK_DIR" 2>/dev/null; then
-            LOCKED=1
-            if ! publish_installer_lock_pid; then
-              err "Could not publish installer lock ownership at $LOCK_DIR"
-              exit 1
-            fi
-          fi
-        fi
+  if [ "$acquired" -eq 1 ]; then
+    case "$lock_kind" in
+      initial) LOCKED=1; LOCK_DIR="$lock_dir"; LOCK_IDENTITY="$identity" ;;
+      destination)
+        DESTINATION_LOCKED=1; DESTINATION_LOCK_DIR="$lock_dir"; DESTINATION_LOCK_IDENTITY="$identity"
+        DESTINATION_LOCK_UID="$authority_uid"; DESTINATION_TARGET_DIR="$target_dir"
+        DESTINATION_TARGET_IDENTITY="$target_identity"; DESTINATION_TARGET_UID="$target_uid"
         ;;
     esac
+    if verify_installer_lock_authorities; then return 0; fi
+    release_installer_lock "$lock_kind" || true
+  else
+    case "$lock_kind" in initial) exec 7<&- ;; destination) exec 8<&- ;; esac
+    err "Another installer is running or the lock authority is unsafe (lock $lock_dir)"
+    err "Wait for the other installer to finish; no PID file or lock directory needs removal."
   fi
-  if [ "$LOCKED" -eq 0 ]; then
-    err "Another installer is running or the lock authority is unsafe (lock $LOCK_DIR)"
-    err "Wait for the other install to finish, or inspect the stale lock without following symlinks."
-    err "Check lock owner with: ls -ld \"$LOCK_DIR\" \"$LOCK_DIR/pid\""
-    exit 1
-  fi
-fi
+  return 1
+}
 
-# Persistent install-state writes begin only after dry-run/confirmation and
-# while the installer lock is held.
+# Create the destination and its private lock authority before acquisition;
+# persistent install state and recovery remain behind that kernel lock.
 if ! ensure_real_directory_tree "$DEST" "install destination"; then
   err "Install destination contains traversal, a symlink, or a non-directory component: $DEST"
   exit 1
+fi
+acquire_installer_lock "$DEST" destination || exit 1
+if [ -n "$LOCK_FILE" ]; then
+  LOCK_DIR="${LOCK_FILE}.d"
+  if ! (umask 077; ensure_real_directory_tree "$LOCK_DIR" "additional installer lock"); then
+    err "Additional installer lock must be an owner-only non-symlink directory: $LOCK_DIR"
+    exit 1
+  fi
+  # Equivalent spellings of the destination must not lock our own inode twice.
+  if [ "$(installer_directory_identity "$LOCK_DIR")" != "$DESTINATION_LOCK_IDENTITY" ]; then
+    if [ "$(installer_path_owner_uid "$LOCK_DIR")" != "$(id -u)" ] || \
+       [ "$(installer_path_mode "$LOCK_DIR")" != 700 ]; then
+      err "Additional installer lock must be an owner-only non-symlink directory: $LOCK_DIR"
+      exit 1
+    fi
+    acquire_installer_lock "$LOCK_DIR" initial || exit 1
+  fi
 fi
 # Only the fixed active path is authoritative. A crash before its no-replace
 # publication can leave `.preparing.*` evidence, but those unique directories
@@ -9174,7 +9555,6 @@ fi
 if [ "$FROM_SOURCE" -eq 1 ]; then
   INSTALL_METHOD_LABEL="exact-tag source build"
   info "Building exact release tag $VERSION from source"
-  ensure_rust
   source_repository_url="https://github.com/${OWNER}/${REPO}.git"
   source_commit=""
   if ! checkout_exact_release_source "$source_repository_url" "$TMP/src" "$VERSION"; then
@@ -9187,6 +9567,7 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
     err "Could not resolve one exact source commit for release tag $VERSION."
     exit 1
   fi
+  ensure_rust "$TMP/src" || exit 1
 
   if ! frankensearch_commit=$(release_dependency_pin "$TMP/src" FRANKENSEARCH_COMMIT) || \
      ! fast_cmaes_commit=$(release_dependency_pin "$TMP/src" FAST_CMAES_COMMIT) || \
@@ -9300,8 +9681,6 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   ok "  Source receipt: $source_receipt_path"
 fi
 prune_binary_transaction_history "$DEST"
-maybe_add_path
-install_local_bin_links
 
 if detect_mac_direct_exec_compat_mode; then
   warn "macOS direct execution compatibility mode enabled"
@@ -9390,40 +9769,10 @@ if [ "$PYTHON_DETECTED" -eq 1 ]; then
 
     if [ "$MIGRATE_PYTHON" -eq 1 ]; then
       stop_python_server
-      if ! displace_python_alias; then
-        err "Failed to fully displace legacy 'am' alias/function definitions."
-        err "Please remove remaining alias/function manually, then rerun installer."
-        err "You can still use the Rust binary directly at: $DEST/$BIN_CLI"
-        error_support_hint
-        exit 1
-      fi
-      if ! displace_python_binary; then
-        err "Failed to displace legacy 'am' launcher in PATH."
-        err "Please remove or rename the legacy launcher manually, then rerun installer."
-        err "You can still use the Rust binary directly at: $DEST/$BIN_CLI"
-        error_support_hint
-        exit 1
-      fi
+      # GH#384: copying the source does not establish that Rust can use it.
+      # Keep the Python launchers, shell startup, env and client configs intact
+      # until migration, integrity and archive-parity verification succeed.
       resolve_database_path
-      # Only migrate env config if resolve_database_path actually copied a Python DB.
-      # PYTHON_DB_MIGRATED_PATH is set only when a DB was copied and needs migration.
-      if [ -n "$PYTHON_DB_MIGRATED_PATH" ]; then
-        migrate_env_config
-      else
-        # No Python DB to migrate — alias/binary displacement was the entire migration.
-        # Write the marker now so future runs skip the migration prompt entirely.
-        # (Without this, the clone directory still triggers PYTHON_DETECTED=1 and the
-        # user is prompted on every `acfs update` — see GitHub issue #258.)
-        if [ ! -f "$PYTHON_MIGRATION_MARKER" ]; then
-          mkdir -p "$(dirname "$PYTHON_MIGRATION_MARKER")" 2>/dev/null || true
-          printf 'migrated_at=%s\nnote=no Python DB found; alias/binary displacement only\ninstaller_version=%s\n' \
-            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            "${VERSION:-unknown}" \
-            > "$PYTHON_MIGRATION_MARKER" 2>/dev/null || true
-          verbose "python_migration_marker:written path=${PYTHON_MIGRATION_MARKER} (no-db displacement-only)"
-          ok "Migration marker saved (no Python database found; alias/binary displaced)"
-        fi
-      fi
     fi
   fi
 fi
@@ -9446,21 +9795,6 @@ if [ "$QUIET" -eq 0 ] && [ -n "$MCP_CONFIG_SCAN" ]; then
       info "[$tool] $path (missing)"
     fi
   done <<< "$MCP_CONFIG_SCAN"
-fi
-
-# First run native setup so its atomic, Git-aware token writer durably commits
-# the one credential every subsequent client and service phase will use.
-# This also handles the broader non-Codex migration work:
-#   - Python→Rust command rewriting
-#   - env var preservation (bearer token, storage root)
-#   - BOM/JSONC/trailing-comma tolerance
-#   - Backup before modification
-if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ] && [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ]; then
-  if ! configure_mcp_clients_for_install "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI"; then
-    err "MCP client configuration failed."
-    error_support_hint
-    exit 1
-  fi
 fi
 
 collect_migration_counts() {
@@ -9759,7 +10093,7 @@ installer_reconstruct_database_from_archive() {
     return 1
   fi
 
-  if output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" doctor reconstruct --yes 2>&1); then
+  if output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" doctor reconstruct --yes 7<&- 8<&- 2>&1); then
     while IFS= read -r line; do
       [ -n "$line" ] && verbose "migration:doctor_reconstruct ${line}"
     done <<< "$output"
@@ -9788,7 +10122,7 @@ installer_archive_parity_verify() {
     return 1
   fi
 
-  if ! output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" doctor check --json 2>&1); then
+  if ! output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" doctor check --json 7<&- 8<&- 2>&1); then
     warn "Post-migration doctor check failed: $(printf '%s\n' "$output" | sed -n '1p')"
     while IFS= read -r line; do
       [ -n "$line" ] && verbose "migration:doctor_check ${line}"
@@ -9848,13 +10182,13 @@ installer_apply_schema_migration() {
     return 1
   fi
 
-  if output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" migrate --force 2>&1); then
+  if output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" migrate --force 7<&- 8<&- 2>&1); then
     success_output="$output"
     success_label="primary"
     while IFS= read -r line; do
       [ -n "$line" ] && verbose "migration:schema_refresh ${line}"
     done <<< "$output"
-  elif output_fallback=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite+aiosqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" migrate --force 2>&1); then
+  elif output_fallback=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite+aiosqlite:///$db_path" STORAGE_ROOT="$storage_root" "$DEST/$BIN_CLI" migrate --force 7<&- 8<&- 2>&1); then
     success_output="$output_fallback"
     success_label="fallback"
     while IFS= read -r line; do
@@ -10064,7 +10398,7 @@ if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ] && [ -n "$PYTHON_DB_MIGRATED_PATH" ]
 
   migration_before_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
   migration_start=$(date +%s)
-  if migration_output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$PYTHON_DB_MIGRATED_PATH" "$DEST/$BIN_CLI" migrate --force 2>&1); then
+  if migration_output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$PYTHON_DB_MIGRATED_PATH" "$DEST/$BIN_CLI" migrate --force 7<&- 8<&- 2>&1); then
     migration_end=$(date +%s)
     migration_seconds=$((migration_end - migration_start))
     migration_after_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
@@ -10087,7 +10421,7 @@ if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ] && [ -n "$PYTHON_DB_MIGRATED_PATH" ]
       warn "  AM_INTERFACE_MODE=cli DATABASE_URL=sqlite:///$PYTHON_DB_MIGRATED_PATH am migrate --force"
     fi
     migration_succeeded=1
-  elif migration_output_fallback=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite+aiosqlite:///$PYTHON_DB_MIGRATED_PATH" "$DEST/$BIN_CLI" migrate --force 2>&1); then
+  elif migration_output_fallback=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite+aiosqlite:///$PYTHON_DB_MIGRATED_PATH" "$DEST/$BIN_CLI" migrate --force 7<&- 8<&- 2>&1); then
     migration_end=$(date +%s)
     migration_seconds=$((migration_end - migration_start))
     migration_after_counts=$(collect_migration_counts "$PYTHON_DB_MIGRATED_PATH")
@@ -10364,19 +10698,6 @@ if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ] && [ -n "$PYTHON_DB_MIGRATED_PATH" ]
     fi
   fi
 
-  if [ "$migration_succeeded" -eq 1 ]; then
-    # Write migration-complete marker so future installer runs skip Python migration entirely.
-    mkdir -p "$(dirname "$PYTHON_MIGRATION_MARKER")" 2>/dev/null || true
-    printf 'migrated_at=%s\nrust_db=%s\npython_db=%s\ninstaller_version=%s\n' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      "${RUST_DB_PATH:-unknown}" \
-      "${PYTHON_DB_PATH:-unknown}" \
-      "${VERSION:-unknown}" \
-      > "$PYTHON_MIGRATION_MARKER" 2>/dev/null || true
-    verbose "python_migration_marker:written path=${PYTHON_MIGRATION_MARKER}"
-    ok "Python→Rust migration marker saved (future installs will skip migration)"
-  fi
-
   if [ "$migration_succeeded" -ne 1 ]; then
     err "Database migration could not be completed safely."
     err "Aborting install to avoid running with a potentially inconsistent migrated database."
@@ -10393,6 +10714,62 @@ fi
 if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 1 ]; then
   warn "Rust database migration was skipped because this macOS host rejected direct execution of the installed Rust binaries."
   warn "The existing Python data path remains active through the compatibility launcher."
+fi
+
+# Commit the user-facing takeover only after all required database checks.
+# A refused migration above must not redirect clients to an unusable mailbox.
+if [ "${MIGRATE_PYTHON:-0}" -eq 1 ]; then
+  # PYTHON_DB_MIGRATED_PATH is set only when a database needs migration.
+  if [ -n "$PYTHON_DB_MIGRATED_PATH" ]; then
+    migrate_env_config
+  fi
+  if ! displace_python_alias; then
+    err "Failed to fully displace legacy 'am' alias/function definitions."
+    err "Please remove remaining alias/function manually, then rerun installer."
+    err "You can still use the Rust binary directly at: $DEST/$BIN_CLI"
+    error_support_hint
+    exit 1
+  fi
+  if ! displace_python_binary; then
+    err "Failed to displace legacy 'am' launcher in PATH."
+    err "Please remove or rename the legacy launcher manually, then rerun installer."
+    err "You can still use the Rust binary directly at: $DEST/$BIN_CLI"
+    error_support_hint
+    exit 1
+  fi
+  if [ -n "$PYTHON_DB_MIGRATED_PATH" ]; then
+    mkdir -p "$(dirname "$PYTHON_MIGRATION_MARKER")" 2>/dev/null || true
+    printf 'migrated_at=%s\nrust_db=%s\npython_db=%s\ninstaller_version=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      "${RUST_DB_PATH:-unknown}" \
+      "${PYTHON_DB_PATH:-unknown}" \
+      "${VERSION:-unknown}" \
+      > "$PYTHON_MIGRATION_MARKER" 2>/dev/null || true
+    verbose "python_migration_marker:written path=${PYTHON_MIGRATION_MARKER}"
+    ok "Python→Rust migration marker saved (future installs will skip migration)"
+  elif [ ! -f "$PYTHON_MIGRATION_MARKER" ]; then
+    # GH#258: launcher-only migrations must not prompt on every later update.
+    mkdir -p "$(dirname "$PYTHON_MIGRATION_MARKER")" 2>/dev/null || true
+    printf 'migrated_at=%s\nnote=no Python DB found; alias/binary displacement only\ninstaller_version=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      "${VERSION:-unknown}" \
+      > "$PYTHON_MIGRATION_MARKER" 2>/dev/null || true
+    verbose "python_migration_marker:written path=${PYTHON_MIGRATION_MARKER} (no-db displacement-only)"
+    ok "Migration marker saved (no Python database found; alias/binary displaced)"
+  fi
+fi
+
+maybe_add_path
+install_local_bin_links
+
+# Native setup durably commits the shared credential before clients/services
+# use it. Run only after the migrated mailbox has passed verification.
+if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ] && [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ]; then
+  if ! configure_mcp_clients_for_install "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI"; then
+    err "MCP client configuration failed."
+    error_support_hint
+    exit 1
+  fi
 fi
 
 if [ "${MIGRATE_PYTHON:-0}" -eq 1 ] && [ "$PYTHON_CURRENT_SHELL_TAKEOVER_POSSIBLE" -eq 1 ]; then
@@ -10466,7 +10843,7 @@ verify_installation() {
   fi
 
   # 3. Check binary command surfaces (prevents swapped/mispackaged installs)
-  cli_help=$("$DEST/$BIN_CLI" --help 2>&1 || true)
+  cli_help=$("$DEST/$BIN_CLI" --help 7<&- 8<&- 2>&1 || true)
   if printf "%s\n" "$cli_help" | grep -qE '(^|[[:space:]])serve-http([[:space:]]|$)'; then
     cli_surface_ok=1
     ok "VERIFY: '$BIN_CLI' exposes CLI command surface"
@@ -10475,7 +10852,7 @@ verify_installation() {
     issues=$((issues + 1))
   fi
 
-  server_help=$("$DEST/$BIN_SERVER" --help 2>&1 || true)
+  server_help=$("$DEST/$BIN_SERVER" --help 7<&- 8<&- 2>&1 || true)
   if printf "%s\n" "$server_help" | grep -qE '^Usage: mcp-agent-mail ' && \
      printf "%s\n" "$server_help" | grep -qE '(^|[[:space:]])serve([[:space:]]|$)'; then
     server_surface_ok=1

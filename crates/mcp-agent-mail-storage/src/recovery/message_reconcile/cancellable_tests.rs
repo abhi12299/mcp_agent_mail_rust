@@ -191,10 +191,8 @@ fn a_busy_project_does_not_prevent_another_message_bundle_from_recovering() {
         &AtomicBool::new(false),
     );
     assert!(
-        refused
-            .unwrap_err()
-            .to_string()
-            .contains("lock budget exhausted")
+        matches!(refused, Err(StorageError::LockContention { ref message })
+        if message.contains("project lock busy"))
     );
     assert!(paths.iter().all(|path| !path.exists()));
     let progressed = reconcile_message_bundle_cancellable(
@@ -231,13 +229,18 @@ fn a_held_flock_keeps_its_owner_evidence_and_all_message_destinations() {
         return;
     }
     use fs2::FileExt;
+    use std::io::Read;
     let (_temp, config, archive, message, recipients) = fixture();
     let paths = bundle_paths(&archive, &message, &recipients);
     let lock_path = archive.root.join(".archive.lock");
     let owner_path = archive.root.join(".archive.lock.owner.json");
     fs::write(&lock_path, b"foreign lock evidence").unwrap();
     fs::write(&owner_path, b"foreign owner evidence").unwrap();
-    let owner = fs::OpenOptions::new().write(true).open(&lock_path).unwrap();
+    let mut owner = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
     owner.try_lock_exclusive().unwrap();
     let result = reconcile_message_bundle_cancellable(
         &Cx::for_testing(),
@@ -247,12 +250,14 @@ fn a_held_flock_keeps_its_owner_evidence_and_all_message_destinations() {
         &AtomicBool::new(false),
     );
     assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("lock budget exhausted")
+        matches!(result, Err(StorageError::LockContention { ref message })
+        if message.contains("project lock busy"))
     );
-    assert_eq!(fs::read(&lock_path).unwrap(), b"foreign lock evidence");
+    // Read through the still-locked owner: Windows refuses a second handle's
+    // access to this exclusively locked range, including in the same process.
+    let mut evidence = Vec::new();
+    owner.read_to_end(&mut evidence).unwrap();
+    assert_eq!(evidence, b"foreign lock evidence");
     assert_eq!(fs::read(&owner_path).unwrap(), b"foreign owner evidence");
     assert!(paths.iter().all(|path| !path.exists()));
     let contender = fs::OpenOptions::new().write(true).open(&lock_path).unwrap();

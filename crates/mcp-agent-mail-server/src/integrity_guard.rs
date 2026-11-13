@@ -20,6 +20,9 @@ mod pool_admission;
 #[path = "integrity_guard_schedule.rs"]
 mod schedule;
 
+pub use backup_budget::Admission as BackupParentAdmission;
+#[cfg(all(test, unix))]
+pub use backup_budget::with_admission as with_backup_parent_admission;
 use schedule::{AutomaticBackupSchedule, BackupCompletion, BackupKind, FullVerificationGate};
 
 use mcp_agent_mail_core::Config;
@@ -37,6 +40,10 @@ static SKIP_NEXT_QUICK_CYCLE: AtomicBool = AtomicBool::new(false);
 static SKIP_NEXT_PROACTIVE_BACKUP: AtomicBool = AtomicBool::new(false);
 static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
+static ROTATION_CONTINUATIONS: std::sync::LazyLock<
+    Mutex<std::collections::BTreeMap<PathBuf, Instant>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::BTreeMap::new()));
+const ROTATION_CONTINUATION_MIN_REST: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 const DEFAULT_QUICK_CHECK_INTERVAL_SECS: u64 = 300;
@@ -268,11 +275,19 @@ pub fn start(config: &Config) {
     drop(worker);
 }
 
-pub fn shutdown() {
+/// Notify the sleeper before another service's join can delay shutdown.
+pub fn request_shutdown() {
+    let _worker = WORKER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     SHUTDOWN.store(true, Ordering::Release);
+}
+
+pub fn shutdown() {
     let mut worker = WORKER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    SHUTDOWN.store(true, Ordering::Release);
     if let Some(handle) = worker.take() {
         let _ = handle.join();
     }
@@ -460,7 +475,12 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
             );
         }
 
-        if !wait_for_next_cycle(quick_every) {
+        let keep_running = if probes_passed {
+            wait_for_next_cycle_with_retention(quick_every, &storage_root, &pool)
+        } else {
+            wait_for_next_cycle(quick_every)
+        };
+        if !keep_running {
             return;
         }
     }
@@ -489,6 +509,124 @@ fn wait_for_next_cycle(mut remaining: Duration) -> bool {
         remaining = remaining.saturating_sub(chunk);
     }
     !SHUTDOWN.load(Ordering::Acquire)
+}
+
+fn next_rotation_continuation(primary: &Path) -> Option<Instant> {
+    ROTATION_CONTINUATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(primary)
+        .copied()
+}
+
+fn record_rotation_continuation(
+    primary: &Path,
+    result: &std::io::Result<crate::backup_rotation::RotateReport>,
+    elapsed: Duration,
+    completed: Instant,
+) {
+    let continue_work = result.as_ref().is_ok_and(|report| {
+        report.work_deferred()
+            && !report.admission_refused
+            && !report.inventory_incomplete
+            && (report.failures.is_empty()
+                || report.evicted() > 0
+                || report.empty_directories_deleted > 0)
+    });
+    let mut pending = ROTATION_CONTINUATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pending.remove(primary);
+    if continue_work {
+        // Rest starts after completion, including an oversized verification.
+        // This targets at most 10% wall-time duty for continuation work.
+        let rest = elapsed
+            .saturating_mul(9)
+            .max(ROTATION_CONTINUATION_MIN_REST);
+        if let Some(due) = completed.checked_add(rest) {
+            if pending.len() >= 128 {
+                pending.pop_first();
+            }
+            pending.insert(primary.to_path_buf(), due);
+        }
+    }
+}
+
+fn run_rotation_continuation_if_due(
+    primary: &Path,
+    now: Instant,
+    integrity_allows_work: bool,
+    shutdown: bool,
+    rotate: impl FnOnce() -> std::io::Result<crate::backup_rotation::RotateReport>,
+) -> bool {
+    if shutdown || !integrity_allows_work {
+        return false;
+    }
+    {
+        let mut pending = ROTATION_CONTINUATIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.get(primary).is_none_or(|due| *due > now) {
+            return false;
+        }
+        pending.remove(primary);
+    }
+    match rotate() {
+        Ok(report) => report_backup_rotation(&report, "bounded background continuation"),
+        Err(error) => {
+            tracing::warn!(%error, "background backup retention refused; ordinary retry pacing remains in effect");
+        }
+    }
+    true
+}
+
+/// Drain already admitted cleanup work between normal integrity cycles. This
+/// path never calls an exporter, changes the publication retry window, or runs
+/// extra live-database probes. Every slice reacquires filesystem/snapshot
+/// authority; no lock is held during its mandatory rest.
+fn wait_for_next_cycle_with_retention(
+    duration: Duration,
+    storage_root: &Path,
+    pool: &DbPool,
+) -> bool {
+    let Some(next_probe) = Instant::now().checked_add(duration) else {
+        return wait_for_next_cycle(duration);
+    };
+    let primary = Path::new(pool.sqlite_path());
+    let allowed = || {
+        !pool.is_closed()
+            && !mcp_agent_mail_db::corruption_circuit_breaker().is_tripped()
+            && mcp_agent_mail_db::integrity::integrity_metrics().last_full_check_outcome
+                != mcp_agent_mail_db::integrity::IntegrityCheckOutcome::Failed
+    };
+    loop {
+        let now = Instant::now();
+        if now >= next_probe || SHUTDOWN.load(Ordering::Acquire) {
+            return !SHUTDOWN.load(Ordering::Acquire);
+        }
+        let Some(next_rotation) = next_rotation_continuation(primary).filter(|_| allowed()) else {
+            return wait_for_next_cycle(next_probe.saturating_duration_since(now));
+        };
+        if !wait_for_next_cycle(next_rotation.min(next_probe).saturating_duration_since(now)) {
+            return false;
+        }
+        if Instant::now() >= next_probe {
+            return true;
+        }
+        run_rotation_continuation_if_due(
+            primary,
+            Instant::now(),
+            allowed(),
+            SHUTDOWN.load(Ordering::Acquire),
+            || {
+                PeriodicBackupPolicy::new(
+                    storage_root,
+                    crate::backup_rotation::resolved_keep_per_kind(),
+                )
+                .rotate(primary, None)
+            },
+        );
+    }
 }
 
 /// A probe's result belongs to the engine that produced it. A recovery can
@@ -710,16 +848,18 @@ fn run_automatic_backup(
     schedule: &mut AutomaticBackupSchedule,
 ) -> bool {
     let primary = Path::new(pool.sqlite_path());
-    let retention = PeriodicBackupPolicy {
+    let retention = PeriodicBackupPolicy::new(
         storage_root,
-        keep: crate::backup_rotation::resolved_keep_per_kind(),
-    };
+        crate::backup_rotation::resolved_keep_per_kind(),
+    );
     run_admitted_backup_with(
         primary,
         schedule,
         Instant::now,
         Some(retention),
-        |kind, before_export| publish_automatic_backup(pool, retention, kind, before_export),
+        |kind, before_export, admission| {
+            publish_automatic_backup(pool, retention, kind, before_export, admission)
+        },
     )
 }
 
@@ -727,6 +867,55 @@ fn run_automatic_backup(
 struct PeriodicBackupPolicy<'a> {
     storage_root: &'a Path,
     keep: usize,
+    rotation_budget: Duration,
+}
+
+impl<'a> PeriodicBackupPolicy<'a> {
+    const fn new(storage_root: &'a Path, keep: usize) -> Self {
+        Self {
+            storage_root,
+            keep,
+            rotation_budget: crate::backup_rotation::BACKGROUND_ROTATION_BUDGET,
+        }
+    }
+
+    fn rotate(
+        self,
+        primary: &Path,
+        admission: Option<&BackupParentAdmission>,
+    ) -> std::io::Result<crate::backup_rotation::RotateReport> {
+        if primary.as_os_str() == ":memory:" {
+            return Ok(crate::backup_rotation::RotateReport::default());
+        }
+        let started = Instant::now();
+        let result = admission.map_or_else(
+            || {
+                crate::backup_rotation::rotate_storage_backups_in_background(
+                    self.storage_root,
+                    primary,
+                    self.keep,
+                    self.rotation_budget,
+                )
+            },
+            |admission| {
+                crate::backup_rotation::rotate_storage_backups_with_exporter_lease(
+                    self.storage_root,
+                    primary,
+                    self.keep,
+                    admission,
+                    self.rotation_budget,
+                )
+            },
+        );
+        let completed = Instant::now();
+        record_rotation_continuation(
+            primary,
+            &result,
+            completed.saturating_duration_since(started),
+            completed,
+        );
+        result
+    }
 }
 
 fn publish_automatic_backup(
@@ -734,6 +923,7 @@ fn publish_automatic_backup(
     retention: PeriodicBackupPolicy<'_>,
     kind: BackupKind,
     before_export: &mut dyn FnMut() -> Result<(), String>,
+    admission: Option<&BackupParentAdmission>,
 ) -> Result<bool, String> {
     let result = match kind {
         BackupKind::Proactive => pool
@@ -760,11 +950,7 @@ fn publish_automatic_backup(
     // refusal below the periodic quota cannot create the stage/count pressure
     // that otherwise retries cleanup. Both exporter leases remain held.
     rotate_after_backup_attempt_with(result, || {
-        crate::backup_rotation::rotate_storage_backups_with_exporter_lease(
-            retention.storage_root,
-            Path::new(pool.sqlite_path()),
-            retention.keep,
-        )
+        retention.rotate(Path::new(pool.sqlite_path()), admission)
     })
 }
 
@@ -774,25 +960,30 @@ fn publish_automatic_backup(
 fn prepare_periodic_publication(
     primary: &Path,
     policy: PeriodicBackupPolicy<'_>,
+    admission: Option<&BackupParentAdmission>,
 ) -> std::io::Result<()> {
     if primary.as_os_str() == ":memory:" {
         return Ok(());
     }
-    match crate::backup_rotation::admit_periodic_publication(
+    if let Some(admission) = admission {
+        admission.revalidate_for(primary)?;
+    }
+    let result = match crate::backup_rotation::admit_periodic_publication(
         policy.storage_root,
         primary,
         policy.keep,
     ) {
         Err(error) if crate::backup_rotation::periodic_publication_budget_exhausted(&error) => {
-            let report = crate::backup_rotation::rotate_storage_backups_with_exporter_lease(
-                policy.storage_root,
-                primary,
-                policy.keep,
-            )?;
+            let report = policy.rotate(primary, admission)?;
             report_backup_rotation(&report, "before automatic publication");
             if report.admission_refused {
                 return Err(std::io::Error::other(
-                    "backup retention admission is unavailable; no repair export was reserved, retry after the reported reader, namespace, or inventory refusal is resolved",
+                    "backup retention admission is unavailable; no repair export was reserved, retry after the reported reader, namespace, inventory, or durability failure is resolved",
+                ));
+            }
+            if report.work_deferred() {
+                return Err(std::io::Error::other(
+                    crate::backup_rotation::RotationWorkDeferred,
                 ));
             }
             crate::backup_rotation::admit_periodic_publication(
@@ -802,7 +993,11 @@ fn prepare_periodic_publication(
             )
         }
         result => result,
+    };
+    if let Some(admission) = admission {
+        admission.revalidate_for(primary)?;
     }
+    result
 }
 
 /// Retention must prove its own verified replacement, including after an
@@ -829,9 +1024,25 @@ fn rotate_after_backup_attempt_with(
 }
 
 pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, phase: &'static str) {
+    if report.window_images_deleted > 0 {
+        tracing::warn!(
+            phase,
+            window_images_deleted = report.window_images_deleted,
+            "backup retention removed newest images because the publication budget stayed exhausted"
+        );
+    }
+    if report.unlinks_with_unobserved_readers > 0 {
+        tracing::info!(
+            phase,
+            unlinks_with_unobserved_readers = report.unlinks_with_unobserved_readers,
+            bytes_unlinked_with_unobserved_readers = report.bytes_unlinked_with_unobserved_readers,
+            "verified superseded backup paths unlinked with incomplete reader visibility; physical blocks may remain until open descriptors and mappings close"
+        );
+    }
     if !report.failures.is_empty()
         || report.admission_refused
         || report.inventory_incomplete
+        || report.unlinks_with_unobserved_readers > 0
         || report.unconfirmed_moves > 0
         || report.unconfirmed_deletions > 0
     {
@@ -844,6 +1055,8 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
             bytes_staged = report.bytes_staged,
             bytes_deleted = report.bytes_deleted,
             bytes_reclaimed = report.bytes_reclaimed,
+            unlinks_with_unobserved_readers = report.unlinks_with_unobserved_readers,
+            bytes_unlinked_with_unobserved_readers = report.bytes_unlinked_with_unobserved_readers,
             bytes_retained = report.bytes_retained(),
             unconfirmed_moves = report.unconfirmed_moves,
             bytes_unconfirmed_moves = report.bytes_unconfirmed_moves,
@@ -851,11 +1064,17 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
             bytes_unconfirmed_deletions = report.bytes_unconfirmed_deletions,
             inventory_incomplete = report.inventory_incomplete,
             admission_refused = report.admission_refused,
+            work_deferred = report.work_deferred(),
+            completed_pin_search_without_match = report.completed_pin_search_without_match,
             failures = report.failures.len(),
             first_failure = ?report.failures.first(),
             "backup retention completed with refusals or uncertain operations; retained bytes remain on disk"
         );
-    } else if report.evicted() > 0 || report.empty_directories_deleted > 0 {
+    } else if report.evicted() > 0
+        || report.empty_directories_deleted > 0
+        || report.deadline_reached()
+        || report.work_deferred()
+    {
         tracing::info!(
             phase,
             empty_directories_deleted = report.empty_directories_deleted,
@@ -865,7 +1084,12 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
             bytes_staged = report.bytes_staged,
             bytes_deleted = report.bytes_deleted,
             bytes_reclaimed = report.bytes_reclaimed,
+            unlinks_with_unobserved_readers = report.unlinks_with_unobserved_readers,
+            bytes_unlinked_with_unobserved_readers = report.bytes_unlinked_with_unobserved_readers,
             bytes_retained = report.bytes_retained(),
+            deadline_reached = report.deadline_reached(),
+            work_deferred = report.work_deferred(),
+            completed_pin_search_without_match = report.completed_pin_search_without_match,
             "backup retention completed"
         );
     }
@@ -878,20 +1102,12 @@ pub fn report_backup_rotation(report: &crate::backup_rotation::RotateReport, pha
 fn rotate_after_backup_admission_refusal(
     primary: &Path,
     retention: Option<PeriodicBackupPolicy<'_>>,
-    parent_lease_held: bool,
+    admission: Option<&BackupParentAdmission>,
 ) {
     let Some(policy) = retention else {
         return;
     };
-    let result = if parent_lease_held {
-        crate::backup_rotation::rotate_storage_backups_with_exporter_lease(
-            policy.storage_root,
-            primary,
-            policy.keep,
-        )
-    } else {
-        crate::backup_rotation::rotate_storage_backups(policy.storage_root, primary, policy.keep)
-    };
+    let result = policy.rotate(primary, admission);
     match result {
         Ok(report) => report_backup_rotation(&report, "after automatic backup admission refusal"),
         Err(error) => tracing::warn!(
@@ -913,7 +1129,11 @@ fn run_admitted_backup_with<F, C>(
     produce: F,
 ) -> bool
 where
-    F: FnOnce(BackupKind, &mut dyn FnMut() -> Result<(), String>) -> Result<bool, String>,
+    F: FnOnce(
+        BackupKind,
+        &mut dyn FnMut() -> Result<(), String>,
+        Option<&BackupParentAdmission>,
+    ) -> Result<bool, String>,
     C: Fn() -> Instant,
 {
     #[cfg(unix)]
@@ -928,14 +1148,25 @@ where
         // Keep the retained-stage budget and its parent-wide lease. Only an
         // admitted exporter may acquire the mailbox journal, always in this
         // lock order, and both leases remain held through producer completion.
-        let admitted = backup_budget::with_admission(primary, || {
-            let lease = match backup_journal::AutomaticBackupLease::try_begin(primary, requested) {
+        let admitted = backup_budget::with_admission(primary, |admission| {
+            let admission = admission.ok_or_else(|| {
+                "a file-backed attempt has no retained parent admission".to_string()
+            })?;
+            if let Err(error) = admission.revalidate_for(primary) {
+                rotate_after_backup_admission_refusal(primary, retention, Some(admission));
+                return Ok(run_automatic_backup_with(schedule, &clock, |_| {
+                    Err(error.to_string())
+                }));
+            }
+            let lease = match backup_journal::AutomaticBackupLease::try_begin(
+                primary, requested, admission,
+            ) {
                 Ok(Some(lease)) => lease,
                 Ok(None) => {
                     tracing::debug!(
                         "integrity guard: automatic export deferred by durable backoff or an active exporter; health probes continue"
                     );
-                    rotate_after_backup_admission_refusal(primary, retention, true);
+                    rotate_after_backup_admission_refusal(primary, retention, Some(admission));
                     return Ok(true);
                 }
                 Err(error) => {
@@ -946,12 +1177,12 @@ where
                         %error,
                         "integrity guard: automatic backup journal admission unavailable; no export started; health probes continue"
                     );
-                    rotate_after_backup_admission_refusal(primary, retention, true);
+                    rotate_after_backup_admission_refusal(primary, retention, Some(admission));
                     return Ok(true);
                 }
             };
             Ok(run_with_backup_lease(
-                primary, schedule, &clock, retention, lease, produce,
+                primary, schedule, &clock, retention, admission, lease, produce,
             ))
         });
         return match admitted {
@@ -960,7 +1191,7 @@ where
                 // Failed staging admission released its parent lease. Public
                 // rotation must reacquire it before using snapshot authority;
                 // its outcome cannot turn the refused exporter into success.
-                rotate_after_backup_admission_refusal(primary, retention, false);
+                rotate_after_backup_admission_refusal(primary, retention, None);
                 run_automatic_backup_with(schedule, clock, |_| Err(error))
             }
         };
@@ -968,11 +1199,12 @@ where
     // Non-Unix platforms retain the existing admission path; memory-backed
     // fixtures never create a journal or a control path on disk.
     run_automatic_backup_with(schedule, clock, |kind| {
-        backup_budget::with_admission(primary, || {
+        backup_budget::with_admission(primary, |admission| {
             if let Some(policy) = retention {
-                prepare_periodic_publication(primary, policy).map_err(|error| error.to_string())?;
+                prepare_periodic_publication(primary, policy, admission)
+                    .map_err(|error| error.to_string())?;
             }
-            produce(kind, &mut || Ok(()))
+            produce(kind, &mut || Ok(()), admission)
         })
     })
 }
@@ -985,15 +1217,20 @@ fn run_with_backup_lease<F, C>(
     schedule: &mut AutomaticBackupSchedule,
     clock: C,
     retention: Option<PeriodicBackupPolicy<'_>>,
+    admission: &BackupParentAdmission,
     mut lease: backup_journal::AutomaticBackupLease,
     produce: F,
 ) -> bool
 where
-    F: FnOnce(BackupKind, &mut dyn FnMut() -> Result<(), String>) -> Result<bool, String>,
+    F: FnOnce(
+        BackupKind,
+        &mut dyn FnMut() -> Result<(), String>,
+        Option<&BackupParentAdmission>,
+    ) -> Result<bool, String>,
     C: Fn() -> Instant,
 {
-    let ready = retention.map_or(Ok(false), |policy| {
-        match prepare_periodic_publication(primary, policy) {
+    let ready = admission.revalidate_for(primary).map_err(|error| error.to_string()).and_then(|()| retention.map_or(Ok(false), |policy| {
+        match prepare_periodic_publication(primary, policy, Some(admission)) {
             Ok(()) => lease
                 .clear_retention_repair_after_admission()
                 .map(|()| false)
@@ -1002,6 +1239,13 @@ where
                 if crate::backup_rotation::periodic_reclamation_enabled()
                     && crate::backup_rotation::periodic_publication_budget_exhausted(&error) =>
             {
+                if lease.retention_repair_spent() {
+                    tracing::warn!(
+                        path = %primary.display(),
+                        %error,
+                        "automatic backups have stopped: retention cannot delete enough old backups to make room, so no new backup is taken until it can; existing backups are kept"
+                    );
+                }
                 lease
                     .prepare_retention_repair()
                     .map_err(|error| error.to_string())?;
@@ -1014,40 +1258,37 @@ where
             }
             Err(error) => Err(error.to_string()),
         }
-    });
+    }));
     if lease.kind() == BackupKind::Verified {
         schedule.request_verified();
     }
     run_automatic_backup_with(schedule, &clock, |kind| {
         let result = ready.and_then(|repair_required| {
             let mut called = false;
-            produce(kind, &mut || {
-                if called {
-                    return Err("automatic export admission was already consumed".to_string());
-                }
-                called = true;
-                if repair_required {
-                    lease
-                        .reserve_retention_repair()
+            produce(
+                kind,
+                &mut || {
+                    if called {
+                        return Err("automatic export admission was already consumed".to_string());
+                    }
+                    called = true;
+                    admission
+                        .revalidate_for(primary)
                         .map_err(|error| error.to_string())?;
-                }
-                Ok(())
-            })
-        });
-        if let Some(policy) = retention
-            && crate::backup_rotation::admit_periodic_publication(
-                policy.storage_root,
-                primary,
-                policy.keep,
+                    if repair_required {
+                        lease
+                            .reserve_retention_repair()
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Ok(())
+                },
+                Some(admission),
             )
-            .is_ok()
-            && let Err(error) = lease.clear_retention_repair_after_admission()
-        {
-            tracing::warn!(
-                %error,
-                "automatic retention regained capacity but the durable repair reservation could not be cleared; future admission remains conservative"
-            );
-        }
+        });
+        // Replenish the repair allowance only at the next attempt's ordinary
+        // admission above. Post-producer cleanup may have completed an unlink
+        // but failed its durability check: a smaller inventory does not erase
+        // that receipt, and completion alone must not replenish the allowance.
         let completion = match &result {
             Ok(true) => BackupCompletion::Published,
             Ok(false) => BackupCompletion::Skipped,
@@ -1244,8 +1485,9 @@ fn run_maintenance_op<F, E>(
 }
 
 /// Run any due background SQLite maintenance ops (bead K4): passive WAL
-/// checkpoint, `ANALYZE`, and `VACUUM`, each on its own configured cadence, plus
-/// re-applying the configured `journal_size_limit`.
+/// checkpoint, `ANALYZE`, and ATC-sidecar `VACUUM`, each on its own configured
+/// cadence, plus re-applying the configured `journal_size_limit`. The primary
+/// mailbox is compacted only by an explicit offline `am doctor vacuum --yes`.
 ///
 /// Runs on the integrity-guard worker thread against its own connection, so it
 /// never touches the request/dispatch hot path. Each op is bounded and
@@ -1266,7 +1508,7 @@ fn run_db_maintenance_cycle(
     if !config.db_maintenance_enabled {
         return;
     }
-    // #219: checkpoint/ANALYZE/VACUUM rewrite live-file state; hold the
+    // #219: checkpoint/ANALYZE rewrite live-file state; hold the
     // in-process write lease so a recovery promotion cannot rename the file
     // out from under them (a VACUUM racing a promotion would rebuild the
     // quarantined generation and recreate sidecars at the live paths).
@@ -1302,16 +1544,12 @@ fn run_db_maintenance_cycle(
     }
 
     if maintenance_task_due(config.db_vacuum_interval_secs, *last_vacuum, now) {
-        run_maintenance_op(
-            "vacuum",
-            || pool.vacuum(),
-            &db.maintenance_vacuum_runs_total,
-            &db.maintenance_last_vacuum_us,
-        );
-        // br-fv0s1: the main vacuum never touches the isolated ATC telemetry
-        // sidecar (atc.sqlite3), so pages freed by the experience-ceiling sweep
-        // (br-bvq1x.11.6) would accumulate. Vacuum it on the same cadence,
-        // reusing the vacuum metrics. No-op when the sidecar was never created.
+        // GH#372: never rebuild the primary mailbox under a running server.
+        // An engine upgrade fixes future insertions, but existing sparse index
+        // pages require explicit, backed-up offline compaction. A scheduled
+        // rewrite must not bypass the doctor's exclusive activity locks.
+        // br-fv0s1: retain compaction for the isolated ATC telemetry sidecar;
+        // it contains no mailbox messages. No-op if it was never created.
         run_maintenance_op(
             "vacuum_atc_sidecar",
             || pool.vacuum_atc_sidecar(),
@@ -1855,7 +2093,7 @@ mod tests {
                 &mut schedule,
                 || now,
                 None,
-                |_, _| panic!("a saturated staging budget must block either producer"),
+                |_, _, _| panic!("a saturated staging budget must block either producer"),
             ));
             assert_eq!(schedule.consecutive_failures(), 1);
             assert_eq!(schedule.next_attempt(now), None);
@@ -1892,7 +2130,7 @@ mod tests {
             &mut schedule,
             || now + Duration::from_secs(1),
             None,
-            |_, _| panic!("a paced operation must not enter admission or its producer"),
+            |_, _, _| panic!("a paced operation must not enter admission or its producer"),
         ));
         assert_eq!(schedule.consecutive_failures(), 1);
         assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
@@ -1911,16 +2149,17 @@ mod tests {
             &mut schedule,
             || now,
             None,
-            |kind, _before_export| {
+            |kind, _before_export, admission| {
                 assert_eq!(kind, BackupKind::Verified);
-                assert!(backup_budget::with_admission(&primary, || Ok(())).is_err());
+                admission.unwrap().revalidate_for(&primary).unwrap();
+                assert!(backup_budget::with_admission(&primary, |_| Ok(())).is_err());
                 rotate_after_backup_attempt_with(Ok(true), || {
-                    assert!(backup_budget::with_admission(&primary, || Ok(())).is_err());
+                    assert!(backup_budget::with_admission(&primary, |_| Ok(())).is_err());
                     Ok(crate::backup_rotation::RotateReport::default())
                 })
             },
         ));
-        assert!(backup_budget::with_admission(&primary, || Ok(())).is_ok());
+        assert!(backup_budget::with_admission(&primary, |_| Ok(())).is_ok());
         assert_eq!(schedule.next_attempt(now), Some(BackupKind::Proactive));
     }
 
@@ -1930,6 +2169,10 @@ mod tests {
         let thread = std::thread::current();
         let name = thread.name().expect("named libtest thread");
         if std::env::var(CHILD).as_deref() == Ok(name) {
+            // Only this dedicated --exact child changes its process mask.
+            // Reader-safe reclamation requires private fixture files and
+            // directories even when the invoking worker uses umask 002.
+            nix::sys::stat::umask(nix::sys::stat::Mode::S_IRWXG | nix::sys::stat::Mode::S_IRWXO);
             return true;
         }
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -2020,6 +2263,728 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn bounded_rotation_continuations_rest_respect_gates_and_never_publish() {
+        use mcp_agent_mail_db::snapshot::{
+            SnapshotRetentionGuard, record_snapshot_metadata, snapshot_bak_path, snapshot_meta_path,
+        };
+
+        if !isolated_default_retention_child() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (primary, _pool) = retention_mailbox(&root);
+        let live = std::fs::read(&primary).unwrap();
+        let backup = snapshot_bak_path(&primary);
+        std::fs::copy(&primary, &backup).unwrap();
+        record_snapshot_metadata(&primary, 2_000_000_000_000_000).unwrap();
+        let metadata = std::fs::read(snapshot_meta_path(&primary)).unwrap();
+        for day in 1..=6 {
+            std::fs::copy(
+                &primary,
+                root.join(format!("mail.sqlite3.bak.200001{day:02}_000000")),
+            )
+            .unwrap();
+        }
+        let wall_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        backup_journal::AutomaticBackupLease::try_begin_at(
+            &primary,
+            BackupKind::Proactive,
+            wall_now,
+        )
+        .unwrap()
+        .unwrap()
+        .finish(BackupCompletion::Skipped)
+        .unwrap();
+        let journal = root.join("mail.sqlite3.automatic-backup-state");
+        let journal_before = std::fs::read(&journal).unwrap();
+        let policy = PeriodicBackupPolicy {
+            rotation_budget: Duration::from_secs(3600),
+            ..PeriodicBackupPolicy::new(&root, 3)
+        };
+        let expired = PeriodicBackupPolicy {
+            rotation_budget: Duration::ZERO,
+            ..policy
+        };
+        let error = prepare_periodic_publication(&primary, expired, None)
+            .expect_err("a spent cleanup quantum cannot permit publication");
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|error| error.is::<crate::backup_rotation::RotationWorkDeferred>())
+        );
+        assert!(!crate::backup_rotation::periodic_publication_budget_exhausted(&error));
+        let deferred = expired.rotate(&primary, None);
+        assert!(deferred.as_ref().unwrap().work_deferred());
+        assert_eq!(deferred.as_ref().unwrap().evicted(), 0);
+        let completed = Instant::now();
+        record_rotation_continuation(&primary, &deferred, Duration::from_secs(2), completed);
+        let due = completed + Duration::from_secs(18);
+        assert_eq!(next_rotation_continuation(&primary), Some(due));
+
+        let callbacks = std::cell::Cell::new(0);
+        for (at, allowed, shutdown) in [
+            (
+                due.checked_sub(Duration::from_nanos(1))
+                    .expect("continuation due time permits a one-nanosecond lookback"),
+                true,
+                false,
+            ),
+            (due, false, false),
+            (due, true, true),
+        ] {
+            assert!(!run_rotation_continuation_if_due(
+                &primary,
+                at,
+                allowed,
+                shutdown,
+                || {
+                    callbacks.set(callbacks.get() + 1);
+                    policy.rotate(&primary, None)
+                },
+            ));
+        }
+        assert_eq!(callbacks.get(), 0);
+        assert_eq!(next_rotation_continuation(&primary), Some(due));
+        assert!(run_rotation_continuation_if_due(
+            &primary,
+            due,
+            true,
+            false,
+            || {
+                callbacks.set(callbacks.get() + 1);
+                let report = policy.rotate(&primary, None)?;
+                assert_eq!(report.deleted, 4, "{report:?}");
+                assert!(!report.work_deferred(), "{report:?}");
+                Ok(report)
+            },
+        ));
+        assert_eq!(callbacks.get(), 1);
+        assert_eq!(next_rotation_continuation(&primary), None);
+
+        // A new backlog can schedule another slice, but a real busy authority
+        // is a refusal: it ends fast continuation instead of spinning.
+        for day in 7..=9 {
+            std::fs::copy(
+                &primary,
+                root.join(format!("mail.sqlite3.bak.200001{day:02}_000000")),
+            )
+            .unwrap();
+        }
+        let deferred = expired.rotate(&primary, None);
+        let completed = due + Duration::from_secs(1);
+        record_rotation_continuation(&primary, &deferred, Duration::from_millis(10), completed);
+        let due = completed + Duration::from_secs(5);
+        assert_eq!(next_rotation_continuation(&primary), Some(due));
+        let _held_authority = SnapshotRetentionGuard::acquire(&primary).unwrap();
+        assert!(run_rotation_continuation_if_due(
+            &primary,
+            due,
+            true,
+            false,
+            || {
+                callbacks.set(callbacks.get() + 1);
+                let report = policy.rotate(&primary, None)?;
+                assert!(report.admission_refused, "{report:?}");
+                assert_eq!(report.evicted(), 0, "{report:?}");
+                Ok(report)
+            },
+        ));
+        assert_eq!(callbacks.get(), 2);
+        assert_eq!(next_rotation_continuation(&primary), None);
+        assert_eq!(std::fs::read(&primary).unwrap(), live);
+        assert_eq!(std::fs::read(&backup).unwrap(), live);
+        assert_eq!(
+            std::fs::read(snapshot_meta_path(&primary)).unwrap(),
+            metadata
+        );
+        assert_eq!(std::fs::read(&journal).unwrap(), journal_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_pin_search_preserves_repair_allowance_until_a_complete_sweep() {
+        use mcp_agent_mail_db::snapshot::{
+            record_snapshot_metadata, snapshot_bak_path, snapshot_meta_path,
+            verified_snapshot_source_path,
+        };
+
+        if !isolated_default_retention_child() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (primary, pool) = retention_mailbox(&root);
+        let live = std::fs::read(&primary).unwrap();
+        let backup = snapshot_bak_path(&primary);
+        std::fs::copy(&primary, &backup).unwrap();
+        let mut metadata = record_snapshot_metadata(&primary, 1_700_000_000_000_000).unwrap();
+        metadata.snapshot_sha256 = "0".repeat(64);
+        std::fs::write(
+            snapshot_meta_path(&primary),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        for number in 0..130 {
+            std::fs::copy(
+                &primary,
+                root.join(format!(
+                    "mail.sqlite3.bak.20000101_00{:02}{:02}",
+                    number / 60,
+                    number % 60,
+                )),
+            )
+            .unwrap();
+        }
+        let policy = PeriodicBackupPolicy {
+            // Exercise the item bound deterministically, independently of
+            // build optimization or machine speed.
+            rotation_budget: Duration::from_secs(3600),
+            ..PeriodicBackupPolicy::new(&root, 3)
+        };
+        let wall_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let now = Instant::now();
+        let mut schedule = AutomaticBackupSchedule::default();
+        backup_budget::with_admission(&primary, |admission| {
+            let lease = backup_journal::AutomaticBackupLease::try_begin_at(
+                &primary,
+                BackupKind::Proactive,
+                wall_now,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(run_with_backup_lease(
+                &primary,
+                &mut schedule,
+                || now,
+                Some(policy),
+                admission.unwrap(),
+                lease,
+                |_, _, _| panic!("an unfinished pin search cannot reserve a repair or export"),
+            ));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(schedule.consecutive_failures(), 1);
+        assert_eq!(
+            crate::backup_rotation::inspect_storage_backups(&primary)
+                .unwrap()
+                .artifact_count,
+            131
+        );
+        let journal = root.join("mail.sqlite3.automatic-backup-state");
+        let journal_before = std::fs::read(&journal).unwrap();
+        let due = next_rotation_continuation(&primary).expect("unfinished sweep schedules cleanup");
+        assert!(run_rotation_continuation_if_due(
+            &primary,
+            due,
+            true,
+            false,
+            || {
+                let report = policy.rotate(&primary, None)?;
+                assert!(report.completed_pin_search_without_match, "{report:?}");
+                assert!(!report.work_deferred(), "{report:?}");
+                assert!(!report.admission_refused, "{report:?}");
+                assert_eq!(
+                    report.evicted(),
+                    0,
+                    "negative search evidence cannot delete"
+                );
+                Ok(report)
+            },
+        ));
+        assert_eq!(next_rotation_continuation(&primary), None);
+        assert_eq!(std::fs::read(&journal).unwrap(), journal_before);
+        assert_eq!(std::fs::read(&primary).unwrap(), live);
+
+        let day = 24 * 3600;
+        backup_budget::with_admission(&primary, |admission| {
+            let lease = backup_journal::AutomaticBackupLease::try_begin_at(
+                &primary,
+                BackupKind::Proactive,
+                wall_now + day,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                !lease.retention_repair_spent(),
+                "bounded work never consumed the repair token"
+            );
+            let mut restarted = AutomaticBackupSchedule::default();
+            let produced = std::cell::Cell::new(0);
+            assert!(run_with_backup_lease(
+                &primary,
+                &mut restarted,
+                || now + Duration::from_secs(day),
+                Some(policy),
+                admission.unwrap(),
+                lease,
+                |kind, before_export, admission| {
+                    produced.set(produced.get() + 1);
+                    assert_eq!(kind, BackupKind::Verified);
+                    publish_automatic_backup(&pool, policy, kind, before_export, admission)
+                },
+            ));
+            assert_eq!(produced.get(), 1);
+            assert_eq!(restarted.consecutive_failures(), 0);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            verified_snapshot_source_path(&primary).as_deref(),
+            Some(backup.as_path())
+        );
+        let reopened = backup_journal::AutomaticBackupLease::try_begin_at(
+            &primary,
+            BackupKind::Proactive,
+            wall_now + 2 * day,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            reopened.retention_repair_spent(),
+            "completion cannot replenish the one-shot allowance"
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), live);
+    }
+
+    #[cfg(unix)]
+    fn retention_namespace_bytes(
+        root: &Path,
+    ) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+        walkdir::WalkDir::new(root)
+            .min_depth(1)
+            .into_iter()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let path = entry.path().strip_prefix(root).unwrap().to_path_buf();
+                let bytes = entry
+                    .file_type()
+                    .is_file()
+                    .then(|| std::fs::read(entry.path()).unwrap());
+                (path, bytes)
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn replace_admitted_retention_parent(
+        active: &Path,
+        displaced: &Path,
+        primary: &Path,
+        live: &[u8],
+    ) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+        std::fs::rename(active, displaced).unwrap();
+        std::fs::create_dir(active).unwrap();
+        std::fs::write(primary, live).unwrap();
+        std::fs::copy(
+            primary,
+            mcp_agent_mail_db::snapshot::snapshot_bak_path(primary),
+        )
+        .unwrap();
+        // A replacement actor legitimately publishes at the configured path.
+        // Metadata from a differently named fixture would mask the lease bug.
+        mcp_agent_mail_db::snapshot::record_snapshot_metadata(primary, 2_000_000_000_000_000)
+            .unwrap();
+        for day in 1..=9 {
+            std::fs::copy(
+                primary,
+                active.join(format!("mail.sqlite3.bak.200001{day:02}_000000")),
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(active.join("doctor/reclaimable/rotation-19991231T235959Z"))
+            .unwrap();
+        retention_namespace_bytes(active)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_parent_blocks_coordinator_and_all_admitted_cleanup() {
+        if !isolated_default_retention_child() {
+            return;
+        }
+        for swap_during_producer in [false, true] {
+            assert_replaced_parent_coordinator_cleanup(swap_during_producer);
+        }
+    }
+
+    #[cfg(unix)]
+    fn retention_parent_with_backlog(active: &Path) -> (PathBuf, DbPool, Vec<u8>) {
+        std::fs::create_dir(active).unwrap();
+        let (primary, pool) = retention_mailbox(active);
+        let live = std::fs::read(&primary).unwrap();
+        std::fs::copy(
+            &primary,
+            mcp_agent_mail_db::snapshot::snapshot_bak_path(&primary),
+        )
+        .unwrap();
+        mcp_agent_mail_db::snapshot::record_snapshot_metadata(&primary, 2_000_000_000_000_000)
+            .unwrap();
+        for day in 1..=3 {
+            std::fs::copy(
+                &primary,
+                active.join(format!("mail.sqlite3.bak.200001{day:02}_000000")),
+            )
+            .unwrap();
+        }
+        (primary, pool, live)
+    }
+
+    #[cfg(unix)]
+    fn assert_replaced_parent_coordinator_cleanup(swap_during_producer: bool) {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let active = root.join("active");
+        let displaced = root.join("displaced");
+        let replacement = root.join("replacement");
+        let (primary, pool, live) = retention_parent_with_backlog(&active);
+        let policy = PeriodicBackupPolicy::new(&active, 3);
+        let now = Instant::now();
+        let wall_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "1")],
+            || {
+                backup_budget::with_admission(&primary, |admission| {
+                    let admission = admission.unwrap();
+                    let mut lease = backup_journal::AutomaticBackupLease::try_begin_at(
+                        &primary,
+                        BackupKind::Verified,
+                        wall_now,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    lease.reserve_retention_repair().unwrap();
+                    let mut foreign = (!swap_during_producer).then(|| {
+                        replace_admitted_retention_parent(&active, &displaced, &primary, &live)
+                    });
+                    let mut called = false;
+                    let mut schedule = AutomaticBackupSchedule::default();
+                    assert!(run_with_backup_lease(
+                        &primary,
+                        &mut schedule,
+                        || now,
+                        Some(policy),
+                        admission,
+                        lease,
+                        |kind, before_export, admitted| {
+                            assert!(
+                                swap_during_producer,
+                                "stale admission must precede the producer"
+                            );
+                            called = true;
+                            foreign = Some(replace_admitted_retention_parent(
+                                &active, &displaced, &primary, &live,
+                            ));
+                            // The actual pool rejects its changed authority;
+                            // its post-producer cleanup must use the old token.
+                            let result = publish_automatic_backup(
+                                &pool,
+                                policy,
+                                kind,
+                                before_export,
+                                admitted,
+                            );
+                            assert!(result.is_err());
+                            result
+                        },
+                    ));
+                    assert_eq!(called, swap_during_producer);
+                    assert_eq!(schedule.consecutive_failures(), 1);
+                    let foreign = foreign.unwrap();
+                    assert_eq!(retention_namespace_bytes(&active), foreign);
+                    // Journal-deferred and journal-error branches share this
+                    // admitted cleanup boundary and must preserve the token.
+                    rotate_after_backup_admission_refusal(&primary, Some(policy), Some(admission));
+                    assert_eq!(retention_namespace_bytes(&active), foreign);
+                    assert!(!active.join("mail.sqlite3.automatic-backup-state").exists());
+                    let reopened = backup_journal::AutomaticBackupLease::try_begin_at(
+                        &displaced.join("mail.sqlite3"),
+                        BackupKind::Verified,
+                        wall_now + 86_400,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(reopened.retention_repair_spent(), !swap_during_producer);
+                    drop(reopened);
+                    std::fs::rename(&active, &replacement).unwrap();
+                    std::fs::rename(&displaced, &active).unwrap();
+                    let resumed = policy.rotate(&primary, Some(admission)).unwrap();
+                    assert!(!resumed.admission_refused, "{resumed:?}");
+                    assert_eq!(resumed.deleted, 1, "{resumed:?}");
+                    assert_eq!(retention_namespace_bytes(&replacement), foreign);
+                    assert_eq!(std::fs::read(&primary).unwrap(), live);
+                    Ok(())
+                })
+                .unwrap();
+            },
+        );
+    }
+
+    /// Records the fields of every event at `warn` or louder, the levels a
+    /// default-configured server prints.
+    #[derive(Clone, Default)]
+    struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct WarnFields(String);
+
+    impl tracing::field::Visit for WarnFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+
+            write!(self.0, "{}={value:?} ", field.name()).unwrap();
+        }
+    }
+
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = WarnFields(String::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn newest_images_removed_by_retention_are_reported_as_a_warning() {
+        let quiet = crate::backup_rotation::RotateReport {
+            deleted: 2,
+            ..Default::default()
+        };
+        let shortened = crate::backup_rotation::RotateReport {
+            deleted: 2,
+            window_images_deleted: 2,
+            ..Default::default()
+        };
+        let capture = WarnCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            report_backup_rotation(&quiet, "ordinary pass");
+            report_backup_rotation(&shortened, "shortened pass");
+        });
+        let warnings = capture.0.lock().unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("window_images_deleted=2"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("shortened pass"), "{warnings:?}");
+    }
+
+    #[test]
+    fn opaque_reader_inventory_is_reported_at_the_default_warning_level() {
+        let ordinary = crate::backup_rotation::RotateReport {
+            deleted: 1,
+            bytes_deleted: 4096,
+            bytes_reclaimed: 4096,
+            ..Default::default()
+        };
+        let opaque = crate::backup_rotation::RotateReport {
+            deleted: 1,
+            bytes_deleted: 4096,
+            unlinks_with_unobserved_readers: 1,
+            bytes_unlinked_with_unobserved_readers: 4096,
+            ..Default::default()
+        };
+        let capture = WarnCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            report_backup_rotation(&ordinary, "observable pass");
+            report_backup_rotation(&opaque, "opaque pass");
+        });
+        let warnings = capture.0.lock().unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("unlinks_with_unobserved_readers=1"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("bytes_unlinked_with_unobserved_readers=4096"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("bytes_reclaimed=0"), "{warnings:?}");
+        assert!(warnings[0].contains("bytes_deleted=4096"), "{warnings:?}");
+        assert!(warnings[0].contains("opaque pass"), "{warnings:?}");
+    }
+
+    /// A pass with refusals must keep backups moving, and it may spend the
+    /// newest images on that only where removing them reopens publication.
+    #[cfg(unix)]
+    #[test]
+    fn publication_follows_a_pass_with_refusals() {
+        use mcp_agent_mail_db::snapshot::{
+            latest_verified_snapshot, record_snapshot_metadata, snapshot_bak_path,
+        };
+        use std::os::unix::fs::MetadataExt as _;
+
+        if !isolated_default_retention_child() {
+            return;
+        }
+        // A sibling test's exiting process hides its descriptors for a moment,
+        // so only a table that stays hidden can excuse this test.
+        let observable = (0..60).any(|_| {
+            let observable = owner_processes_fully_observable();
+            if !observable {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            observable
+        });
+        if !observable {
+            eprintln!("not asserting publication: a process of this user hides its open files");
+            return;
+        }
+        for (stuck, refusals_clear) in [(6_u32, false), (6, true), (4, false)] {
+            let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+            let (primary, pool) = retention_mailbox(&root);
+            let slot = snapshot_bak_path(&primary);
+            std::fs::copy(&primary, &slot).unwrap();
+            let published = record_snapshot_metadata(&primary, 1_700_000_000_000_000).unwrap();
+            let image = |day: u32| root.join(format!("mail.sqlite3.bak.2000010{day}_000000"));
+            let refused: Vec<PathBuf> = (1..=stuck).map(image).collect();
+            for path in &refused {
+                std::fs::write(path, b"interrupted export").unwrap();
+            }
+            let newest = [8, 9].map(image);
+            for path in &newest {
+                std::fs::copy(&primary, path).unwrap();
+            }
+
+            // The count limit is 6: the slot, the refused images and the two
+            // newest. Removing those two only helps while 5 or fewer remain.
+            let reopens = stuck < 5;
+            let report =
+                crate::backup_rotation::rotate_storage_backups(&root, &primary, 3).unwrap();
+            assert_eq!(
+                report.window_images_deleted,
+                if reopens { 2 } else { 0 },
+                "{report:?}"
+            );
+            assert_eq!(newest.iter().all(|path| !path.exists()), reopens);
+            assert_eq!(
+                crate::backup_rotation::admit_periodic_publication(&root, &primary, 3).is_ok(),
+                reopens,
+                "stuck={stuck}"
+            );
+
+            if refusals_clear {
+                for path in &refused {
+                    std::fs::copy(&primary, path).unwrap();
+                }
+            }
+            let slot_before = std::fs::metadata(&slot).unwrap().ino();
+            let mut schedule = AutomaticBackupSchedule::default();
+            assert!(run_automatic_backup(&pool, &root, &mut schedule));
+            assert_eq!(schedule.consecutive_failures(), 0);
+            assert_ne!(
+                std::fs::metadata(&slot).unwrap().ino(),
+                slot_before,
+                "stuck={stuck} refusals_clear={refusals_clear}: no new image followed the pass"
+            );
+            // Ordinary admission's first hour is a proactive refresh. Only the
+            // over-budget repair is verified.
+            let next = latest_verified_snapshot(&primary).expect("a verified snapshot remains");
+            assert_eq!(
+                next.created_us > published.created_us,
+                !reopens && !refusals_clear,
+                "stuck={stuck} refusals_clear={refusals_clear}"
+            );
+        }
+    }
+
+    /// Backups stopping is the worse failure, so it has its own default-level
+    /// line once the one repair export is spent.
+    #[cfg(unix)]
+    #[test]
+    fn stopped_backups_are_reported_as_a_warning() {
+        use mcp_agent_mail_db::snapshot::{record_snapshot_metadata, snapshot_bak_path};
+
+        if !isolated_default_retention_child() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let (primary, pool) = retention_mailbox(&root);
+        std::fs::copy(&primary, snapshot_bak_path(&primary)).unwrap();
+        record_snapshot_metadata(&primary, 1_700_000_000_000_000).unwrap();
+        for day in 1..=6 {
+            std::fs::write(
+                root.join(format!("mail.sqlite3.bak.2000010{day}_000000")),
+                b"interrupted export",
+            )
+            .unwrap();
+        }
+        let policy = PeriodicBackupPolicy::new(&root, 3);
+        let start = Instant::now();
+        let wall_start = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut schedule = AutomaticBackupSchedule::default();
+        let capture = WarnCapture::default();
+        let mut stopped_lines = Vec::new();
+        tracing::subscriber::with_default(capture.clone(), || {
+            for hour in 0..3_u64 {
+                let now = start + Duration::from_secs(hour * 3600);
+                let requested = schedule.next_attempt(now).expect("this attempt is due");
+                backup_budget::with_admission(&primary, |admission| {
+                    let lease = backup_journal::AutomaticBackupLease::try_begin_at(
+                        &primary,
+                        requested,
+                        wall_start + hour * 3600,
+                    )
+                    .unwrap()
+                    .expect("no other exporter");
+                    run_with_backup_lease(
+                        &primary,
+                        &mut schedule,
+                        || now,
+                        Some(policy),
+                        admission.unwrap(),
+                        lease,
+                        |kind, before_export, admission| {
+                            publish_automatic_backup(&pool, policy, kind, before_export, admission)
+                        },
+                    );
+                    Ok(())
+                })
+                .unwrap();
+                stopped_lines.push(
+                    capture
+                        .0
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|line| line.contains("automatic backups have stopped"))
+                        .count(),
+                );
+            }
+        });
+        // The repair export takes hour 0. Each hour after it says so again.
+        assert_eq!(stopped_lines, [0, 1, 2], "{:?}", capture.0.lock().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn unpublished_automatic_attempts_reclaim_below_quota_and_preserve_verified_recovery() {
         use std::io::{Read as _, Write as _};
@@ -2069,10 +3034,7 @@ mod tests {
             };
             source.sync_all().unwrap();
             drop(source);
-            let policy = PeriodicBackupPolicy {
-                storage_root: &root,
-                keep: 3,
-            };
+            let policy = PeriodicBackupPolicy::new(&root, 3);
             crate::backup_rotation::admit_periodic_publication(&root, &primary, policy.keep)
                 .expect("this refusal must occur below the automatic count and byte quota");
             assert_eq!(
@@ -2098,10 +3060,15 @@ mod tests {
                 &mut schedule,
                 || now,
                 Some(policy),
-                |actual_kind, before_export| {
+                |actual_kind, before_export, admission| {
                     assert_eq!(actual_kind, kind);
-                    let result =
-                        publish_automatic_backup(&pool, policy, actual_kind, before_export);
+                    let result = publish_automatic_backup(
+                        &pool,
+                        policy,
+                        actual_kind,
+                        before_export,
+                        admission,
+                    );
                     if verified {
                         assert_eq!(
                             result,
@@ -2239,10 +3206,7 @@ mod tests {
             let reader = std::fs::File::open(root.join("mail.sqlite3.bak.authority.lock")).unwrap();
             fs2::FileExt::try_lock_shared(&reader).unwrap();
             let mut reader = Some(reader);
-            let policy = PeriodicBackupPolicy {
-                storage_root: &root,
-                keep: 3,
-            };
+            let policy = PeriodicBackupPolicy::new(&root, 3);
             let start = Instant::now();
             let mut schedule = AutomaticBackupSchedule::default();
             schedule.request_verified();
@@ -2253,7 +3217,7 @@ mod tests {
                     &mut schedule,
                     || now,
                     Some(policy),
-                    |_, _| panic!("refused admission must never enter an exporter"),
+                    |_, _, _| panic!("refused admission must never enter an exporter"),
                 ));
                 if malformed_journal {
                     assert_eq!(schedule.consecutive_failures(), 0);
@@ -2526,10 +3490,7 @@ mod tests {
             after_attempt, 52,
             "the one reserved repair really published before metadata refusal"
         );
-        let policy = PeriodicBackupPolicy {
-            storage_root: &root,
-            keep: 3,
-        };
+        let policy = PeriodicBackupPolicy::new(&root, 3);
         let wall_now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2538,7 +3499,7 @@ mod tests {
             let mut restarted = AutomaticBackupSchedule::default();
             let future = wall_now + restart * 24 * 3600;
             let monotonic = Instant::now() + Duration::from_secs(restart * 24 * 3600);
-            backup_budget::with_admission(&primary, || {
+            backup_budget::with_admission(&primary, |admission| {
                 let lease = backup_journal::AutomaticBackupLease::try_begin_at(
                     &primary,
                     BackupKind::Verified,
@@ -2551,8 +3512,9 @@ mod tests {
                     &mut restarted,
                     || monotonic,
                     Some(policy),
+                    admission.unwrap(),
                     lease,
-                    |_, _| panic!("a restarted over-budget repair must not enter any exporter"),
+                    |_, _, _| panic!("a restarted over-budget repair must not enter any exporter"),
                 ));
                 Ok(())
             })
@@ -2612,17 +3574,14 @@ mod tests {
                 (authority, std::fs::File::open(&backup).unwrap())
             };
             let reader = (!reader_arrives_during_producer).then(acquire_reader);
-            let policy = PeriodicBackupPolicy {
-                storage_root: &root,
-                keep: 3,
-            };
+            let policy = PeriodicBackupPolicy::new(&root, 3);
             let wall_now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
             let now = Instant::now();
             let mut schedule = AutomaticBackupSchedule::default();
-            backup_budget::with_admission(&primary, || {
+            backup_budget::with_admission(&primary, |admission| {
                 let lease = backup_journal::AutomaticBackupLease::try_begin_at(
                     &primary,
                     BackupKind::Proactive,
@@ -2635,11 +3594,13 @@ mod tests {
                     &mut schedule,
                     || now,
                     Some(policy),
+                    admission.unwrap(),
                     lease,
-                    |kind, before_export| {
+                    |kind, before_export, admission| {
                         assert!(reader_arrives_during_producer);
                         let reader = acquire_reader();
-                        let result = publish_automatic_backup(&pool, policy, kind, before_export);
+                        let result =
+                            publish_automatic_backup(&pool, policy, kind, before_export, admission);
                         assert!(
                             result.is_err(),
                             "active reader must defer the real exporter"
@@ -2662,7 +3623,7 @@ mod tests {
             drop(reader);
 
             let mut restarted = AutomaticBackupSchedule::default();
-            backup_budget::with_admission(&primary, || {
+            backup_budget::with_admission(&primary, |admission| {
                 let lease = backup_journal::AutomaticBackupLease::try_begin_at(
                     &primary,
                     BackupKind::Verified,
@@ -2675,9 +3636,10 @@ mod tests {
                     &mut restarted,
                     || now + Duration::from_secs(24 * 3600),
                     Some(policy),
+                    admission.unwrap(),
                     lease,
-                    |kind, before_export| {
-                        publish_automatic_backup(&pool, policy, kind, before_export)
+                    |kind, before_export, admission| {
+                        publish_automatic_backup(&pool, policy, kind, before_export, admission)
                     },
                 ));
                 Ok(())
@@ -2707,15 +3669,22 @@ mod tests {
         let (primary, pool) = retention_mailbox(&root);
         let live = std::fs::read(&primary).unwrap();
         let backup = mcp_agent_mail_db::snapshot::snapshot_bak_path(&primary);
-        let policy = PeriodicBackupPolicy {
-            storage_root: &root,
-            keep: 3,
-        };
+        let policy = PeriodicBackupPolicy::new(&root, 3);
         let start = Instant::now();
         let wall_start = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
+        // The current slot and these two resident generations fill keep=3.
+        // Each older historical image below must therefore be outside the
+        // shared window before the test requires its payload to be reclaimed.
+        for generation in ["20010101_000000", "20010102_000000"] {
+            std::fs::copy(
+                &primary,
+                root.join(format!("mail.sqlite3.bak.{generation}")),
+            )
+            .unwrap();
+        }
         let mut schedule = AutomaticBackupSchedule::default();
         schedule.request_verified();
         let mut last_verified_us = 0;
@@ -2741,7 +3710,7 @@ mod tests {
             let now = start + Duration::from_secs(hour * 3600);
             let requested = schedule.next_attempt(now).expect("hourly work is due");
             assert_eq!(requested, BackupKind::Verified);
-            backup_budget::with_admission(&primary, || {
+            backup_budget::with_admission(&primary, |admission| {
                 let lease = backup_journal::AutomaticBackupLease::try_begin_at(
                     &primary,
                     requested,
@@ -2755,9 +3724,10 @@ mod tests {
                     &mut schedule,
                     || now,
                     Some(policy),
+                    admission.unwrap(),
                     lease,
-                    |kind, before_export| {
-                        publish_automatic_backup(&pool, policy, kind, before_export)
+                    |kind, before_export, admission| {
+                        publish_automatic_backup(&pool, policy, kind, before_export, admission)
                     },
                 ));
                 Ok(())
@@ -2993,6 +3963,189 @@ mod tests {
                 actual.next_attempt(now + schedule::BACKUP_RETRY_MAX),
                 expected.next_attempt(now + schedule::BACKUP_RETRY_MAX)
             );
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_retention_repair_restart_admission(
+        root: &Path,
+        primary: &Path,
+        reclaimed: &Path,
+        wall_now: u64,
+        now: Instant,
+    ) {
+        let policy = PeriodicBackupPolicy::new(root, 3);
+        let next_day = 24 * 3600;
+        backup_budget::with_admission(primary, |admission| {
+            let lease = backup_journal::AutomaticBackupLease::try_begin_at(
+                primary,
+                BackupKind::Verified,
+                wall_now + next_day,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                lease.retention_repair_spent(),
+                "completion and post-attempt inventory cannot replenish a repair"
+            );
+            // If the next inventory is full again, the persisted reservation
+            // must still prevent another repair.
+            std::fs::copy(primary, reclaimed).unwrap();
+            let mut schedule = AutomaticBackupSchedule::default();
+            assert!(run_with_backup_lease(
+                primary,
+                &mut schedule,
+                || now + Duration::from_secs(next_day),
+                Some(policy),
+                admission.unwrap(),
+                lease,
+                |_, _, _| panic!("a spent repair cannot export into renewed pressure"),
+            ));
+            Ok(())
+        })
+        .unwrap();
+
+        // A later attempt with genuine ordinary capacity must still clear
+        // the allowance and reach its producer.
+        std::fs::remove_file(reclaimed).unwrap();
+        backup_budget::with_admission(primary, |admission| {
+            let lease = backup_journal::AutomaticBackupLease::try_begin_at(
+                primary,
+                BackupKind::Verified,
+                wall_now + 2 * next_day,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(lease.retention_repair_spent());
+            let mut schedule = AutomaticBackupSchedule::default();
+            let mut produced = false;
+            assert!(run_with_backup_lease(
+                primary,
+                &mut schedule,
+                || now + Duration::from_secs(2 * next_day),
+                Some(policy),
+                admission.unwrap(),
+                lease,
+                |_, before_export, _| {
+                    produced = true;
+                    before_export().unwrap();
+                    Ok(true)
+                },
+            ));
+            assert!(produced);
+            let reopened = backup_journal::AutomaticBackupLease::try_begin_at(
+                primary,
+                BackupKind::Verified,
+                wall_now + 3 * next_day,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(!reopened.retention_repair_spent());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_attempt_cleanup_cannot_replenish_retention_repair_allowance() {
+        use crate::backup_rotation::{RotateReport, RotationFailure};
+
+        for outcome in [
+            Ok(true),
+            Ok(false),
+            Err("original export refusal".to_string()),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let (primary, _pool) = retention_mailbox(&root);
+            let live = std::fs::read(&primary).unwrap();
+            let candidates: Vec<_> = (1..=6)
+                .map(|day| root.join(format!("mail.sqlite3.bak.2000010{day}_000000")))
+                .collect();
+            for path in &candidates {
+                std::fs::copy(&primary, path).unwrap();
+            }
+            let policy = PeriodicBackupPolicy::new(&root, 3);
+            let wall_now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let now = Instant::now();
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("AM_BACKUP_ROTATION_DELETE", "1")],
+                || {
+                    // Six images fill ordinary admission. No verified pin is
+                    // installed, so real retention preserves them and asks for
+                    // the single over-budget repair export instead.
+                    backup_budget::with_admission(&primary, |admission| {
+                        let lease = backup_journal::AutomaticBackupLease::try_begin_at(
+                            &primary,
+                            BackupKind::Proactive,
+                            wall_now,
+                        )
+                        .unwrap()
+                        .unwrap();
+                        let mut schedule = AutomaticBackupSchedule::default();
+                        let followups = run_with_backup_lease(
+                            &primary,
+                            &mut schedule,
+                            || now,
+                            Some(policy),
+                            admission.unwrap(),
+                            lease,
+                            |kind, before_export, _| {
+                                assert_eq!(kind, BackupKind::Verified);
+                                before_export().unwrap();
+                                // The producer result and sync-failure receipt
+                                // are injected at the coordinator seam. The
+                                // journal, inventory, unlink and reopen are
+                                // real; namespace tests separately exercise
+                                // the directory-sync fault boundary.
+                                std::fs::remove_file(&candidates[0]).unwrap();
+                                let report = RotateReport {
+                                    admission_refused: true,
+                                    unconfirmed_deletions: 1,
+                                    bytes_unconfirmed_deletions: live.len() as u64,
+                                    failures: vec![RotationFailure {
+                                        source: candidates[0].clone(),
+                                        rename_completed: false,
+                                        deletion_completed: true,
+                                        reader_inventory_incomplete: false,
+                                        requested_destination: None,
+                                        error: "unlink completed; directory durability unconfirmed"
+                                            .to_owned(),
+                                    }],
+                                    ..Default::default()
+                                };
+                                let result =
+                                    rotate_after_backup_attempt_with(outcome.clone(), || {
+                                        Ok(report)
+                                    });
+                                assert_eq!(result, outcome);
+                                result
+                            },
+                        );
+                        assert_eq!(followups, outcome != Ok(false));
+                        Ok(())
+                    })
+                    .unwrap();
+                    crate::backup_rotation::admit_periodic_publication(&root, &primary, 3)
+                        .expect("the unconfirmed unlink creates apparent capacity");
+
+                    assert_retention_repair_restart_admission(
+                        &root,
+                        &primary,
+                        &candidates[0],
+                        wall_now,
+                        now,
+                    );
+                },
+            );
+            assert_eq!(std::fs::read(&primary).unwrap(), live);
+            for path in &candidates[1..] {
+                assert_eq!(std::fs::read(path).unwrap(), live);
+            }
         }
     }
 
@@ -4065,6 +5218,91 @@ mod tests {
             cp.is_none() && an.is_none() && va.is_none() && atc.is_none() && dr.is_none(),
             "disabled maintenance must not attempt or advance any task"
         );
+    }
+
+    #[test]
+    fn scheduled_maintenance_never_vacuums_the_live_mailbox() {
+        let directory = tempfile::tempdir().expect("maintenance fixture directory");
+        let path = directory.path().join("mailbox.sqlite3");
+        let conn = mcp_agent_mail_db::guard_db_conn(
+            mcp_agent_mail_db::DbConn::open_file(path.to_string_lossy().as_ref())
+                .expect("open runtime maintenance fixture"),
+            "close scheduled maintenance fixture",
+        );
+        conn.execute_raw(
+            "PRAGMA journal_mode = DELETE; \
+             PRAGMA autocommit_retain = OFF; \
+             CREATE TABLE mail(id INTEGER PRIMARY KEY, body TEXT NOT NULL); \
+             INSERT INTO mail VALUES (7, 'Preserve this message'); \
+             CREATE TABLE discarded(id INTEGER PRIMARY KEY, payload BLOB NOT NULL); \
+             WITH RECURSIVE seq(n) AS ( \
+                 SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 384 \
+             ) INSERT INTO discarded(payload) SELECT zeroblob(2048) FROM seq; \
+             DELETE FROM discarded;",
+        )
+        .expect("seed reclaimable pages without deleting mail");
+        let free_pages = || {
+            conn.query_sync("PRAGMA freelist_count", &[])
+                .expect("read freelist")[0]
+                .get_as::<i64>(0)
+                .expect("decode freelist")
+        };
+        let free_before = free_pages();
+        assert!(free_before > 0, "fixture must be compactable");
+        let bytes_before = std::fs::read(&path).expect("read original mailbox image");
+        let pool = DbPool::new(&DbPoolConfig {
+            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&path),
+            storage_root: Some(directory.path().join("archive")),
+            min_connections: 0,
+            max_connections: 2,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create maintenance pool");
+        let config = Config {
+            db_maintenance_enabled: true,
+            db_checkpoint_interval_secs: 0,
+            db_analyze_interval_secs: 0,
+            db_vacuum_interval_secs: 1,
+            db_journal_size_limit_bytes: 0,
+            atc_experience_max_rows: 0,
+            doctor_retention_enabled: false,
+            ..Config::default()
+        };
+        let now = Instant::now();
+        let (mut checkpoint, mut analyze, mut vacuum, mut atc, mut doctor) =
+            (None, None, None, None, None);
+        run_db_maintenance_cycle(
+            &pool,
+            &config,
+            &path,
+            now,
+            &mut checkpoint,
+            &mut analyze,
+            &mut vacuum,
+            &mut atc,
+            &mut doctor,
+        );
+        assert_eq!(vacuum, Some(now), "the sidecar cadence was due");
+        assert_eq!(free_pages(), free_before, "no automatic mailbox compaction");
+        assert_eq!(
+            std::fs::read(&path).expect("read mailbox after scheduled maintenance"),
+            bytes_before,
+            "a due VACUUM interval must leave the mailbox byte-for-byte intact"
+        );
+        assert_eq!(
+            conn.query_sync("SELECT body FROM mail WHERE id = 7", &[])
+                .expect("read preserved message")[0]
+                .get_as::<String>(0)
+                .expect("decode preserved body"),
+            "Preserve this message"
+        );
+        // Positive control: the fixture really would change if the scheduled
+        // path accidentally called the primary-mailbox vacuum again.
+        pool.vacuum().expect("explicit fixture compaction");
+        assert_eq!(free_pages(), 0);
+        assert!(std::fs::metadata(&path).unwrap().len() < bytes_before.len() as u64);
     }
 
     #[test]

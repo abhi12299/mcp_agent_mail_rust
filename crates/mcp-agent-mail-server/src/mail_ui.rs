@@ -68,17 +68,17 @@ pub fn dispatch(
     body: &str,
 ) -> Result<Option<String>, (u16, String)> {
     // Standalone callers (including static export) retain a real 30-second
-    // budget. The live HTTP server calls `dispatch_with_cx` with its own
+    // budget. The live HTTP server calls `dispatch_live_with_cx` with its own
     // timeout-linked context so cancellation crosses the blocking boundary.
     let cx = crate::runtime_request_cx(Budget::with_deadline_secs(30));
     dispatch_with_cx(path, query, method, body, &cx)
 }
 
-/// Dispatch a mail UI request with the server-owned cancellation context.
+/// Dispatch a standalone mail UI request with the caller's cancellation context.
 ///
-/// HTTP blocking dispatch must use this entrypoint so a request timeout
-/// cancels in-flight database work instead of merely returning while a worker
-/// continues and possibly commits the abandoned request.
+/// Offline/static-export callers may construct a read pool or an archive
+/// snapshot. Live HTTP requests use [`dispatch_live_with_cx`] so initialization
+/// remains owned by server startup.
 pub fn dispatch_with_cx(
     path: &str,
     query: &str,
@@ -93,10 +93,10 @@ pub fn dispatch_with_cx(
         return render_archive_route(sub, query, method);
     }
 
-    // GH#184: when this dispatch runs inside a live server process, the
-    // server's pool for this database is already open — reuse it for BOTH
-    // reads and writes instead of bootstrapping a fresh observability pool
-    // per GET request. A second in-process `DbPool::new` on the live file
+    // GH#184: standalone consumers may share a process with an existing
+    // server pool — reuse it for BOTH reads and writes instead of
+    // bootstrapping a fresh observability pool per GET request. A second
+    // in-process `DbPool::new` on the live file
     // re-runs the entire startup init (integrity probes, WAL checkpoint,
     // recovery) and can block outright against the live pool's engine-level
     // coordination — exactly the wedge that took the whole HTTP surface
@@ -126,6 +126,48 @@ pub fn dispatch_with_cx(
         .as_ref()
         .map_or(live_pool, crate::ObservabilityDbPool::pool);
 
+    dispatch_database_route(sub, query, method, body, cx, read_pool, live_pool)
+}
+
+/// Dispatch against the initialized pool already owned by the live server.
+///
+/// A browser arriving during startup must not bootstrap a second pool, wait
+/// on the initialization gate, or reconstruct a private archive snapshot.
+/// Archive-only routes remain usable while SQLite is unavailable.
+pub fn dispatch_live_with_cx(
+    path: &str,
+    query: &str,
+    method: &str,
+    body: &str,
+    cx: &Cx,
+) -> Result<Option<String>, (u16, String)> {
+    let sub = path.strip_prefix("/mail").unwrap_or(path);
+    if sub.starts_with("/archive/") {
+        return render_archive_route(sub, query, method);
+    }
+
+    let pool = mcp_agent_mail_db::get_cached_pool(&DbPoolConfig::from_env())
+        .filter(DbPool::is_initialized);
+    let Some(pool) = pool else {
+        let detail = "Database is initializing or unavailable; retry shortly";
+        return if crate::HttpState::is_mail_json_route(path, method) {
+            json_detail_err(503, detail)
+        } else {
+            Err((503, detail.to_string()))
+        };
+    };
+    dispatch_database_route(sub, query, method, body, cx, &pool, &pool)
+}
+
+fn dispatch_database_route(
+    sub: &str,
+    query: &str,
+    method: &str,
+    body: &str,
+    cx: &Cx,
+    read_pool: &DbPool,
+    live_pool: &DbPool,
+) -> Result<Option<String>, (u16, String)> {
     match sub {
         // Python parity: GET /mail and /mail/unified-inbox → unified inbox.
         "" | "/" | "/unified-inbox" => {
@@ -142,9 +184,9 @@ pub fn dispatch_with_cx(
         // Explicit projects list route (legacy Python: GET /mail/projects).
         "/projects" => render_projects_list(cx, read_pool),
         _ if sub.starts_with("/api/") => {
-            handle_api_route(sub, query, method, body, cx, read_pool, &live_pool)
+            handle_api_route(sub, query, method, body, cx, read_pool, live_pool)
         }
-        _ => dispatch_project_route(sub, method, body, cx, read_pool, &live_pool, query),
+        _ => dispatch_project_route(sub, method, body, cx, read_pool, live_pool, query),
     }
 }
 
@@ -175,6 +217,10 @@ fn initialized_test_pool(prefix: &str) -> DbPool {
         .expect("test sqlite journal mode should initialize");
     let cfg = DbPoolConfig {
         database_url: format!("sqlite:///{}", db_path.display()),
+        // All these database files have the same temporary parent. Default
+        // ephemeral rerouting hashes that parent, so it would give unrelated
+        // fixtures one shared archive despite their distinct database paths.
+        storage_root: Some(db_path.with_extension("archive")),
         ..DbPoolConfig::default()
     };
     get_or_create_pool(&cfg).expect("test pool should initialize")
@@ -183,6 +229,31 @@ fn initialized_test_pool(prefix: &str) -> DbPool {
 #[cfg(test)]
 mod request_budget_tests {
     use super::*;
+
+    #[test]
+    fn initialized_test_pools_do_not_share_archive_authority() {
+        let ephemeral_base = tempfile::tempdir().expect("private ephemeral archive base");
+        let ephemeral_base_text = ephemeral_base.path().to_string_lossy();
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_and_env_overrides_for_test(
+            &[
+                ("AM_EPHEMERAL_MODE", "auto"),
+                ("ALLOW_EPHEMERAL_PROJECTS_IN_DEFAULT_STORAGE", "false"),
+                ("AM_EPHEMERAL_ROOT", ephemeral_base_text.as_ref()),
+            ],
+            |_| {
+                let runtime = message_fixture_runtime();
+                let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+                let _guard = Cx::set_current(Some(cx));
+                let first = initialized_test_pool("mail-ui-archive-isolation");
+                let second = initialized_test_pool("mail-ui-archive-isolation");
+                assert_ne!(
+                    first.storage_root(),
+                    second.storage_root(),
+                    "distinct test mailboxes must never reconcile through the same archive"
+                );
+            },
+        );
+    }
 
     #[test]
     fn mail_ui_request_budget_deadline_is_relative_to_now() {
@@ -240,9 +311,14 @@ mod request_budget_tests {
         .expect("completed write outcome must survive a concurrent cancellation");
         assert!(cx.is_cancel_requested());
 
-        let read_cx = Cx::for_testing();
-        let projects = block_on_outcome(&read_cx, queries::list_projects(&read_cx, &pool))
-            .expect("read back committed database row");
+        let read_cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let projects = {
+            // The pool's timer also observes the ambient request. Read back
+            // through a fresh request, then restore the cancelled write context.
+            let _read_guard = Cx::set_current(Some(read_cx.clone()));
+            block_on_outcome(&read_cx, queries::list_projects(&read_cx, &pool))
+                .expect("read back committed database row")
+        };
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].id, project.id);
         assert_eq!(projects[0].human_key, "/mail-ui-ready-cancel");
@@ -306,6 +382,63 @@ mod request_budget_tests {
             result,
             Err((503, "Database operation did not complete".to_string()))
         );
+    }
+
+    #[test]
+    fn mail_ui_db_bridge_retryable_database_errors_return_503() {
+        use mcp_agent_mail_db::DbError;
+
+        let cx = Cx::for_testing();
+        for error in [
+            DbError::Sqlite(
+                "database initialization still in progress after 30s; \
+                 the mailbox is warming up or its archive reconcile is \
+                 slow — retry shortly (bounded init-gate wait, GH#245)"
+                    .to_string(),
+            ),
+            DbError::ResourceBusy("database is locked".to_string()),
+            DbError::PoolExhausted {
+                message: "pool acquisition timed out".to_string(),
+                pool_size: 1,
+                max_overflow: 0,
+            },
+            DbError::Sqlite("Too many open files (os error 24)".to_string()),
+        ] {
+            let future = std::future::ready(asupersync::Outcome::Err(error));
+            let result: Result<(), _> = block_on_outcome(&cx, future);
+            assert_eq!(
+                result,
+                Err((
+                    503,
+                    "Database temporarily unavailable; retry shortly".to_string()
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn mail_ui_db_bridge_preserves_permanent_error_and_not_found_statuses() {
+        use mcp_agent_mail_db::DbError;
+
+        let cx = Cx::for_testing();
+        for error in [
+            DbError::Sqlite("database disk image is malformed".to_string()),
+            DbError::Schema("no such table: messages".to_string()),
+            DbError::Pool("permission denied: /private/mailbox.sqlite3".to_string()),
+            DbError::invalid("project", "invalid project key"),
+        ] {
+            let future = std::future::ready(asupersync::Outcome::Err(error));
+            let result: Result<(), _> = block_on_outcome(&cx, future);
+            assert_eq!(result, Err((500, "Internal server error".to_string())));
+        }
+        let missing: Result<(), _> = block_on_outcome(
+            &cx,
+            std::future::ready(asupersync::Outcome::Err(DbError::not_found(
+                "Project",
+                "private-project-key",
+            ))),
+        );
+        assert_eq!(missing, Err((404, "Not found".to_string())));
     }
 }
 
@@ -441,6 +574,16 @@ first body
                 .expect("archive file must not require a database")
                 .expect("archive file route must be handled");
                 assert_eq!(serde_json::from_str::<String>(&payload).unwrap(), content);
+                let live_payload = dispatch_live_with_cx(
+                    "/mail/archive/browser/demo/file",
+                    "path=notes.txt",
+                    "GET",
+                    "",
+                    &Cx::for_testing(),
+                )
+                .expect("live archive browsing must not require an initialized pool")
+                .expect("live archive file route must be handled");
+                assert_eq!(live_payload, payload);
 
                 for (path, query) in [
                     ("/mail/archive/guide", ""),
@@ -1285,7 +1428,7 @@ first body
             &[(sender.id.unwrap_or(0), "to")],
         )));
 
-        let html = render_message(&cx, &pool, &project.slug, root.id.unwrap_or(0))
+        let html = render_message(&cx, &pool, &project.slug, root.id.unwrap_or(0), false)
             .expect("message render should succeed")
             .expect("message route should return html");
         assert!(html.contains("GreenCastle"));
@@ -1350,7 +1493,7 @@ first body
             &[(sender.id.unwrap_or(0), "to")],
         )));
 
-        let html = render_message(&cx, &pool, &project.slug, root_id)
+        let html = render_message(&cx, &pool, &project.slug, root_id, false)
             .expect("message render should succeed")
             .expect("message route should return html");
         assert!(
@@ -1485,7 +1628,7 @@ first body
             &[(recipient.id.unwrap_or(0), "to")],
         )));
 
-        let html = render_message(&cx, &pool, &project.slug, message.id.unwrap_or(0))
+        let html = render_message(&cx, &pool, &project.slug, message.id.unwrap_or(0), false)
             .expect("message render should succeed")
             .expect("message route should return html");
         assert!(!html.contains("marked.parse(markdownContent)"), "{html}");
@@ -1547,7 +1690,7 @@ first body
         )
         .expect("delete sender row");
 
-        let html = render_message(&cx, &pool, &project.slug, message.id.unwrap_or(0))
+        let html = render_message(&cx, &pool, &project.slug, message.id.unwrap_or(0), false)
             .expect("message render should succeed")
             .expect("message route should return html");
         assert!(
@@ -1634,9 +1777,7 @@ first body
             "{html}"
         );
         assert!(
-            html.contains(
-                "window.agentMailAppendAuth(`/mail/${selectedMessage.project_slug}/thread/${encodeURIComponent(selectedMessage.thread_id)}`)"
-            ),
+            html.contains("window.agentMailAppendAuth(selectedMessage.thread_url)"),
             "{html}"
         );
         assert!(
@@ -1752,6 +1893,10 @@ fn block_on_outcome<T>(
         asupersync::Outcome::Err(e) => {
             let status = if matches!(e, mcp_agent_mail_db::DbError::NotFound { .. }) {
                 404
+            } else if e.is_retryable() {
+                // A bounded startup wait or busy pool is temporary, not a
+                // broken database. Keep internal diagnostics in the log.
+                503
             } else {
                 500
             };
@@ -1760,6 +1905,7 @@ fn block_on_outcome<T>(
                 status,
                 match status {
                     404 => "Not found".to_string(),
+                    503 => "Database temporarily unavailable; retry shortly".to_string(),
                     _ => "Internal server error".to_string(),
                 },
             ))
@@ -1856,7 +2002,11 @@ fn is_valid_project_identifier(slug: &str) -> bool {
 }
 
 fn is_valid_archive_agent_name(name: &str) -> bool {
-    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric())
+    // Keep historical alphanumeric archive names readable, including system
+    // identities. Punctuated IDs use the common portable-name rules, with
+    // exact spelling so this path boundary rejects whitespace aliases.
+    (!name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric()))
+        || mcp_agent_mail_core::models::normalize_agent_name(name).as_deref() == Some(name)
 }
 
 fn is_valid_time_travel_timestamp(timestamp: &str) -> bool {
@@ -1946,10 +2096,26 @@ fn percent_encode_path_segment(input: &str) -> String {
 }
 
 pub fn mail_thread_href(project_slug: &str, thread_id: &str) -> String {
+    // Browsers normalize dot path segments even when their dots are encoded.
+    // Keep those legitimate conversation keys in a query parameter instead.
+    if matches!(thread_id, "." | "..") {
+        return format!(
+            "/mail/{project_slug}/thread?thread_id={}",
+            percent_encode_path_segment(thread_id)
+        );
+    }
     format!(
         "/mail/{project_slug}/thread/{}",
         percent_encode_path_segment(thread_id)
     )
+}
+
+fn mail_thread_href_for_mode(project_slug: &str, thread_id: &str, static_export: bool) -> String {
+    if static_export {
+        crate::static_export::export_thread_route(project_slug, thread_id)
+    } else {
+        mail_thread_href(project_slug, thread_id)
+    }
 }
 
 #[cfg(test)]
@@ -2306,13 +2472,25 @@ mod utility_tests {
     }
 
     #[test]
-    fn archive_agent_name_validation_python_parity() {
-        assert!(is_valid_archive_agent_name("Agent123"));
-        assert!(is_valid_archive_agent_name("A"));
+    fn archive_agent_name_validation_accepts_legacy_and_explicit_identities() {
+        for name in [
+            "Agent123",
+            "A",
+            "bluelake",
+            "HumanOverseer",
+            "AirTrafficControl",
+            "agent-name",
+            "Review-API",
+            "db.migrations_2",
+        ] {
+            assert!(is_valid_archive_agent_name(name), "rejected {name:?}");
+        }
         assert!(!is_valid_archive_agent_name(""));
-        assert!(!is_valid_archive_agent_name("agent-name"));
         assert!(!is_valid_archive_agent_name("agent name"));
         assert!(!is_valid_archive_agent_name("agent!"));
+        let maximum = format!("task-{}", "x".repeat(123));
+        assert!(is_valid_archive_agent_name(&maximum));
+        assert!(!is_valid_archive_agent_name(&format!("{maximum}x")));
     }
 
     #[test]
@@ -2583,13 +2761,38 @@ mod auth_route_hardening_regression_suite {
 
     #[test]
     fn regression_time_travel_rejects_bad_agent_name() {
-        // is_valid_archive_agent_name rejects path-traversal and special chars.
-        assert!(!is_valid_archive_agent_name(""));
-        assert!(!is_valid_archive_agent_name("../etc"));
-        assert!(!is_valid_archive_agent_name("agent;DROP"));
-        assert!(!is_valid_archive_agent_name("a b c"));
+        // Explicit task IDs must not weaken the archive path boundary or
+        // introduce platform-specific aliases that registration would refuse.
+        for name in [
+            "",
+            "../etc",
+            "agent/other",
+            "agent\\other",
+            "agent;DROP",
+            "a b c",
+            "agent%2Fother",
+            "agent@project",
+            "project:demo#agent",
+            "agent..other",
+            "agent.work.",
+            "NUL.archive",
+            "COM1.archive",
+            "LPT9.archive",
+            "YOUR_AGENT",
+            "review-placeholder",
+            "codex-cli",
+            "claude-sonnet-4.5",
+            "réview-api",
+            " review-api",
+            "review-api ",
+            "\treview-api\n",
+        ] {
+            assert!(!is_valid_archive_agent_name(name), "accepted {name:?}");
+        }
         assert!(is_valid_archive_agent_name("BlueLake"));
         assert!(is_valid_archive_agent_name("Agent42"));
+        assert!(is_valid_archive_agent_name("review-api"));
+        assert!(is_valid_archive_agent_name("Review.API_2"));
     }
 
     #[test]
@@ -3306,6 +3509,7 @@ struct UnifiedMessage {
     created_relative: String,
     importance: String,
     thread_id: String,
+    thread_url: String,
     project_slug: String,
     project_name: String,
     sender: String,
@@ -3333,12 +3537,7 @@ struct UnifiedMessageAggregate {
 }
 
 impl UnifiedMessageAggregate {
-    fn from_inbox_row(
-        project: &ProjectRow,
-        recipient_name: &str,
-        row: &queries::InboxRow,
-        root_ids_with_replies: &HashSet<i64>,
-    ) -> Self {
+    fn from_inbox_row(project: &ProjectRow, recipient_name: &str, row: &queries::InboxRow) -> Self {
         let message = &row.message;
         let mut recipients = std::collections::BTreeSet::new();
         recipients.insert(recipient_name.to_string());
@@ -3350,10 +3549,9 @@ impl UnifiedMessageAggregate {
             body_md: message.body_md.clone(),
             created_ts: message.created_ts,
             importance: message.importance.clone(),
-            thread_id: display_thread_ref_for_message(
+            thread_id: queries::canonical_thread_id(
                 message.id.unwrap_or(0),
                 message.thread_id.as_deref(),
-                root_ids_with_replies,
             ),
             project_slug: project.slug.clone(),
             project_name: project.human_key.clone(),
@@ -3386,6 +3584,7 @@ impl UnifiedMessageAggregate {
             created_relative: ts_display_relative(self.created_ts),
             created,
             importance: self.importance,
+            thread_url: mail_thread_href(&self.project_slug, &self.thread_id),
             thread_id: self.thread_id,
             project_slug: self.project_slug,
             project_name: self.project_name,
@@ -3398,41 +3597,7 @@ impl UnifiedMessageAggregate {
     }
 }
 
-fn explicit_thread_ref(thread_id: Option<&str>) -> Option<String> {
-    thread_id
-        .map(str::trim)
-        .filter(|thread_id| !thread_id.is_empty())
-        .map(str::to_string)
-}
-
-fn root_ids_with_replies(
-    cx: &Cx,
-    pool: &DbPool,
-    project_id: i64,
-    root_message_ids: &[i64],
-) -> Result<HashSet<i64>, (u16, String)> {
-    Ok(block_on_outcome(
-        cx,
-        queries::list_numeric_thread_roots_with_replies(cx, pool, project_id, root_message_ids),
-    )?
-    .into_iter()
-    .collect())
-}
-
-fn display_thread_ref_for_message(
-    message_id: i64,
-    thread_id: Option<&str>,
-    root_ids_with_replies: &HashSet<i64>,
-) -> String {
-    if let Some(thread_ref) = explicit_thread_ref(thread_id) {
-        return thread_ref;
-    }
-    if message_id > 0 && root_ids_with_replies.contains(&message_id) {
-        return message_id.to_string();
-    }
-    String::new()
-}
-
+#[cfg(test)]
 fn collect_unified_message_aggregates(
     cx: &Cx,
     pool: &DbPool,
@@ -3440,7 +3605,10 @@ fn collect_unified_message_aggregates(
     limit: usize,
     filter_importance: Option<&str>,
 ) -> Result<Vec<UnifiedMessageAggregate>, (u16, String)> {
-    unified::collect(cx, pool, projects_rows, limit, filter_importance)
+    if limit == 0 || projects_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    unified::collect(cx, pool, projects_rows, limit, filter_importance).map(|page| page.messages)
 }
 
 #[cfg(test)]
@@ -3466,7 +3634,6 @@ fn reference_collect_unified_message_aggregates(
         let pid = project.id.unwrap_or(0);
         let agents_rows = block_on_outcome(cx, queries::list_agents(cx, pool, pid))?;
         let mut project_inbox_rows = Vec::new();
-        let mut candidate_root_ids = Vec::new();
         for agent in &agents_rows {
             let aid = agent.id.unwrap_or(0);
             let inbox = block_on_outcome(
@@ -3478,17 +3645,10 @@ fn reference_collect_unified_message_aggregates(
                 if !matches_importance_filter(&message.importance, filter_importance) {
                     continue;
                 }
-                if explicit_thread_ref(message.thread_id.as_deref()).is_none()
-                    && let Some(message_id) = message.id
-                    && message_id > 0
-                {
-                    candidate_root_ids.push(message_id);
-                }
                 project_inbox_rows.push((agent.name.clone(), row));
             }
         }
 
-        let reply_root_ids = root_ids_with_replies(cx, pool, pid, &candidate_root_ids)?;
         for (agent_name, row) in project_inbox_rows {
             let message = &row.message;
             let Some(message_id) = message.id else {
@@ -3499,12 +3659,7 @@ fn reference_collect_unified_message_aggregates(
                 continue;
             }
 
-            let aggregate = UnifiedMessageAggregate::from_inbox_row(
-                project,
-                &agent_name,
-                &row,
-                &reply_root_ids,
-            );
+            let aggregate = UnifiedMessageAggregate::from_inbox_row(project, &agent_name, &row);
             messages.insert(message_id, aggregate);
         }
     }
@@ -3528,25 +3683,22 @@ fn render_unified_inbox(
         .map(str::to_ascii_lowercase);
     let projects_rows = block_on_outcome(cx, queries::list_projects(cx, pool))?;
 
+    let mut page = unified::collect(
+        cx,
+        pool,
+        &projects_rows,
+        limit,
+        normalized_filter.as_deref(),
+    )?;
     let mut projects = Vec::new();
     let mut total_agents: usize = 0;
     for p in &projects_rows {
         let pid = p.id.unwrap_or(0);
-        let agents_rows = block_on_outcome(cx, queries::list_agents(cx, pool, pid))?;
-        if agents_rows.is_empty() {
+        let agents = page.agents.remove(&pid).unwrap_or_default();
+        if agents.is_empty() {
             continue;
         }
-        total_agents += agents_rows.len();
-        let agents: Vec<UnifiedAgent> = agents_rows
-            .iter()
-            .map(|a| UnifiedAgent {
-                id: a.id.unwrap_or(0),
-                name: a.name.clone(),
-                program: a.program.clone(),
-                model: a.model.clone(),
-                last_active: ts_display(a.last_active_ts),
-            })
-            .collect();
+        total_agents += agents.len();
         projects.push(UnifiedProject {
             id: pid,
             slug: p.slug.clone(),
@@ -3557,16 +3709,16 @@ fn render_unified_inbox(
         });
     }
 
-    let messages = collect_unified_message_aggregates(
-        cx,
-        pool,
-        &projects_rows,
-        limit,
-        normalized_filter.as_deref(),
-    )?
-    .into_iter()
-    .map(UnifiedMessageAggregate::into_view)
-    .collect::<Vec<_>>();
+    let messages = page
+        .messages
+        .into_iter()
+        .map(UnifiedMessageAggregate::into_view)
+        .map(|mut message| {
+            message.thread_url =
+                mail_thread_href_for_mode(&message.project_slug, &message.thread_id, static_export);
+            message
+        })
+        .collect::<Vec<_>>();
 
     let total_messages = messages.len();
     render(
@@ -3601,6 +3753,7 @@ fn unified_api_message_value(message: &UnifiedMessage) -> serde_json::Value {
         "created_relative": message.created_relative,
         "importance": message.importance,
         "thread_id": message.thread_id,
+        "thread_url": message.thread_url,
         "sender": message.sender,
         "recipients": message.recipients,
         "recipient_names": message.recipient_names,
@@ -3623,7 +3776,37 @@ struct ProjectCtx {
     /// Retired agents, listed apart from the active ones. Deregistered agents
     /// appear in neither list (GH#358).
     retired_agents: Vec<AgentView>,
+    threads: Vec<ConversationView>,
+    threads_url: String,
+    has_more_threads: bool,
     static_export: bool,
+}
+
+const RECENT_CONVERSATIONS: usize = 6;
+const DEFAULT_CONVERSATIONS_PAGE_SIZE: usize = 50;
+const MAX_CONVERSATIONS_PAGE_SIZE: usize = 200;
+
+#[derive(Serialize)]
+struct ConversationView {
+    thread_id: String,
+    subject: String,
+    message_count: i64,
+    first_activity: String,
+    last_activity: String,
+    last_activity_relative: String,
+    thread_url: String,
+}
+
+fn conversation_view(project_slug: &str, row: queries::ProjectThreadSummary) -> ConversationView {
+    ConversationView {
+        thread_url: mail_thread_href(project_slug, &row.thread_id),
+        thread_id: row.thread_id,
+        subject: row.subject,
+        message_count: row.message_count,
+        first_activity: ts_display(row.first_created_ts),
+        last_activity: ts_display(row.last_created_ts),
+        last_activity_relative: ts_display_relative(row.last_created_ts),
+    }
 }
 
 #[derive(Serialize)]
@@ -3704,15 +3887,394 @@ fn render_project(
     let roster = block_on_outcome(cx, queries::list_agent_roster(cx, pool, p.id.unwrap_or(0)))?;
     let (retired, active): (Vec<_>, Vec<_>) =
         roster.iter().partition(|agent| agent.retired_at.is_some());
+    // Static snapshots do not export the dynamic conversation browser.
+    let (threads, has_more_threads) = if static_export {
+        (Vec::new(), false)
+    } else {
+        let page = block_on_outcome(
+            cx,
+            queries::list_project_threads(cx, pool, p.id.unwrap_or(0), RECENT_CONVERSATIONS, None),
+        )?;
+        let has_more = page.next_cursor.is_some();
+        (
+            page.threads
+                .into_iter()
+                .map(|row| conversation_view(&p.slug, row))
+                .collect(),
+            has_more,
+        )
+    };
     render(
         "mail_project.html",
         ProjectCtx {
             project: project_view(&p),
             agents: active.into_iter().map(agent_view).collect(),
             retired_agents: retired.into_iter().map(agent_view).collect(),
+            threads,
+            threads_url: format!("/mail/{}/threads", p.slug),
+            has_more_threads,
             static_export,
         },
     )
+}
+
+// ---------------------------------------------------------------------------
+// Route: GET /mail/{project}/threads — canonical project conversations
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct ThreadsCtx {
+    project: ProjectView,
+    threads: Vec<ConversationView>,
+    threads_url: String,
+    next_page_url: String,
+    previous_page_url: String,
+    page_size: usize,
+    static_export: bool,
+}
+
+/// Bind navigation state to its project and page size. The snapshot watermark
+/// keeps newly arriving messages from moving conversations between pages.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConversationCursor {
+    version: u8,
+    project_id: i64,
+    page_size: usize,
+    position: queries::ProjectThreadCursor,
+}
+
+fn conversations_page_size(query: &str) -> Result<usize, (u16, String)> {
+    let Some(raw) = extract_query_str(query, "limit") else {
+        return Ok(DEFAULT_CONVERSATIONS_PAGE_SIZE);
+    };
+    let size = raw
+        .parse::<usize>()
+        .map_err(|_| (400, "Invalid conversation page size".to_string()))?;
+    Ok(size.clamp(1, MAX_CONVERSATIONS_PAGE_SIZE))
+}
+
+fn decode_conversation_cursor(
+    raw: &str,
+    project_id: i64,
+    page_size: usize,
+) -> Result<queries::ProjectThreadCursor, (u16, String)> {
+    use base64::Engine as _;
+
+    let invalid = || (400, "Invalid conversation cursor".to_string());
+    if raw.len() > 1024 {
+        return Err(invalid());
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| invalid())?;
+    let cursor: ConversationCursor = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    if cursor.version != 1
+        || cursor.project_id != project_id
+        || cursor.page_size != page_size
+        || cursor.position.anchor_message_id <= 0
+        || cursor.position.snapshot_id < cursor.position.anchor_message_id
+    {
+        return Err(invalid());
+    }
+    Ok(cursor.position)
+}
+
+fn conversation_page_url(
+    project: &ProjectRow,
+    page_size: usize,
+    position: Option<queries::ProjectThreadCursor>,
+    static_export: bool,
+) -> Result<String, (u16, String)> {
+    use base64::Engine as _;
+
+    let Some(position) = position else {
+        return Ok(String::new());
+    };
+    let bytes = serde_json::to_vec(&ConversationCursor {
+        version: 1,
+        project_id: project.id.unwrap_or(0),
+        page_size,
+        position,
+    })
+    .map_err(|err| (500, format!("Could not encode conversation cursor: {err}")))?;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let suffix = if static_export {
+        "&__static_export=1"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "/mail/{}/threads?limit={page_size}&cursor={encoded}{suffix}",
+        project.slug
+    ))
+}
+
+fn render_project_threads(
+    cx: &Cx,
+    pool: &DbPool,
+    project_slug: &str,
+    query: &str,
+) -> Result<Option<String>, (u16, String)> {
+    let page_size = conversations_page_size(query)?;
+    let project = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
+    let project_id = project.id.unwrap_or(0);
+    let cursor = extract_query_str(query, "cursor")
+        .map(|raw| decode_conversation_cursor(&raw, project_id, page_size))
+        .transpose()?;
+    let page = block_on_outcome(
+        cx,
+        queries::list_project_threads(cx, pool, project_id, page_size, cursor.as_ref()),
+    )?;
+    let static_export = is_static_export_request(query);
+    render(
+        "mail_threads.html",
+        ThreadsCtx {
+            project: project_view(&project),
+            threads: page
+                .threads
+                .into_iter()
+                .map(|row| conversation_view(&project.slug, row))
+                .collect(),
+            threads_url: format!("/mail/{}/threads", project.slug),
+            next_page_url: conversation_page_url(
+                &project,
+                page_size,
+                page.next_cursor,
+                static_export,
+            )?,
+            previous_page_url: conversation_page_url(
+                &project,
+                page_size,
+                page.previous_cursor,
+                static_export,
+            )?,
+            page_size,
+            static_export,
+        },
+    )
+}
+
+#[cfg(test)]
+mod conversation_ui_tests {
+    use super::*;
+
+    fn page_link(html: &str, relation: &str) -> Option<String> {
+        let relation_start = html.find(&format!("rel=\"{relation}\""))?;
+        let tag_start = html[..relation_start].rfind("<a ")?;
+        let tag = &html[tag_start..relation_start];
+        let href_start = tag.find("href=\"")? + "href=\"".len();
+        let href = tag[href_start..].split('"').next()?;
+        Some(href.replace("&#x2f;", "/").replace("&amp;", "&"))
+    }
+
+    fn follow_link(cx: &Cx, pool: &DbPool, link: &str) -> String {
+        let (path, query) = link.split_once('?').unwrap_or((link, ""));
+        dispatch_project_route(
+            path.strip_prefix("/mail").expect("mail URL"),
+            "GET",
+            "",
+            cx,
+            pool,
+            pool,
+            query,
+        )
+        .expect("conversation link succeeds")
+        .expect("conversation HTML")
+    }
+
+    #[test]
+    fn project_conversations_follow_stable_rendered_pagination_links() {
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(60));
+        let pool = initialized_test_pool("project-conversations-ui");
+        let project = block_on_outcome(
+            &cx,
+            queries::ensure_project(&cx, &pool, "/conversation-browser-ui"),
+        )
+        .expect("project");
+        let pid = project.id.unwrap();
+        let sender = block_on_outcome(
+            &cx,
+            queries::register_agent(
+                &cx, &pool, pid, "BlueLake", "test", "test", None, None, None,
+            ),
+        )
+        .expect("sender");
+        let send = |thread: &str, subject: &str| {
+            block_on_outcome(
+                &cx,
+                queries::create_message(
+                    &cx,
+                    &pool,
+                    pid,
+                    sender.id.unwrap(),
+                    subject,
+                    "Private body must not be in conversation summaries",
+                    Some(thread),
+                    "normal",
+                    false,
+                    "[]",
+                ),
+            )
+            .expect("message")
+        };
+        for index in 0..9 {
+            send(&format!("topic-{index}"), &format!("Conversation {index}"));
+        }
+
+        let preview = render_project(&cx, &pool, &project.slug, false)
+            .unwrap()
+            .unwrap();
+        assert!(preview.contains("Active Conversations"));
+        for index in 3..9 {
+            assert!(preview.contains(&format!("Conversation {index}")));
+            assert!(html_contains_url(
+                &preview,
+                &mail_thread_href(&project.slug, &format!("topic-{index}")),
+            ));
+        }
+        assert!(!preview.contains("Conversation 2"));
+        assert!(!preview.contains("Private body"));
+
+        let first_url = format!("/mail/{}/threads?limit=3", project.slug);
+        let first = follow_link(&cx, &pool, &first_url);
+        assert!(first.contains("Conversation 8"));
+        assert!(first.contains("Conversation 6"));
+        assert!(!first.contains("Conversation 5"));
+        assert!(page_link(&first, "prev").is_none());
+        let older = page_link(&first, "next").expect("older page link");
+
+        // Both a new conversation and a reply to an unseen conversation arrive
+        // after page one. Following its links must retain the original window.
+        send("new-topic", "Arrived after browsing began");
+        send("topic-0", "New activity on the oldest conversation");
+        let second = follow_link(&cx, &pool, &older);
+        for index in 3..6 {
+            assert!(second.contains(&format!("Conversation {index}")));
+        }
+        assert!(!second.contains("Conversation 6"));
+        assert!(!second.contains("Arrived after browsing began"));
+        assert!(!second.contains("New activity on the oldest conversation"));
+        let newer = page_link(&second, "prev").expect("newer page link");
+        let back = follow_link(&cx, &pool, &newer);
+        assert!(back.contains("Conversation 8"));
+        assert!(back.contains("Conversation 6"));
+        assert!(!back.contains("Conversation 5"));
+        assert!(page_link(&back, "prev").is_none());
+        let last = follow_link(
+            &cx,
+            &pool,
+            &page_link(&second, "next").expect("last page link"),
+        );
+        for index in 0..3 {
+            assert!(last.contains(&format!("Conversation {index}")));
+        }
+        assert!(page_link(&last, "next").is_none());
+        assert!(!last.contains("New activity on the oldest conversation"));
+
+        let fresh = follow_link(&cx, &pool, &first_url);
+        assert!(fresh.contains("Arrived after browsing began"));
+        assert!(fresh.contains("New activity on the oldest conversation"));
+    }
+
+    #[test]
+    fn project_conversations_validate_bounded_project_specific_cursors() {
+        let project = ProjectRow {
+            id: Some(7),
+            slug: "demo".to_string(),
+            human_key: "/demo".to_string(),
+            created_at: 0,
+        };
+        let cursor = queries::ProjectThreadCursor {
+            snapshot_id: 30,
+            anchor_created_ts: 50,
+            anchor_message_id: 15,
+            newer: false,
+        };
+        let url = conversation_page_url(&project, 10, Some(cursor), false).unwrap();
+        let query = url.split_once('?').unwrap().1;
+        let encoded = extract_query_str(query, "cursor").unwrap();
+        assert!(decode_conversation_cursor(&encoded, 7, 10).is_ok());
+        assert_eq!(
+            decode_conversation_cursor(&encoded, 8, 10).unwrap_err().0,
+            400
+        );
+        assert_eq!(
+            decode_conversation_cursor(&encoded, 7, 20).unwrap_err().0,
+            400
+        );
+        for bad in ["not_base64!", "e30", &"A".repeat(1025)] {
+            assert_eq!(decode_conversation_cursor(bad, 7, 10).unwrap_err().0, 400);
+        }
+        assert_eq!(conversations_page_size("").unwrap(), 50);
+        assert_eq!(conversations_page_size("limit=0").unwrap(), 1);
+        assert_eq!(conversations_page_size("limit=9999").unwrap(), 200);
+        for query in ["limit=-1", "limit=wrong", "limit=999999999999999999999999"] {
+            assert_eq!(conversations_page_size(query).unwrap_err().0, 400);
+        }
+    }
+
+    #[test]
+    fn project_conversations_search_links_open_canonical_roots_and_exact_keys() {
+        let runtime = message_fixture_runtime();
+        let cx = runtime.request_cx_with_budget(Budget::with_deadline_secs(60));
+        let pool = initialized_test_pool("project-conversations-search");
+        let project = block_on_outcome(
+            &cx,
+            queries::ensure_project(&cx, &pool, "/conversation-browser-search"),
+        )
+        .expect("project");
+        let pid = project.id.unwrap();
+        let sender = block_on_outcome(
+            &cx,
+            queries::register_agent(
+                &cx, &pool, pid, "BlueLake", "test", "test", None, None, None,
+            ),
+        )
+        .expect("sender");
+        let mut expected = Vec::new();
+        for (thread, subject) in [
+            (None, "Standalone search result"),
+            (Some(" padded/key+%2F "), "Exact key search result"),
+            (Some(".."), "Dot key search result"),
+        ] {
+            let message = block_on_outcome(
+                &cx,
+                queries::create_message(
+                    &cx,
+                    &pool,
+                    pid,
+                    sender.id.unwrap(),
+                    subject,
+                    "Search conversation body",
+                    thread,
+                    "normal",
+                    false,
+                    "[]",
+                ),
+            )
+            .expect("message");
+            let key = thread.map_or_else(|| message.id.unwrap().to_string(), str::to_string);
+            expected.push((key, subject));
+        }
+
+        // Facet-only search exercises the real DB result projection, including
+        // a null thread_id. Saved recipes are unrelated to this isolated pool.
+        let html = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("DATABASE_URL", "unsupported://conversation-ui-search")],
+            || render_search(&cx, &pool, &project.slug, "imp=normal"),
+        )
+        .expect("project search")
+        .expect("search HTML");
+        for (key, subject) in expected {
+            let link = mail_thread_href(&project.slug, &key);
+            assert!(html.contains(subject), "search includes {subject}");
+            assert!(html_contains_url(&html, &link), "search links to {key}");
+            let conversation = follow_link(&cx, &pool, &link);
+            assert!(conversation.contains(subject));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3779,26 +4341,10 @@ fn render_inbox(
     )?;
     let total = inbox.len();
     let page_rows: Vec<_> = inbox.iter().skip(offset).take(limit).collect();
-    let candidate_root_ids: Vec<i64> = page_rows
-        .iter()
-        .filter_map(|row| {
-            if explicit_thread_ref(row.message.thread_id.as_deref()).is_none() {
-                row.message.id.filter(|message_id| *message_id > 0)
-            } else {
-                None
-            }
-        })
-        .collect();
-    let reply_root_ids = root_ids_with_replies(cx, pool, pid, &candidate_root_ids)?;
-
     let mut items = Vec::new();
     for row in page_rows {
         let m = &row.message;
-        let thread_id = display_thread_ref_for_message(
-            m.id.unwrap_or(0),
-            m.thread_id.as_deref(),
-            &reply_root_ids,
-        );
+        let thread_id = queries::canonical_thread_id(m.id.unwrap_or(0), m.thread_id.as_deref());
         items.push(InboxMessage {
             id: m.id.unwrap_or(0),
             subject: m.subject.clone(),
@@ -3806,11 +4352,7 @@ fn render_inbox(
             sender: row.sender_name.clone(),
             importance: m.importance.clone(),
             thread_id: thread_id.clone(),
-            thread_url: if thread_id.is_empty() {
-                String::new()
-            } else {
-                mail_thread_href(&p.slug, &thread_id)
-            },
+            thread_url: mail_thread_href_for_mode(&p.slug, &thread_id, static_export),
             created: ts_display(m.created_ts),
             ack_required: m.ack_required_bool(),
             acked: row.ack_ts.is_some(),
@@ -3854,6 +4396,7 @@ struct MessageCtx {
     other_thread_items: Vec<MessageThreadPreview>,
     extra_thread_count: usize,
     commit_sha: Option<String>,
+    static_export: bool,
 }
 
 #[derive(Serialize)]
@@ -3888,6 +4431,7 @@ fn render_message(
     pool: &DbPool,
     project_slug: &str,
     message_id: i64,
+    static_export: bool,
 ) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
     let pid = p.id.unwrap_or(0);
@@ -3903,37 +4447,24 @@ fn render_message(
         cx,
         queries::list_message_recipients_by_message(cx, pool, pid, message_id),
     )?;
-    let stored_thread_ref = explicit_thread_ref(m.thread_id.as_deref());
-    let candidate_thread_ref = stored_thread_ref
-        .clone()
-        .or_else(|| (current_message_id > 0).then(|| current_message_id.to_string()));
-    let thread_items = if let Some(thread_id) = candidate_thread_ref.as_deref() {
-        block_on_outcome(
-            cx,
-            queries::list_thread_messages(cx, pool, pid, thread_id, None),
-        )?
-        .into_iter()
-        .map(|item| MessageThreadPreview {
-            id: item.id,
-            from: item.from,
-            subject: item.subject,
-        })
-        .collect()
-    } else {
-        Vec::new()
-    };
+    let thread_ref = queries::canonical_thread_id(current_message_id, m.thread_id.as_deref());
+    let thread_items = block_on_outcome(
+        cx,
+        queries::list_canonical_thread_messages(cx, pool, pid, &thread_ref, None),
+    )?
+    .into_iter()
+    .map(|item| MessageThreadPreview {
+        id: item.id,
+        from: item.from,
+        subject: item.subject,
+    })
+    .collect::<Vec<_>>();
     let other_thread_items = thread_items
         .iter()
         .filter(|item| item.id != current_message_id)
         .cloned()
         .collect::<Vec<_>>();
     let extra_thread_count = other_thread_items.len().saturating_sub(5);
-    let thread_ref = if stored_thread_ref.is_some() || thread_items.len() > 1 {
-        candidate_thread_ref.unwrap_or_default()
-    } else {
-        String::new()
-    };
-
     render(
         "mail_message.html",
         MessageCtx {
@@ -3944,7 +4475,7 @@ fn render_message(
                 body_md: m.body_md.clone(),
                 body_html: markdown::render_markdown_to_safe_html(&m.body_md),
                 importance: m.importance.clone(),
-                thread_url: mail_thread_href(&p.slug, &thread_ref),
+                thread_url: mail_thread_href_for_mode(&p.slug, &thread_ref, static_export),
                 thread_id: thread_ref,
                 created: ts_display(m.created_ts),
                 ack_required: m.ack_required_bool(),
@@ -3961,6 +4492,7 @@ fn render_message(
             other_thread_items,
             extra_thread_count,
             commit_sha: None,
+            static_export,
         },
     )
 }
@@ -4062,6 +4594,7 @@ struct ThreadCtx {
     thread_subject: String,
     message_count: usize,
     messages: Vec<ThreadMessage>,
+    static_export: bool,
 }
 
 #[derive(Serialize)]
@@ -4080,13 +4613,17 @@ fn render_thread(
     pool: &DbPool,
     project_slug: &str,
     thread_id: &str,
+    static_export: bool,
 ) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
     let pid = p.id.unwrap_or(0);
     let thread_msgs = block_on_outcome(
         cx,
-        queries::list_thread_messages(cx, pool, pid, thread_id, None),
+        queries::list_canonical_thread_messages(cx, pool, pid, thread_id, None),
     )?;
+    if thread_msgs.is_empty() {
+        return Err((404, "Thread not found".to_string()));
+    }
 
     let messages: Vec<ThreadMessage> = thread_msgs
         .iter()
@@ -4114,6 +4651,7 @@ fn render_thread(
             thread_subject,
             message_count,
             messages,
+            static_export,
         },
     )
 }
@@ -4527,23 +5065,21 @@ fn render_search(
         let web_results: Vec<WebSearchResult> = resp
             .results
             .iter()
-            .map(|r| WebSearchResult {
-                id: r.id,
-                subject: r.title.clone(),
-                snippet: highlight_snippet(&r.body, &q, 250),
-                from_name: r.from_agent.clone().unwrap_or_default(),
-                created: r.created_ts.map_or_else(String::new, ts_display),
-                created_relative: r.created_ts.map_or_else(String::new, ts_display_relative),
-                importance: r.importance.clone().unwrap_or_default(),
-                thread_url: r
-                    .thread_id
-                    .as_deref()
-                    .map_or_else(String::new, |thread_id| {
-                        mail_thread_href(project_slug, thread_id)
-                    }),
-                thread_id: r.thread_id.clone().unwrap_or_default(),
-                ack_required: r.ack_required.unwrap_or(false),
-                score: r.score.map_or_else(String::new, |s| format!("{s:.2}")),
+            .map(|r| {
+                let thread_id = queries::canonical_thread_id(r.id, r.thread_id.as_deref());
+                WebSearchResult {
+                    id: r.id,
+                    subject: r.title.clone(),
+                    snippet: highlight_snippet(&r.body, &q, 250),
+                    from_name: r.from_agent.clone().unwrap_or_default(),
+                    created: r.created_ts.map_or_else(String::new, ts_display),
+                    created_relative: r.created_ts.map_or_else(String::new, ts_display_relative),
+                    importance: r.importance.clone().unwrap_or_default(),
+                    thread_url: mail_thread_href_for_mode(&p.slug, &thread_id, static_export),
+                    thread_id,
+                    ack_required: r.ack_required.unwrap_or(false),
+                    score: r.score.map_or_else(String::new, |s| format!("{s:.2}")),
+                }
             })
             .collect();
 
@@ -5008,6 +5544,19 @@ fn dispatch_project_route(
 
     match rest {
         "" => render_project(cx, read_pool, project_slug, is_static_export_request(query)),
+        "threads" if method == "GET" => render_project_threads(cx, read_pool, project_slug, query),
+        "thread" if method == "GET" => {
+            let thread_id = extract_query_str(query, "thread_id")
+                .ok_or_else(|| (400, "Missing thread ID".to_string()))?;
+            render_thread(
+                cx,
+                read_pool,
+                project_slug,
+                &thread_id,
+                is_static_export_request(query),
+            )
+        }
+        "threads" | "thread" => Err((405, "Method Not Allowed".to_string())),
         "search" => render_search(cx, read_pool, project_slug, query),
         "file_reservations" => render_file_reservations(cx, read_pool, project_slug),
         "attachments" => render_attachments(cx, read_pool, project_slug),
@@ -5057,15 +5606,30 @@ fn dispatch_project_route(
             let mid: i64 = mid_str
                 .parse()
                 .map_err(|_| (400, format!("Invalid message ID: {mid_str}")))?;
-            render_message(cx, read_pool, project_slug, mid)
+            render_message(
+                cx,
+                read_pool,
+                project_slug,
+                mid,
+                is_static_export_request(query),
+            )
         }
         _ if rest.starts_with("thread/") => {
+            if method != "GET" {
+                return Err((405, "Method Not Allowed".to_string()));
+            }
             let encoded_thread_id = rest.strip_prefix("thread/").unwrap_or("");
             let thread_id = percent_decode_path_segment(encoded_thread_id);
             if thread_id.is_empty() {
                 return Err((400, "Missing thread ID".to_string()));
             }
-            render_thread(cx, read_pool, project_slug, &thread_id)
+            render_thread(
+                cx,
+                read_pool,
+                project_slug,
+                &thread_id,
+                is_static_export_request(query),
+            )
         }
         _ => Ok(None),
     }
@@ -5128,15 +5692,16 @@ fn render_api_unified_inbox(
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty());
 
-    let projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
-    let messages = collect_unified_message_aggregates(
-        &cx,
-        &pool,
-        &projects,
-        limit,
-        normalized_filter.as_deref(),
-    )
-    .map_err(|(status, msg)| (status, format!("unified inbox aggregation failed: {msg}")))?;
+    // Live refreshes normally request only messages. Global project inventory
+    // (including recovery orphan discovery) is independent of that bounded
+    // page and belongs only to callers that explicitly request navigation.
+    let projects = if include_projects {
+        block_on_outcome(cx, queries::list_projects(cx, pool))?
+    } else {
+        Vec::new()
+    };
+    let messages = unified::collect_messages(cx, pool, limit, normalized_filter.as_deref())
+        .map_err(|(status, msg)| (status, format!("unified inbox aggregation failed: {msg}")))?;
 
     let mut result = serde_json::json!({ "messages": messages.into_iter().map(|message| unified_api_message_value(&message.into_view())).collect::<Vec<_>>() });
     if include_projects {

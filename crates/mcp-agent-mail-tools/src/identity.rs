@@ -17,10 +17,12 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 
 use crate::messaging::try_dispatch_archive_write;
+#[cfg(test)]
+use crate::tool_util::get_db_pool;
 use crate::tool_util::{
     db_error_to_mcp_error, db_outcome_to_mcp_result, get_authoritative_live_db_pool,
-    get_coalescer_bypass_read_db_pool, get_db_pool, get_read_db_pool, legacy_tool_error,
-    resolve_existing_project, resolve_project,
+    get_coalescer_bypass_read_db_pool, get_db_pool_for_request, get_read_db_pool,
+    legacy_tool_error, resolve_existing_project, resolve_project,
 };
 
 /// Classify a [`mcp_agent_mail_db::DbError`] as retryable at the tool layer
@@ -561,6 +563,59 @@ fn coalescer_latency_health_level(
     }
 }
 
+/// Unfinished acquisitions are evidence that completed-wait histograms cannot
+/// provide. A partial observation cannot establish that all observed locks are
+/// healthy, but a known stalled waiter remains red even when other evidence is
+/// missing. This does not diagnose a deadlock or attribute any particular call.
+fn lock_wait_health_verdict(
+    snapshot: &mcp_agent_mail_core::lock_order::LockActivitySnapshot,
+) -> HealthVerdict {
+    use mcp_agent_mail_core::HealthLevel;
+    use mcp_agent_mail_core::lock_order::LOCK_WAIT_STALL_THRESHOLD;
+
+    let stalled = snapshot
+        .locks
+        .iter()
+        .filter(|lock| snapshot.available && lock.is_stalled(LOCK_WAIT_STALL_THRESHOLD))
+        .count();
+    let complete = snapshot.is_complete();
+    let level = if stalled > 0 {
+        HealthLevel::Red
+    } else if complete {
+        HealthLevel::Green
+    } else {
+        HealthLevel::Yellow
+    };
+    let detail = if stalled > 0 {
+        let names = snapshot
+            .locks
+            .iter()
+            .filter(|lock| lock.is_stalled(LOCK_WAIT_STALL_THRESHOLD))
+            .take(4)
+            .map(|lock| format!("{}#{}", lock.lock_name, lock.instance_id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "{stalled} instrumented lock(s) have an observed waiter blocked for at least {} s: {names}; inspect lock_activity holders and waiters; coverage_complete={complete}; this is not a deadlock proof",
+            LOCK_WAIT_STALL_THRESHOLD.as_secs(),
+        )
+    } else if complete {
+        format!(
+            "no instrumented lock waiter observed at or above {} s; uninstrumented engine and filesystem waits are outside this observation",
+            LOCK_WAIT_STALL_THRESHOLD.as_secs(),
+        )
+    } else {
+        format!(
+            "lock observation incomplete: available={}, busy_instances={}, omitted_active_instances={}, registrations_dropped={}; no clean lock-wait verdict established; inspect lock_activity for retained evidence",
+            snapshot.available,
+            snapshot.busy_instances,
+            snapshot.omitted_active_instances,
+            snapshot.registrations_dropped,
+        )
+    };
+    HealthVerdict::new(level, true, detail)
+}
+
 /// Build the `health_check` retention block (GH#210).
 ///
 /// Read-only: enumerates the same recovery-debris / direct-backup / staging
@@ -897,6 +952,237 @@ const fn archive_writes_pending(lag: &mcp_agent_mail_storage::ArchiveLagSnapshot
         || lag.oldest_unmaterialized_us > 0
 }
 
+const MAX_ARCHIVE_GAP_OBSERVATIONS: usize = 64;
+const MAX_ARCHIVE_GAP_GENERATION_BYTES: usize = 256;
+const ARCHIVE_GAP_CRITICAL_AGE: std::time::Duration = std::time::Duration::from_mins(30);
+
+#[derive(Debug, PartialEq, Eq)]
+struct ArchiveGapMailbox {
+    database_url: String,
+    storage_root: PathBuf,
+}
+
+impl ArchiveGapMailbox {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            database_url: config.database_url.clone(),
+            storage_root: config.storage_root.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchiveGapGeneration {
+    token: String,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Debug)]
+struct ArchiveGapProbe {
+    generation: ArchiveGapGeneration,
+    observed_at: std::time::Instant,
+}
+
+#[derive(Debug)]
+struct ArchiveGapObservation {
+    mailbox: ArchiveGapMailbox,
+    generation: ArchiveGapGeneration,
+    gap: u64,
+    since: std::time::Instant,
+    last_observed: std::time::Instant,
+    queue_unknown: bool,
+}
+
+/// Bounded observational state only: eviction forgets an age, never mailbox
+/// data or a recovery authority. A generation token must come from the same
+/// read-only statement that supplied the inventory, and is never seeded here.
+#[derive(Debug, Default)]
+struct ArchiveGapTracker {
+    observations: std::collections::VecDeque<ArchiveGapObservation>,
+}
+
+impl ArchiveGapTracker {
+    fn observe(
+        &mut self,
+        mailbox: ArchiveGapMailbox,
+        generation: Option<&ArchiveGapGeneration>,
+        gap: Option<u64>,
+        archive_pending: bool,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let previous = self
+            .observations
+            .iter()
+            .position(|observation| observation.mailbox == mailbox)
+            .and_then(|index| self.observations.remove(index));
+        let generation = generation.filter(|generation| {
+            !generation.token.trim().is_empty()
+                && generation.token.len() <= MAX_ARCHIVE_GAP_GENERATION_BYTES
+        })?;
+        let gap = gap.filter(|gap| *gap > 0)?;
+        if archive_pending {
+            return None;
+        }
+        if previous
+            .as_ref()
+            .is_some_and(|previous| now < previous.last_observed)
+        {
+            // A slower, older probe must not restart the clock in the past:
+            // that would manufacture a critical age on the next fresh probe.
+            return None;
+        }
+        let since = previous
+            .filter(|previous| previous.generation == *generation && gap >= previous.gap)
+            .map_or(now, |previous| {
+                if previous.queue_unknown {
+                    let confirmed_age = previous
+                        .last_observed
+                        .saturating_duration_since(previous.since);
+                    now.checked_sub(confirmed_age).unwrap_or(now)
+                } else {
+                    previous.since
+                }
+            });
+        let age = now.saturating_duration_since(since);
+        if self.observations.len() >= MAX_ARCHIVE_GAP_OBSERVATIONS {
+            let _ = self.observations.pop_front();
+        }
+        self.observations.push_back(ArchiveGapObservation {
+            mailbox,
+            generation: generation.clone(),
+            gap,
+            since,
+            last_observed: now,
+            queue_unknown: false,
+        });
+        Some(age)
+    }
+
+    fn observe_unknown_queue(
+        &mut self,
+        mailbox: &ArchiveGapMailbox,
+        generation: Option<&ArchiveGapGeneration>,
+        gap: Option<u64>,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        let index = self
+            .observations
+            .iter()
+            .position(|previous| previous.mailbox == *mailbox)?;
+        let previous = self.observations.get_mut(index)?;
+        let age = previous
+            .last_observed
+            .saturating_duration_since(previous.since);
+        if now < previous.last_observed {
+            return Some(age);
+        }
+        // Freeze the last confirmed age, including when source evidence is
+        // missing. Neither repeated unknowns nor resumption may age this gap.
+        previous.since = now.checked_sub(age).unwrap_or(now);
+        previous.last_observed = now;
+        previous.queue_unknown = true;
+        let Some((generation, gap)) = generation.zip(gap) else {
+            return Some(age);
+        };
+        if generation != &previous.generation || gap == 0 || gap < previous.gap {
+            // Actual source replacement or inventory progress can clear the
+            // earlier failure; a busy queue alone cannot.
+            self.observations.remove(index);
+            return None;
+        }
+        previous.gap = gap;
+        Some(age)
+    }
+}
+
+fn observe_idle_archive_gap(
+    config: &Config,
+    probe: Option<&ArchiveGapProbe>,
+    semantic: &SemanticReadinessResponse,
+    archive_pending: Option<bool>,
+) -> Option<std::time::Duration> {
+    static TRACKER: std::sync::OnceLock<std::sync::Mutex<ArchiveGapTracker>> =
+        std::sync::OnceLock::new();
+    let tracker = TRACKER.get_or_init(|| std::sync::Mutex::new(ArchiveGapTracker::default()));
+    let mut observations = tracker.lock().unwrap_or_else(|poisoned| {
+        let mut observations = poisoned.into_inner();
+        // A partially updated observation must never supply a critical age.
+        observations.observations.clear();
+        tracker.clear_poison();
+        observations
+    });
+    let mailbox = ArchiveGapMailbox::from_config(config);
+    let generation = probe.map(|probe| &probe.generation);
+    let now = probe.map_or_else(std::time::Instant::now, |probe| probe.observed_at);
+    match archive_pending {
+        Some(pending) => observations.observe(
+            mailbox,
+            generation,
+            semantic.archive_message_gap,
+            pending,
+            now,
+        ),
+        None => observations.observe_unknown_queue(
+            &mailbox,
+            generation,
+            semantic.archive_message_gap,
+            now,
+        ),
+    }
+}
+
+fn apply_idle_archive_gap_health(
+    semantic: &mut SemanticReadinessResponse,
+    verdicts: &mut HealthVerdicts,
+    archive_pending: bool,
+    idle_gap_age: Option<std::time::Duration>,
+) {
+    use mcp_agent_mail_core::HealthLevel::{Red, Yellow};
+
+    if archive_pending || semantic.archive_message_gap.is_none_or(|gap| gap == 0) {
+        return;
+    }
+    let persistent = idle_gap_age.is_some_and(|age| age >= ARCHIVE_GAP_CRITICAL_AGE);
+    let level = if persistent || verdicts.archive_db_parity.level() == Red {
+        Red
+    } else {
+        Yellow
+    };
+    let observation = idle_gap_age.map_or_else(
+        || "idle gap age is unavailable without a verified database generation".to_string(),
+        |age| {
+            format!(
+                "idle inventory gap has not decreased across observations for {} ms{}",
+                age.as_millis(),
+                if persistent {
+                    "; persistent archive convergence failure (30-minute bound)"
+                } else {
+                    ""
+                }
+            )
+        },
+    );
+    let detail = format!("{}; {observation}", verdicts.archive_db_parity.detail);
+    verdicts.archive_db_parity = HealthVerdict::new(level, true, detail.clone());
+    // Apply after decomposition: an archive gap must not be misclassified as
+    // a database connectivity failure merely because readiness is degraded.
+    // Preserve an existing stronger failure and its diagnostic. If the gap
+    // escalates a prior warning, retain that warning's reason as well.
+    if verdicts.semantic_readiness.level() < level {
+        let detail = if semantic.status == "ok" {
+            detail
+        } else {
+            format!("{}; {detail}", semantic.detail)
+        };
+        verdicts.semantic_readiness = HealthVerdict::new(level, false, detail.clone());
+        semantic.status = if level == Red { "fail" } else { "warn" }.to_string();
+        semantic.detail = detail;
+    }
+}
+
 fn archive_parity_health_verdict(
     semantic: &SemanticReadinessResponse,
     kind: SemanticVerdictKind,
@@ -925,8 +1211,8 @@ fn archive_parity_health_verdict(
     {
         // Inventory and queue observations are not atomic: a writer can finish
         // between the probes. Report unverified convergence, not corruption.
-        // A later aligned inventory clears this observation without retaining
-        // a process-local failure that could outlive the actual repair.
+        // A later aligned inventory clears the observation. The generation-
+        // scoped tracker separately escalates a persistent nonshrinking gap.
         HealthVerdict::new(
             Yellow,
             true,
@@ -980,6 +1266,35 @@ fn archive_drain_stall_detail(
                 critical_us / 1_000,
             )
         })
+}
+
+fn apply_archive_sample_unavailable(
+    verdicts: &mut HealthVerdicts,
+    lock: &str,
+    last_confirmed_idle_gap_age: Option<std::time::Duration>,
+) {
+    use mcp_agent_mail_core::HealthLevel::{Red, Yellow};
+
+    let floor = if last_confirmed_idle_gap_age.is_some_and(|age| age >= ARCHIVE_GAP_CRITICAL_AGE) {
+        Red
+    } else {
+        Yellow
+    };
+    let level = verdicts.archive_db_parity.level().max(floor);
+    let prior_gap = last_confirmed_idle_gap_age.map_or_else(String::new, |age| {
+        format!(
+            "; last confirmed idle inventory gap age {} ms (paused while queue evidence is unavailable)",
+            age.as_millis()
+        )
+    });
+    verdicts.archive_db_parity = HealthVerdict::new(
+        level,
+        true,
+        format!(
+            "{}; archive lag sample unavailable at {lock}; queue convergence is unverified{prior_gap}",
+            verdicts.archive_db_parity.detail
+        ),
+    );
 }
 
 /// Decompose the bundled health signals into independent verdicts
@@ -1222,7 +1537,11 @@ fn semantic_readiness_response(
     }
 }
 
-fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse {
+fn health_check_semantic_readiness(
+    config: &Config,
+    observed_generation: &mut Option<ArchiveGapProbe>,
+) -> SemanticReadinessResponse {
+    *observed_generation = None;
     let sqlite_path = match resolve_health_check_sqlite_path(&config.database_url) {
         Ok(path) => path,
         Err(error) => return semantic_readiness_response("fail", error),
@@ -1259,6 +1578,8 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
         );
     }
 
+    #[cfg(unix)]
+    let source_identity_before = std::fs::metadata(&sqlite_path).ok();
     let conn = match open_health_check_sync_db_connection(&sqlite_path) {
         Ok(conn) => conn,
         Err(error) => {
@@ -1315,14 +1636,32 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
     }
 
     let archive = crate::tool_util::read_archive_inventory(&config.storage_root);
-    let rows = match conn.query_sync(
-        "SELECT \
+    let inventory_sql = "SELECT \
             (SELECT COUNT(*) FROM projects) AS project_count, \
             (SELECT COUNT(*) FROM agents) AS agent_count, \
             (SELECT COUNT(*) FROM messages) AS message_count, \
-            COALESCE((SELECT MAX(id) FROM messages), 0) AS max_id",
-        &[],
-    ) {
+            COALESCE((SELECT MAX(id) FROM messages), 0) AS max_id";
+    // Counts and generation must share one statement snapshot: a later
+    // autocommit identity read could attach an older gap to a recovered DB.
+    // Legacy/unreadable identity remains unknown and never seeds a token.
+    let observed_at = std::time::Instant::now();
+    let inventory = if cfg!(unix) && present.contains("db_identity") {
+        let with_generation = conn.query_sync(
+            &format!(
+                "{inventory_sql}, \
+                 (SELECT generation_id FROM db_identity WHERE singleton = 0) AS generation_id"
+            ),
+            &[],
+        );
+        if with_generation.is_ok() {
+            with_generation
+        } else {
+            conn.query_sync(inventory_sql, &[])
+        }
+    } else {
+        conn.query_sync(inventory_sql, &[])
+    };
+    let rows = match inventory {
         Ok(rows) => rows,
         Err(error) => {
             return semantic_readiness_response(
@@ -1434,6 +1773,29 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
         ),
     );
     readiness.archive_message_gap = Some(db_ahead_by);
+    // Metadata-only checks discard ages across a restored inode even when a
+    // backup retains the same logical token. No additional live DB is opened.
+    #[cfg(unix)]
+    if let Ok(token) = row.get_named::<String>("generation_id") {
+        use std::os::unix::fs::MetadataExt as _;
+        if let (Some(before), Ok(after)) = (source_identity_before, std::fs::metadata(&sqlite_path))
+            && before.dev() == after.dev()
+            && before.ino() == after.ino()
+        {
+            *observed_generation = Some(ArchiveGapProbe {
+                generation: ArchiveGapGeneration {
+                    token,
+                    device: after.dev(),
+                    inode: after.ino(),
+                },
+                observed_at,
+            });
+        }
+    }
+    // Other platforms keep the immediate warning without inventing a
+    // persistence age until a source-bound physical identity is available.
+    #[cfg(not(unix))]
+    let _ = observed_at;
     readiness
 }
 
@@ -1557,6 +1919,10 @@ pub struct HealthCheckResponse {
     /// gauges are idle so a blocking-dispatch stall is never hidden behind an
     /// all-zero pool utilization report.
     pub timeout_diagnostics: TimeoutDiagnosticsResponse,
+    /// Bounded live holders and unfinished waiters from the serving process.
+    /// Missing/partial observations never certify the absence of blocked work.
+    #[serde(default)]
+    pub lock_activity: mcp_agent_mail_core::lock_order::LockActivitySnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queues: Option<QueuesHealthResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1567,6 +1933,13 @@ pub struct HealthCheckResponse {
     pub retention: Option<RetentionHealthResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integrity: Option<IntegrityHealthResponse>,
+    /// Read-only lexical index evidence from this daemon's admitted mailbox.
+    /// Diagnostic clients must not open another pool to reconstruct this state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical_backfill: Option<mcp_agent_mail_db::search_service::LexicalBackfillHealth>,
+    /// Circuit state belongs to the serving process, not its diagnostic client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub circuit_breakers: Option<mcp_agent_mail_db::DbHealthStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_indexing: Option<mcp_agent_mail_db::search_service::SemanticIndexingHealth>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1675,6 +2048,10 @@ pub struct IntegrityHealthResponse {
     pub last_full_check_outcome: mcp_agent_mail_db::IntegrityCheckOutcome,
     pub checks_total: u64,
     pub failures_total: u64,
+    /// Current failures, separate from the lifetime tally.
+    pub failures_since_last_ok: u64,
+    /// Accepted never-written orphan pages, retained as a space advisory.
+    pub never_written_orphan_pages: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1830,20 +2207,22 @@ pub struct QueuesHealthResponse {
 /// the depth of the durable retry backlog and commit coalescer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveLagHealthResponse {
+    /// Queue mutex that could not be sampled; null means the sample is complete.
+    pub unavailable_lock: Option<String>,
     /// Ops in the durable retry backlog (WBQ-unavailable fallback path).
-    pub backlog_depth: u64,
+    pub backlog_depth: Option<u64>,
     /// Age of the oldest op in the retry backlog, milliseconds.
-    pub backlog_oldest_age_ms: u64,
+    pub backlog_oldest_age_ms: Option<u64>,
     /// Enqueued-but-not-committed requests in the commit coalescer.
     pub coalescer_pending: u64,
     /// Age of the oldest uncommitted coalescer request, milliseconds.
-    pub coalescer_oldest_age_ms: u64,
+    pub coalescer_oldest_age_ms: Option<u64>,
     /// Longest interval without a committed request among repositories with
     /// queued or in-flight coalescer work, milliseconds.
     #[serde(default)]
-    pub coalescer_since_progress_ms: u64,
+    pub coalescer_since_progress_ms: Option<u64>,
     /// Age of the oldest unmaterialized archive write overall, milliseconds.
-    pub oldest_unmaterialized_ms: u64,
+    pub oldest_unmaterialized_ms: Option<u64>,
     /// Lifetime totals for the retry backlog.
     pub backlog_enqueued_total: u64,
     pub backlog_drained_total: u64,
@@ -1875,6 +2254,41 @@ pub struct ArchiveLagHealthResponse {
     /// drain is stuck, not merely behind.
     #[serde(default)]
     pub drain_stalled: bool,
+}
+
+impl ArchiveLagHealthResponse {
+    fn from_sample(
+        lag: &mcp_agent_mail_storage::ArchiveLagSnapshot,
+        unavailable_lock: Option<&str>,
+        warn_us: u64,
+        critical_us: u64,
+    ) -> Self {
+        let complete = unavailable_lock.is_none();
+        Self {
+            unavailable_lock: unavailable_lock.map(str::to_string),
+            backlog_depth: complete.then_some(lag.backlog_depth),
+            backlog_oldest_age_ms: complete.then(|| us_to_ms_ceil(lag.backlog_oldest_age_us)),
+            coalescer_pending: lag.coalescer_pending,
+            coalescer_oldest_age_ms: complete.then(|| us_to_ms_ceil(lag.coalescer_oldest_age_us)),
+            coalescer_since_progress_ms: complete
+                .then(|| us_to_ms_ceil(lag.coalescer_since_progress_us)),
+            oldest_unmaterialized_ms: complete.then(|| us_to_ms_ceil(lag.oldest_unmaterialized_us)),
+            backlog_enqueued_total: lag.enqueued_total,
+            backlog_drained_total: lag.drained_total,
+            backlog_dropped_total: lag.dropped_total,
+            backlog_ephemeral_total: lag.ephemeral_total,
+            warn_threshold_ms: warn_us.div_ceil(1_000),
+            critical_threshold_ms: critical_us.div_ceil(1_000),
+            warning: !complete
+                || lag.oldest_unmaterialized_us >= warn_us
+                || lag.ephemeral_total > 0,
+            wbq_depth: lag.wbq_depth,
+            wbq_inflight_oldest_age_ms: us_to_ms_ceil(lag.wbq_inflight_oldest_age_us),
+            wbq_inflight_execution_ms: us_to_ms_ceil(lag.wbq_inflight_execution_us),
+            wbq_since_progress_ms: us_to_ms_ceil(lag.wbq_since_progress_us),
+            drain_stalled: archive_drain_stall_detail(lag, critical_us).is_some(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2204,7 +2618,8 @@ pub struct CommitInfo {
 #[allow(clippy::too_many_lines)]
 pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let config = &Config::get();
-    let mut semantic_readiness = health_check_semantic_readiness(config);
+    let mut observed_generation = None;
+    let mut semantic_readiness = health_check_semantic_readiness(config, &mut observed_generation);
     let pool = if semantic_readiness.status == "fail" {
         None
     } else {
@@ -2222,10 +2637,8 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             }
         }
     };
-    // Ensure background workers are running so health_check reports stable
-    // queue capacity/soft-cap values even before the first write/commit.
-    mcp_agent_mail_storage::wbq_start();
-    let _ = mcp_agent_mail_storage::get_commit_coalescer();
+    // Storage startup and write callers own worker lifecycle. A health probe
+    // must not wait behind shutdown/restart admission or restart those workers.
     let disk_sample = if config.disk_space_monitor_enabled {
         Some(mcp_agent_mail_core::disk::sample_and_record(config))
     } else {
@@ -2254,7 +2667,11 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // tool replies are decoupled from git-archive materialization, so this is the
     // eventual-consistency window operators watch. Bounds degrade health_level so a
     // stuck archive can never read fully green (acceptance criterion (b)).
-    let archive_lag = mcp_agent_mail_storage::archive_lag_snapshot();
+    let (archive_lag, unavailable_archive_lock) =
+        match mcp_agent_mail_storage::try_archive_lag_snapshot() {
+            Ok(sample) => (sample, None),
+            Err(unavailable) => (unavailable.lower_bound, Some(unavailable.unavailable_lock)),
+        };
     let archive_lag_warn_us = mcp_agent_mail_storage::archive_lag_warn_threshold_us();
     let archive_lag_critical_us = mcp_agent_mail_storage::archive_lag_critical_threshold_us();
     let archive_lag_oldest_us = archive_lag.oldest_unmaterialized_us;
@@ -2275,18 +2692,43 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // subsystem (db/write/transport).
     let recovery = build_recovery_status(config);
     let integrity_metrics = mcp_agent_mail_db::integrity_metrics();
-    let verdicts = compute_health_verdicts(
+    // Unknown queues cannot prove an idle gap. Pause its age and retain the
+    // last confirmed failure rather than treating an unavailable sample as
+    // evidence of either new persistence or recovery.
+    let queue_unknown = unavailable_archive_lock.is_some();
+    let archive_pending = archive_writes_pending(&archive_lag);
+    let idle_gap_age = observe_idle_archive_gap(
+        config,
+        observed_generation.as_ref(),
+        &semantic_readiness,
+        (!queue_unknown).then_some(archive_pending),
+    );
+    let mut verdicts = compute_health_verdicts(
         config,
         pool.is_some(),
         &semantic_readiness,
         &integrity_metrics,
         archive_drain_stall.as_deref(),
-        archive_writes_pending(&archive_lag),
+        archive_pending || queue_unknown,
     );
-    let critical_red = verdicts.rollup_level() == mcp_agent_mail_core::HealthLevel::Red;
+    apply_idle_archive_gap_health(
+        &mut semantic_readiness,
+        &mut verdicts,
+        archive_pending || queue_unknown,
+        idle_gap_age,
+    );
+    if let Some(lock) = unavailable_archive_lock {
+        apply_archive_sample_unavailable(&mut verdicts, lock, idle_gap_age);
+    }
+    let lock_activity = mcp_agent_mail_core::lock_order::lock_activity_snapshot();
+    let lock_wait_verdict = lock_wait_health_verdict(&lock_activity);
+    let critical_red = verdicts.rollup_level() == mcp_agent_mail_core::HealthLevel::Red
+        || lock_wait_verdict.level() == mcp_agent_mail_core::HealthLevel::Red;
     // The top-level level can never be greener than the weakest critical
     // verdict (or the live pressure level).
-    let mut effective_level = pressure_level.max(verdicts.rollup_level());
+    let mut effective_level = pressure_level
+        .max(verdicts.rollup_level())
+        .max(lock_wait_verdict.level());
     // GH#166: a deleted/replaced executable owning the mailbox locks blocks direct
     // reservation/recovery paths even while mail still flows through the stale
     // process. Never report fully green readiness in that state (status stays
@@ -2300,7 +2742,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // stalled drain is not converging and is already red in archive_db_parity.
     if archive_lag_oldest_us >= archive_lag_critical_us {
         effective_level = effective_level.max(mcp_agent_mail_core::HealthLevel::Red);
-    } else if archive_lag_oldest_us >= archive_lag_warn_us {
+    } else if unavailable_archive_lock.is_some() || archive_lag_oldest_us >= archive_lag_warn_us {
         effective_level = effective_level.max(mcp_agent_mail_core::HealthLevel::Yellow);
     }
     // A coalescer can have an empty queue now while its tail latency is already
@@ -2327,7 +2769,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     // nondeterministic aggregation.
     let archive_lag_level = if archive_lag_oldest_us >= archive_lag_critical_us {
         mcp_agent_mail_core::HealthLevel::Red
-    } else if archive_lag_oldest_us >= archive_lag_warn_us {
+    } else if unavailable_archive_lock.is_some() || archive_lag_oldest_us >= archive_lag_warn_us {
         mcp_agent_mail_core::HealthLevel::Yellow
     } else {
         mcp_agent_mail_core::HealthLevel::Green
@@ -2351,7 +2793,12 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             name: "archive_lag".to_string(),
             level: archive_lag_level.to_string(),
             detail: format!(
-                "oldest unmaterialized archive op {} ms (warn {} ms, critical {} ms); wbq depth {}, in-flight batch executing {} ms, no completed op for {} ms; coalescer pending {}, no committed request for {} ms{}",
+                "{}confirmed lag lower bound: {} ms (warn {} ms, critical {} ms); \
+                 wbq depth {}, in-flight batch executing {} ms, no completed op for {} ms; \
+                 coalescer pending {}, confirmed progress-gap lower bound {} ms{}",
+                unavailable_archive_lock.map_or_else(String::new, |lock| {
+                    format!("archive sample unavailable at {lock}; ")
+                }),
                 archive_lag_oldest_us / 1_000,
                 archive_lag_warn_us / 1_000,
                 archive_lag_critical_us / 1_000,
@@ -2385,6 +2832,11 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             name: "retention".to_string(),
             level: retention_verdict.status,
             detail: retention_verdict.detail,
+        },
+        HealthLevelContributor {
+            name: "lock_waits".to_string(),
+            level: lock_wait_verdict.status,
+            detail: lock_wait_verdict.detail,
         },
     ];
     if recovery.as_ref().is_some_and(|r| r.executable_deleted) {
@@ -2433,7 +2885,19 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             &timeout_diagnostics,
             config.health_commit_coalescer_p99_degraded_ms,
         ),
+        lock_activity,
         queues: Some({
+            // Before lazy worker initialization these gauges are zero. Report
+            // the configured limits without starting workers or rewriting the
+            // observation; retain actual nonzero running-worker limits.
+            let wbq_capacity = match metrics.storage.wbq_capacity {
+                0 => u64::try_from(config.wbq_channel_capacity).unwrap_or(u64::MAX),
+                observed => observed,
+            };
+            let commit_soft_cap = match metrics.storage.commit_soft_cap {
+                0 => mcp_agent_mail_storage::COMMIT_COALESCER_SOFT_CAP,
+                observed => observed,
+            };
             let wbq_over_80_for_s = if metrics.storage.wbq_over_80_since_us == 0 {
                 0
             } else {
@@ -2441,8 +2905,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                     .saturating_sub(metrics.storage.wbq_over_80_since_us)
                     .saturating_div(1_000_000)
             };
-            let wbq_utilization_pct =
-                percentage_clamped(metrics.storage.wbq_depth, metrics.storage.wbq_capacity);
+            let wbq_utilization_pct = percentage_clamped(metrics.storage.wbq_depth, wbq_capacity);
 
             let commit_over_80_for_s = if metrics.storage.commit_over_80_since_us == 0 {
                 0
@@ -2451,15 +2914,13 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                     .saturating_sub(metrics.storage.commit_over_80_since_us)
                     .saturating_div(1_000_000)
             };
-            let commit_utilization_pct = percentage_clamped(
-                metrics.storage.commit_pending_requests,
-                metrics.storage.commit_soft_cap,
-            );
+            let commit_utilization_pct =
+                percentage_clamped(metrics.storage.commit_pending_requests, commit_soft_cap);
 
             QueuesHealthResponse {
                 wbq: WbqQueueHealthResponse {
                     depth: metrics.storage.wbq_depth,
-                    capacity: metrics.storage.wbq_capacity,
+                    capacity: wbq_capacity,
                     utilization_pct: wbq_utilization_pct,
                     peak_depth: metrics.storage.wbq_peak_depth,
                     enqueued_total: metrics.storage.wbq_enqueued_total,
@@ -2474,7 +2935,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                 },
                 commit_coalescer: CommitCoalescerHealthResponse {
                     pending_requests: metrics.storage.commit_pending_requests,
-                    soft_cap: metrics.storage.commit_soft_cap,
+                    soft_cap: commit_soft_cap,
                     utilization_pct: commit_utilization_pct,
                     peak_pending_requests: metrics.storage.commit_peak_pending_requests,
                     enqueued_total: metrics.storage.commit_enqueued_total,
@@ -2491,33 +2952,12 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
                     warning: commit_over_80_for_s >= 300
                         || coalescer_latency_level != mcp_agent_mail_core::HealthLevel::Green,
                 },
-                archive_lag: ArchiveLagHealthResponse {
-                    backlog_depth: archive_lag.backlog_depth,
-                    backlog_oldest_age_ms: us_to_ms_ceil(archive_lag.backlog_oldest_age_us),
-                    coalescer_pending: archive_lag.coalescer_pending,
-                    coalescer_oldest_age_ms: us_to_ms_ceil(archive_lag.coalescer_oldest_age_us),
-                    coalescer_since_progress_ms: us_to_ms_ceil(
-                        archive_lag.coalescer_since_progress_us,
-                    ),
-                    oldest_unmaterialized_ms: us_to_ms_ceil(archive_lag_oldest_us),
-                    backlog_enqueued_total: archive_lag.enqueued_total,
-                    backlog_drained_total: archive_lag.drained_total,
-                    backlog_dropped_total: archive_lag.dropped_total,
-                    backlog_ephemeral_total: archive_lag.ephemeral_total,
-                    warn_threshold_ms: archive_lag_warn_us.div_ceil(1_000),
-                    critical_threshold_ms: archive_lag_critical_us.div_ceil(1_000),
-                    // br-ack-fast: a lagging archive OR any op that could not be
-                    // durably journaled (ephemeral) warrants operator attention.
-                    warning: archive_lag_oldest_us >= archive_lag_warn_us
-                        || archive_lag.ephemeral_total > 0,
-                    wbq_depth: archive_lag.wbq_depth,
-                    wbq_inflight_oldest_age_ms: us_to_ms_ceil(
-                        archive_lag.wbq_inflight_oldest_age_us,
-                    ),
-                    wbq_inflight_execution_ms: us_to_ms_ceil(archive_lag.wbq_inflight_execution_us),
-                    wbq_since_progress_ms: us_to_ms_ceil(archive_lag.wbq_since_progress_us),
-                    drain_stalled: archive_drain_stalled,
-                },
+                archive_lag: ArchiveLagHealthResponse::from_sample(
+                    &archive_lag,
+                    unavailable_archive_lock,
+                    archive_lag_warn_us,
+                    archive_lag_critical_us,
+                ),
             }
         }),
         disk: disk_sample.as_ref().map(|s| DiskHealthResponse {
@@ -2548,7 +2988,13 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             last_full_check_outcome: integrity_metrics.last_full_check_outcome,
             checks_total: integrity_metrics.checks_total,
             failures_total: integrity_metrics.failures_total,
+            failures_since_last_ok: integrity_metrics.failures_since_last_ok,
+            never_written_orphan_pages: integrity_metrics.never_written_orphan_pages,
         }),
+        lexical_backfill: pool
+            .as_ref()
+            .map(mcp_agent_mail_db::search_service::lexical_backfill_health),
+        circuit_breakers: Some(mcp_agent_mail_db::db_health_status()),
         semantic_indexing: mcp_agent_mail_db::search_service::semantic_indexing_health(),
         two_tier_indexing: mcp_agent_mail_db::search_service::two_tier_indexing_health(),
         recovery,
@@ -2599,7 +3045,7 @@ Check that all parameters have valid values."
     let base_config = Config::get();
     let config = maybe_reroute_ephemeral_storage(&base_config, &human_key).unwrap_or(base_config);
     let config = &config;
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
 
     // Log identity_mode if provided (future: resolve project identity via git remotes, etc.)
     if let Some(mode) = identity_mode {
@@ -2672,7 +3118,7 @@ Check that all parameters have valid values."
     reason = "MCP tool signatures mirror the public JSON-RPC schema"
 )]
 #[tool(
-    description = "Create or update an agent identity within a project and persist its profile to Git.\n\nWhen to use\n-----------\n- At the start of a coding session by any automated agent.\n- To update an existing agent's program/model/task metadata and bump last_active.\n\nSemantics\n---------\n- If `name` is omitted, a random adjective+noun name is auto-generated.\n- Reusing the same `name` updates the profile (program/model/task) and\n  refreshes `last_active_ts`.\n- A `profile.json` file is written under `agents/<Name>/` in the project archive.\n\nCRITICAL: Agent Naming Rules\n-----------------------------\n- Agent names MUST be randomly generated adjective+noun combinations\n- Examples: \"GreenLake\", \"BlueDog\", \"RedStone\", \"PurpleBear\"\n- Names should be unique, easy to remember, and NOT descriptive\n- INVALID examples: \"BackendHarmonizer\", \"DatabaseMigrator\", \"UIRefactorer\"\n- The whole point: names should be memorable identifiers, not role descriptions\n- Best practice: Omit the `name` parameter to auto-generate a valid name\n\nParameters\n----------\nproject_key : str\n    The same human key you passed to `ensure_project` (or equivalent identifier).\nprogram : str\n    The agent program (e.g., \"codex-cli\", \"claude-code\").\nmodel : str\n    The underlying model (e.g., \"gpt5-codex\", \"opus-4.1\").\nname : Optional[str]\n    MUST be a valid adjective+noun combination if provided (e.g., \"BlueLake\").\n    If omitted, a random valid name is auto-generated (RECOMMENDED).\n    Names are unique per project; passing the same name updates the profile.\ntask_description : str\n    Short description of current focus (shows up in directory listings).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nRegister with auto-generated name (RECOMMENDED):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"3\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"task_description\":\"Auth refactor\"\n}}}\n```\n\nRegister with explicit valid name:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"4\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\",\"name\":\"BlueLake\",\"task_description\":\"Navbar redesign\"\n}}}\n```\n\nPitfalls\n--------\n- Names MUST match the adjective+noun format or an error will be raised\n- Names are case-insensitive unique. If you see \"already in use\", pick another or omit `name`.\n- Use the same `project_key` consistently across cooperating agents.\n\nOptional cryptographic proof gate\n---------------------------------\nBy default registration is self-asserted (no proof needed). When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof` (a JSON\nstring binding identity, project_key, program, model, capability scope, issued_at,\nexpires_at, and a nonce, signed by a configured trust-anchor Ed25519 key). When the gate\nis enabled, registration fails closed (no agent is created) if the proof is missing,\nmalformed, untrusted, expired, replayed, or does not match the requested identity/scope."
+    description = "Create or update an agent identity within a project and persist its profile to Git.\n\nWhen to use\n-----------\n- At the start of a coding session by any automated agent.\n- To update an existing agent's program/model/task metadata and bump last_active.\n\nSemantics\n---------\n- If `name` is omitted, a random adjective+noun name is auto-generated.\n- Reusing the same `name` updates the profile (program/model/task) and\n  refreshes `last_active_ts`.\n- A `profile.json` file is written under `agents/<Name>/` in the project archive.\n\nAgent Naming Rules\n------------------\n- Omit `name` for a random adjective+noun name such as \"GreenLake\" or \"BlueDog\".\n- Explicit names may also be task identifiers such as \"app-x-refactor\", \"worker_42\", or \"api.review\".\n- Task identifiers start with an ASCII letter or digit, contain '.', '_' or '-', and use only ASCII letters, digits and those separators (at most 128 characters).\n- Reserved program/model/operator identities, broadcast tokens, template placeholders, '..', trailing dots and device names are rejected.\n- Adjective+noun names normalize to PascalCase; task identifiers retain their spelling.\n- Names are case-insensitive unique within each project; use the canonical name returned by registration.\n\nParameters\n----------\nproject_key : str\n    The same human key you passed to `ensure_project` (or equivalent identifier).\nprogram : str\n    The agent program (e.g., \"codex-cli\", \"claude-code\").\nmodel : str\n    The underlying model (e.g., \"gpt5-codex\", \"opus-4.1\").\nname : Optional[str]\n    An adjective+noun name (e.g., \"BlueLake\") or a safe task identifier (e.g., \"app-x-refactor\").\n    If omitted, a random adjective+noun name is auto-generated.\n    Names are unique per project; passing the same name updates the profile.\ntask_description : str\n    Short description of current focus (shows up in directory listings).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nRegister with auto-generated name:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"3\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"task_description\":\"Auth refactor\"\n}}}\n```\n\nRegister with explicit task name:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"4\",\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\",\"name\":\"app-x-refactor\",\"task_description\":\"Navbar redesign\"\n}}}\n```\n\nPitfalls\n--------\n- Unsafe or reserved names are rejected before an identity is created.\n- Names are case-insensitive unique. If you see \"already in use\", pick another or omit `name`.\n- Use the same `project_key` consistently across cooperating agents.\n\nOptional cryptographic proof gate\n---------------------------------\nBy default registration is self-asserted (no proof needed). When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof` (a JSON\nstring binding identity, project_key, program, model, capability scope, issued_at,\nexpires_at, and a nonce, signed by a configured trust-anchor Ed25519 key). When the gate\nis enabled, registration fails closed (no agent is created) if the proof is missing,\nmalformed, untrusted, expired, replayed, or does not match the requested identity/scope."
 )]
 pub async fn register_agent(
     ctx: &McpContext,
@@ -2766,7 +3212,7 @@ pub(crate) async fn register_agent_with_token_policy(
         ));
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
 
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
@@ -2793,7 +3239,7 @@ pub(crate) async fn register_agent_with_token_policy(
                     (
                         "INVALID_AGENT_NAME",
                         format!(
-                            "Invalid agent name format: '{n}'. Agent names MUST be randomly generated adjective+noun combinations (e.g., 'GreenLake', 'BlueDog'), NOT descriptive names. Omit the 'name' parameter to auto-generate a valid name."
+                            "Invalid agent name format: '{n}'. Use an adjective+noun name (e.g., 'GreenLake') or a safe task identifier (e.g., 'app-x-refactor', 'worker_42'). Task identifiers must start with an ASCII letter or digit, contain '.', '_' or '-', and use only ASCII letters, digits and those separators (at most 128 characters). Reserved identities, template placeholders, '..', trailing dots and device names are not allowed. Omit the 'name' parameter to auto-generate a valid name."
                         ),
                     )
                 });
@@ -3144,7 +3590,7 @@ Check that all parameters have valid values."
 /// - `project_key`: Project human key or slug
 /// - `program`: Agent program
 /// - `model`: Model identifier
-/// - `name_hint`: Optional name hint (must be valid adjective+noun if provided)
+/// - `name_hint`: Optional adjective+noun name or safe explicit task identifier
 /// - `task_description`: Optional current task description
 /// - `attachments_policy`: Optional attachment handling policy
 /// - `pane_id`: Optional tmux pane identifier. HTTP clients should pass the
@@ -3168,7 +3614,7 @@ Check that all parameters have valid values."
     reason = "MCP tool signatures mirror the public JSON-RPC schema"
 )]
 #[tool(
-    description = "Create a new, unique agent identity and persist its profile to Git.\n\nHow this differs from `register_agent`\n--------------------------------------\n- Always creates a new identity with a fresh unique name (never updates an existing one).\n- `name_hint`, if provided, MUST be a valid adjective+noun combination and must be available,\n  otherwise an error is raised. Without a hint, a random adjective+noun name is generated.\n\nCRITICAL: Agent Naming Rules\n-----------------------------\n- Agent names MUST be randomly generated adjective+noun combinations\n- Examples: \"GreenCastle\", \"BlueLake\", \"RedStone\", \"PurpleBear\"\n- Names should be unique, easy to remember, and NOT descriptive\n- INVALID examples: \"BackendHarmonizer\", \"DatabaseMigrator\", \"UIRefactorer\"\n- Best practice: Omit `name_hint` to auto-generate a valid name (RECOMMENDED)\n\nWhen to use\n-----------\n- Spawning a brand new worker agent that should not overwrite an existing profile.\n- Temporary task-specific identities (e.g., short-lived refactor assistants).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nAuto-generate name (RECOMMENDED):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c2\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\"\n}}}\n```\n\nWith valid name hint:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c1\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"name_hint\":\"GreenCastle\",\n  \"task_description\":\"DB migration spike\"\n}}}\n```\n\nOptional cryptographic proof gate\n---------------------------------\nSame gate as `register_agent`: by default no proof is needed. When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof`; otherwise\nregistration fails closed.\n\nTranscript-safe creation\n------------------------\n`return_registration_token : bool, default true`. When true (default), the response\nincludes the freshly-minted `registration_token`. When false, the token is omitted from\nthe tool result so transcript-visible MCP sessions can satisfy a \"do not echo secrets\ninto scrollback\" contract, and the response carries `registration_token_returned: false`\ninstead. The token still exists server-side (it is generated and persisted either way).\nWhen the operator enables session-bound identity (`MESSAGING_SESSION_IDENTITY=true`),\nthe new identity is bound to this MCP session (stdio process, or Streamable HTTP\nsession via `Mcp-Session-Id`): the session sends and replies as it with\n`verified_sender: true` and no `sender_token`, also under the fail-closed send profile,\nand cannot act as other agents of the project by naming them. Without that setting a\ncaller that opts out of the token echo sends with `verified_sender: false` unless it\nobtains the token through an operator/admin path, and under the fail-closed send profile\na sender token is mandatory.\n\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c3\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5\",\n  \"return_registration_token\":false\n}}}\n```"
+    description = "Create a new, unique agent identity and persist its profile to Git.\n\nHow this differs from `register_agent`\n--------------------------------------\n- Always creates a new identity with a fresh unique name (never updates an existing one).\n- `name_hint`, if provided, must be a valid adjective+noun name or safe task identifier and must be available,\n  otherwise an error is raised. Without a hint, a random adjective+noun name is generated.\n\nAgent Naming Rules\n------------------\n- Omit `name_hint` for a random adjective+noun name such as \"GreenCastle\" or \"BlueLake\".\n- Explicit hints may also be task identifiers such as \"app-x-refactor\", \"worker_42\", or \"api.review\".\n- Task identifiers start with an ASCII letter or digit, contain '.', '_' or '-', and use only ASCII letters, digits and those separators (at most 128 characters).\n- Reserved program/model/operator identities, broadcast tokens, template placeholders, '..', trailing dots and device names are rejected.\n- Adjective+noun names normalize to PascalCase; task identifiers retain their spelling.\n- Names are case-insensitive unique within each project; a differently cased duplicate is still rejected.\n\nWhen to use\n-----------\n- Spawning a brand new worker agent that should not overwrite an existing profile.\n- Temporary task-specific identities (e.g., short-lived refactor assistants).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nAuto-generate name:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c2\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\"\n}}}\n```\n\nWith explicit task name hint:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c1\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"name_hint\":\"worker_42\",\n  \"task_description\":\"DB migration spike\"\n}}}\n```\n\nOptional cryptographic proof gate\n---------------------------------\nSame gate as `register_agent`: by default no proof is needed. When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof`; otherwise\nregistration fails closed.\n\nTranscript-safe creation\n------------------------\n`return_registration_token : bool, default true`. When true (default), the response\nincludes the freshly-minted `registration_token`. When false, the token is omitted from\nthe tool result so transcript-visible MCP sessions can satisfy a \"do not echo secrets\ninto scrollback\" contract, and the response carries `registration_token_returned: false`\ninstead. The token still exists server-side (it is generated and persisted either way).\nWhen the operator enables session-bound identity (`MESSAGING_SESSION_IDENTITY=true`),\nthe new identity is bound to this MCP session (stdio process, or Streamable HTTP\nsession via `Mcp-Session-Id`): the session sends and replies as it with\n`verified_sender: true` and no `sender_token`, also under the fail-closed send profile,\nand cannot act as other agents of the project by naming them. Without that setting a\ncaller that opts out of the token echo sends with `verified_sender: false` unless it\nobtains the token through an operator/admin path, and under the fail-closed send profile\na sender token is mandatory.\n\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c3\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5\",\n  \"return_registration_token\":false\n}}}\n```"
 )]
 pub async fn create_agent_identity(
     ctx: &McpContext,
@@ -3215,7 +3661,7 @@ pub async fn create_agent_identity(
         ));
     }
 
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
 
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
@@ -3240,7 +3686,7 @@ pub async fn create_agent_identity(
                     (
                         "INVALID_AGENT_NAME",
                         format!(
-                            "Invalid agent name format: '{hint}'. Agent names MUST be randomly generated adjective+noun combinations (e.g., 'GreenLake', 'BlueDog'), NOT descriptive names. Omit the 'name' parameter to auto-generate a valid name."
+                            "Invalid agent name format: '{hint}'. Use an adjective+noun name (e.g., 'GreenLake') or a safe task identifier (e.g., 'app-x-refactor', 'worker_42'). Task identifiers must start with an ASCII letter or digit, contain '.', '_' or '-', and use only ASCII letters, digits and those separators (at most 128 characters). Reserved identities, template placeholders, '..', trailing dots and device names are not allowed. Omit the 'name_hint' parameter to auto-generate a valid name."
                         ),
                     )
                 });
@@ -3507,7 +3953,7 @@ pub async fn retire_agent(
 ) -> McpResult<String> {
     let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
     let transport = validated_call_transport(call_transport.as_deref())?;
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let agent = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::get_agent(
@@ -3581,7 +4027,7 @@ pub async fn unretire_agent(
 ) -> McpResult<String> {
     let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
     let transport = validated_call_transport(call_transport.as_deref())?;
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let agent = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::get_agent(
@@ -3642,7 +4088,7 @@ pub async fn deregister_agent(
 ) -> McpResult<String> {
     let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
     let transport = validated_call_transport(call_transport.as_deref())?;
-    let pool = get_db_pool()?;
+    let pool = get_db_pool_for_request(ctx)?;
     let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let agent = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::get_agent(
@@ -4598,6 +5044,487 @@ mod tests {
         assert_eq!(unsafe_index.detail, ahead.detail);
     }
 
+    fn gap_mailbox(database: &str, archive: &str) -> ArchiveGapMailbox {
+        ArchiveGapMailbox {
+            database_url: database.to_string(),
+            storage_root: PathBuf::from(archive),
+        }
+    }
+
+    fn gap_generation(token: &str) -> ArchiveGapGeneration {
+        ArchiveGapGeneration {
+            token: token.to_string(),
+            #[cfg(unix)]
+            device: 1,
+            #[cfg(unix)]
+            inode: 1,
+        }
+    }
+
+    #[test]
+    fn archive_gap_unknown_queue_pauses_age_without_forgetting_prior_failure() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("generation-a");
+        let mailbox = || gap_mailbox("database", "archive");
+        let mut tracker = ArchiveGapTracker::default();
+        assert_eq!(
+            tracker.observe_unknown_queue(&mailbox(), Some(&generation), Some(3), start),
+            None,
+        );
+        assert_eq!(
+            tracker.observe(mailbox(), Some(&generation), Some(3), false, start),
+            Some(std::time::Duration::ZERO),
+        );
+        let critical_at = start + ARCHIVE_GAP_CRITICAL_AGE;
+        assert_eq!(
+            tracker.observe(mailbox(), Some(&generation), Some(3), false, critical_at),
+            Some(ARCHIVE_GAP_CRITICAL_AGE),
+        );
+        let day = std::time::Duration::from_hours(24);
+        for (elapsed, source, gap) in [
+            (day, Some(&generation), Some(3)),
+            (day * 2, None, None),
+            (day * 3, Some(&generation), Some(4)),
+        ] {
+            let age = tracker.observe_unknown_queue(&mailbox(), source, gap, start + elapsed);
+            assert_eq!(age, Some(ARCHIVE_GAP_CRITICAL_AGE));
+            let mut verdicts = compute_health_verdicts(
+                &Config::from_env(),
+                true,
+                &semantic("ok", "queue evidence unavailable"),
+                &healthy_integrity_metrics(),
+                None,
+                true,
+            );
+            apply_archive_sample_unavailable(&mut verdicts, "archive_backlog.queue", age);
+            assert_eq!(verdicts.archive_db_parity.status, "red");
+            assert!(verdicts.archive_db_parity.detail.contains("last confirmed"));
+            assert!(verdicts.archive_db_parity.detail.contains("paused"));
+        }
+        let resumed_at = start + day * 4;
+        assert_eq!(
+            tracker.observe(mailbox(), Some(&generation), Some(4), false, resumed_at),
+            Some(ARCHIVE_GAP_CRITICAL_AGE),
+        );
+        let second = std::time::Duration::from_secs(1);
+        assert_eq!(
+            tracker.observe(
+                mailbox(),
+                Some(&generation),
+                Some(4),
+                false,
+                resumed_at + second
+            ),
+            Some(ARCHIVE_GAP_CRITICAL_AGE + second),
+        );
+        // Authoritative progress, convergence and source replacement each
+        // clear a prior failure even when the queue cannot be sampled.
+        let replacement = gap_generation("generation-b");
+        for (source, gap) in [(&generation, 3), (&generation, 0), (&replacement, 4)] {
+            assert_eq!(
+                tracker.observe_unknown_queue(
+                    &mailbox(),
+                    Some(source),
+                    Some(gap),
+                    resumed_at + second,
+                ),
+                None,
+            );
+            assert!(tracker.observations.is_empty());
+            let _ = tracker.observe(mailbox(), Some(&generation), Some(4), false, resumed_at);
+        }
+        assert_eq!(
+            tracker
+                .observe_unknown_queue(&mailbox(), Some(&generation), Some(4), resumed_at + day,),
+            Some(std::time::Duration::ZERO),
+        );
+    }
+
+    #[test]
+    fn archive_gap_age_resets_on_progress_and_convergence() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("generation-a");
+        let mut tracker = ArchiveGapTracker::default();
+        for (elapsed, gap, age) in [(0, 20, 0), (300, 21, 300), (600, 19, 0), (900, 19, 300)] {
+            assert_eq!(
+                tracker.observe(
+                    gap_mailbox("database", "archive"),
+                    Some(&generation),
+                    Some(gap),
+                    false,
+                    start + std::time::Duration::from_secs(elapsed),
+                ),
+                Some(std::time::Duration::from_secs(age)),
+            );
+        }
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database", "archive"),
+                Some(&generation),
+                Some(0),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            None,
+        );
+        assert!(tracker.observations.is_empty());
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database", "archive"),
+                Some(&generation),
+                Some(19),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            Some(std::time::Duration::ZERO),
+        );
+    }
+
+    #[test]
+    fn archive_gap_age_is_scoped_to_database_archive_and_generation() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("generation-a");
+        let mut tracker = ArchiveGapTracker::default();
+        for (database, archive, elapsed) in [
+            ("database-a", "archive-a", 0),
+            ("database-b", "archive-a", 600),
+            ("database-a", "archive-b", 1200),
+        ] {
+            let _ = tracker.observe(
+                gap_mailbox(database, archive),
+                Some(&generation),
+                Some(3),
+                false,
+                start + std::time::Duration::from_secs(elapsed),
+            );
+        }
+        for (database, archive, age) in [
+            ("database-a", "archive-a", 1800),
+            ("database-b", "archive-a", 1200),
+            ("database-a", "archive-b", 600),
+        ] {
+            assert_eq!(
+                tracker.observe(
+                    gap_mailbox(database, archive),
+                    Some(&generation),
+                    Some(3),
+                    false,
+                    start + ARCHIVE_GAP_CRITICAL_AGE,
+                ),
+                Some(std::time::Duration::from_secs(age)),
+            );
+        }
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database-a", "archive-a"),
+                Some(&gap_generation("generation-b")),
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            Some(std::time::Duration::ZERO),
+        );
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database-a", "archive-a"),
+                None,
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            None,
+        );
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database-b", "archive-a"),
+                Some(&generation),
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            Some(std::time::Duration::from_mins(20)),
+        );
+    }
+
+    #[test]
+    fn archive_gap_age_forgets_pending_unavailable_and_invalid_observations() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("generation-a");
+        let blank = gap_generation(" \t");
+        let oversized = gap_generation(&"x".repeat(MAX_ARCHIVE_GAP_GENERATION_BYTES + 1));
+        for (identity, gap, pending) in [
+            (Some(&generation), Some(3), true),
+            (None, Some(3), false),
+            (Some(&generation), None, false),
+            (Some(&blank), Some(3), false),
+            (Some(&oversized), Some(3), false),
+        ] {
+            let mut tracker = ArchiveGapTracker::default();
+            let _ = tracker.observe(
+                gap_mailbox("database", "archive"),
+                Some(&generation),
+                Some(3),
+                false,
+                start,
+            );
+            assert_eq!(
+                tracker.observe(
+                    gap_mailbox("database", "archive"),
+                    identity,
+                    gap,
+                    pending,
+                    start + ARCHIVE_GAP_CRITICAL_AGE,
+                ),
+                None,
+            );
+            assert!(tracker.observations.is_empty());
+            assert_eq!(
+                tracker.observe(
+                    gap_mailbox("database", "archive"),
+                    Some(&generation),
+                    Some(3),
+                    false,
+                    start + ARCHIVE_GAP_CRITICAL_AGE,
+                ),
+                Some(std::time::Duration::ZERO),
+            );
+        }
+    }
+
+    #[test]
+    fn archive_gap_tracking_is_bounded_and_retains_recent_observations() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("generation-a");
+        let mut tracker = ArchiveGapTracker::default();
+        for index in 0..MAX_ARCHIVE_GAP_OBSERVATIONS {
+            let _ = tracker.observe(
+                gap_mailbox(&format!("database-{index}"), "archive"),
+                Some(&generation),
+                Some(3),
+                false,
+                start,
+            );
+        }
+        let _ = tracker.observe(
+            gap_mailbox("database-0", "archive"),
+            Some(&generation),
+            Some(3),
+            false,
+            start + std::time::Duration::from_secs(1),
+        );
+        let _ = tracker.observe(
+            gap_mailbox("database-extra", "archive"),
+            Some(&generation),
+            Some(3),
+            false,
+            start + std::time::Duration::from_secs(2),
+        );
+        assert_eq!(tracker.observations.len(), MAX_ARCHIVE_GAP_OBSERVATIONS);
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database-1", "archive"),
+                Some(&generation),
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            Some(std::time::Duration::ZERO),
+            "eviction must forget an age instead of manufacturing persistence",
+        );
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database-0", "archive"),
+                Some(&generation),
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            Some(ARCHIVE_GAP_CRITICAL_AGE),
+        );
+        assert_eq!(tracker.observations.len(), MAX_ARCHIVE_GAP_OBSERVATIONS);
+    }
+
+    #[test]
+    fn archive_gap_age_forgets_out_of_order_observation() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("generation-a");
+        let mut tracker = ArchiveGapTracker::default();
+        let _ = tracker.observe(
+            gap_mailbox("database", "archive"),
+            Some(&generation),
+            Some(3),
+            false,
+            start + ARCHIVE_GAP_CRITICAL_AGE,
+        );
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database", "archive"),
+                Some(&generation),
+                Some(3),
+                false,
+                start,
+            ),
+            None,
+        );
+        assert!(tracker.observations.is_empty());
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database", "archive"),
+                Some(&generation),
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE + std::time::Duration::from_secs(1),
+            ),
+            Some(std::time::Duration::ZERO),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_gap_age_restarts_when_restored_inode_keeps_generation_token() {
+        let start = std::time::Instant::now();
+        let generation = gap_generation("preserved-generation");
+        let mut tracker = ArchiveGapTracker::default();
+        let _ = tracker.observe(
+            gap_mailbox("database", "archive"),
+            Some(&generation),
+            Some(3),
+            false,
+            start,
+        );
+        let restored = ArchiveGapGeneration {
+            inode: 2,
+            ..generation
+        };
+        assert_eq!(
+            tracker.observe(
+                gap_mailbox("database", "archive"),
+                Some(&restored),
+                Some(3),
+                false,
+                start + ARCHIVE_GAP_CRITICAL_AGE,
+            ),
+            Some(std::time::Duration::ZERO),
+        );
+    }
+
+    #[test]
+    fn idle_archive_gap_health_escalates_at_the_exact_persistence_boundary() {
+        let config = Config::default();
+        for (age, readiness, color) in [
+            (None, "warn", "yellow"),
+            (Some(std::time::Duration::ZERO), "warn", "yellow"),
+            (
+                ARCHIVE_GAP_CRITICAL_AGE.checked_sub(std::time::Duration::from_millis(1)),
+                "warn",
+                "yellow",
+            ),
+            (Some(ARCHIVE_GAP_CRITICAL_AGE), "fail", "red"),
+            (
+                Some(ARCHIVE_GAP_CRITICAL_AGE + std::time::Duration::from_millis(1)),
+                "fail",
+                "red",
+            ),
+        ] {
+            let mut observation = semantic("ok", "sqlite is ahead of the archive by 2 message(s)");
+            observation.archive_message_gap = Some(2);
+            let mut verdicts = compute_health_verdicts(
+                &config,
+                true,
+                &observation,
+                &healthy_integrity_metrics(),
+                None,
+                false,
+            );
+            apply_idle_archive_gap_health(&mut observation, &mut verdicts, false, age);
+            assert_eq!(observation.status, readiness);
+            assert_eq!(verdicts.semantic_readiness.status, color);
+            assert_eq!(verdicts.archive_db_parity.status, color);
+            assert!(verdicts.archive_db_parity.critical);
+            assert_eq!(verdicts.db_health.status, "green");
+            assert_eq!(verdicts.write_health.status, "green");
+            assert_eq!(verdicts.rollup_level(), verdicts.archive_db_parity.level());
+            if age.is_none() {
+                assert!(observation.detail.contains("age is unavailable"));
+            } else if color == "red" {
+                assert!(observation.detail.contains("30-minute bound"));
+            }
+        }
+    }
+
+    #[test]
+    fn idle_archive_gap_health_ignores_active_converged_and_skipped_inventory() {
+        let config = Config::default();
+        for (gap, pending) in [(Some(2), true), (Some(0), false), (None, false)] {
+            let mut observation = semantic("ok", "inventory observation");
+            observation.archive_message_gap = gap;
+            let mut verdicts = compute_health_verdicts(
+                &config,
+                true,
+                &observation,
+                &healthy_integrity_metrics(),
+                None,
+                pending,
+            );
+            apply_idle_archive_gap_health(
+                &mut observation,
+                &mut verdicts,
+                pending,
+                Some(ARCHIVE_GAP_CRITICAL_AGE),
+            );
+            assert_eq!(observation.status, "ok");
+            assert_eq!(observation.detail, "inventory observation");
+            assert_eq!(verdicts.semantic_readiness.status, "green");
+            assert_eq!(verdicts.archive_db_parity.status, "green");
+        }
+    }
+
+    #[test]
+    fn idle_archive_gap_health_preserves_existing_failures() {
+        let config = Config::default();
+        for age in [None, Some(ARCHIVE_GAP_CRITICAL_AGE)] {
+            let mut observation = semantic(
+                "fail",
+                "sqlite schema missing required health_check tables: messages",
+            );
+            observation.archive_message_gap = Some(2);
+            let prior_detail = observation.detail.clone();
+            let mut verdicts = compute_health_verdicts(
+                &config,
+                true,
+                &observation,
+                &healthy_integrity_metrics(),
+                None,
+                false,
+            );
+            apply_idle_archive_gap_health(&mut observation, &mut verdicts, false, age);
+            assert_eq!(observation.status, "fail");
+            assert_eq!(observation.detail, prior_detail);
+            assert_eq!(verdicts.semantic_readiness.status, "red");
+            assert_eq!(verdicts.semantic_readiness.detail, prior_detail);
+            assert_eq!(verdicts.db_health.status, "green");
+            assert_eq!(verdicts.write_health.status, "red");
+        }
+
+        let mut observation = semantic("ok", "sqlite is ahead of the archive by 2 message(s)");
+        observation.archive_message_gap = Some(2);
+        let mut verdicts = compute_health_verdicts(
+            &config,
+            true,
+            &observation,
+            &healthy_integrity_metrics(),
+            Some("no completed op for 900000 ms"),
+            false,
+        );
+        apply_idle_archive_gap_health(&mut observation, &mut verdicts, false, None);
+        assert_eq!(verdicts.archive_db_parity.status, "red");
+        assert_eq!(verdicts.semantic_readiness.status, "red");
+        assert_eq!(observation.status, "fail");
+        assert!(observation.detail.contains("drain stalled"));
+        assert_eq!(verdicts.db_health.status, "green");
+        assert_eq!(verdicts.write_health.status, "green");
+    }
+
     #[test]
     fn semantic_archive_gap_wire_format_preserves_skipped_and_legacy_responses() {
         let legacy = json!({"status": "ok", "detail": "parity skipped"});
@@ -4752,6 +5679,70 @@ mod tests {
             verdicts.archive_db_parity.detail, "git archive and sqlite index are aligned",
             "must not assert bare alignment over visibly unequal counts"
         );
+    }
+
+    #[test]
+    fn unavailable_archive_sample_is_unknown_and_preserves_known_stalls() {
+        let mut lag = mcp_agent_mail_storage::ArchiveLagSnapshot::default();
+        let complete = ArchiveLagHealthResponse::from_sample(&lag, None, 1_000_000, 30_000_000);
+        assert_eq!(complete.backlog_depth, Some(0));
+        assert_eq!(complete.oldest_unmaterialized_ms, Some(0));
+        assert!(!complete.warning);
+
+        let lock = "commit_coalescer.progress";
+        let unknown =
+            ArchiveLagHealthResponse::from_sample(&lag, Some(lock), 1_000_000, 30_000_000);
+        let value = serde_json::to_value(unknown).unwrap();
+        assert_eq!(value["unavailable_lock"], lock);
+        assert_eq!(value["warning"], true);
+        for field in [
+            "backlog_depth",
+            "backlog_oldest_age_ms",
+            "coalescer_oldest_age_ms",
+            "coalescer_since_progress_ms",
+            "oldest_unmaterialized_ms",
+        ] {
+            assert!(
+                value[field].is_null(),
+                "missing {field} must not become zero"
+            );
+        }
+
+        let mut verdicts = compute_health_verdicts(
+            &Config::from_env(),
+            true,
+            &semantic("ok", "archive and sqlite aligned"),
+            &healthy_integrity_metrics(),
+            None,
+            true,
+        );
+        assert_eq!(verdicts.archive_db_parity.status, "green");
+        apply_archive_sample_unavailable(&mut verdicts, lock, None);
+        assert_eq!(verdicts.archive_db_parity.status, "yellow");
+        assert!(verdicts.archive_db_parity.detail.contains(lock));
+        apply_archive_sample_unavailable(&mut verdicts, lock, Some(std::time::Duration::ZERO));
+        assert_eq!(verdicts.archive_db_parity.status, "yellow");
+
+        lag.wbq_inflight_execution_us = 31_000_000;
+        lag.oldest_unmaterialized_us = 31_000_000;
+        let unknown =
+            ArchiveLagHealthResponse::from_sample(&lag, Some(lock), 1_000_000, 30_000_000);
+        assert!(unknown.drain_stalled);
+        assert_eq!(unknown.wbq_inflight_execution_ms, 31_000);
+        assert_eq!(unknown.oldest_unmaterialized_ms, None);
+        let stall = archive_drain_stall_detail(&lag, 30_000_000).unwrap();
+        let mut stalled = compute_health_verdicts(
+            &Config::from_env(),
+            true,
+            &semantic("ok", "archive is behind sqlite"),
+            &healthy_integrity_metrics(),
+            Some(&stall),
+            true,
+        );
+        apply_archive_sample_unavailable(&mut stalled, lock, None);
+        assert_eq!(stalled.archive_db_parity.status, "red");
+        assert!(stalled.archive_db_parity.detail.contains("drain stalled"));
+        assert!(stalled.archive_db_parity.detail.contains(lock));
     }
 
     #[test]
@@ -5413,10 +6404,13 @@ mod tests {
             },
             pool_utilization: None,
             timeout_diagnostics: test_timeout_diagnostics(),
+            lock_activity: mcp_agent_mail_core::lock_order::LockActivitySnapshot::default(),
             queues: None,
             disk: None,
             retention: None,
             integrity: None,
+            lexical_backfill: None,
+            circuit_breakers: None,
             semantic_indexing: None,
             two_tier_indexing: None,
             recovery: None,
@@ -5606,13 +6600,16 @@ mod tests {
         assert!(is_valid_agent_name("BlueLake"));
         assert!(is_valid_agent_name("RedFox"));
         assert!(is_valid_agent_name("GoldHawk"));
+        assert!(is_valid_agent_name("blue_lake"));
+        assert!(is_valid_agent_name("app-x-refactor"));
+        assert!(is_valid_agent_name("API.review_2"));
     }
 
     #[test]
     fn invalid_agent_names_rejected() {
         use mcp_agent_mail_core::models::is_valid_agent_name;
         assert!(!is_valid_agent_name(""));
-        assert!(!is_valid_agent_name("blue_lake")); // underscore not allowed
+        assert!(!is_valid_agent_name("blue..lake")); // notification path guard
         assert!(!is_valid_agent_name("123"));
         assert!(!is_valid_agent_name("Blue Lake")); // space not allowed
         assert!(!is_valid_agent_name("EaglePeak")); // eagle is a noun, not adjective
@@ -5824,12 +6821,24 @@ mod tests {
     }
 
     #[test]
-    fn agent_name_special_chars_rejected() {
+    fn agent_name_separators_follow_explicit_id_contract() {
         use mcp_agent_mail_core::models::is_valid_agent_name;
-        assert!(!is_valid_agent_name("Blue-Lake"));
-        assert!(!is_valid_agent_name("Blue_Lake"));
-        assert!(!is_valid_agent_name("Blue.Lake"));
-        assert!(!is_valid_agent_name("Blue@Lake"));
+        // Safe explicit task IDs are distinct from generated vocabulary names.
+        for name in ["Blue-Lake", "Blue_Lake", "Blue.Lake"] {
+            assert!(is_valid_agent_name(name), "safe explicit ID: {name}");
+        }
+        for name in [
+            "Blue@Lake",
+            "Blue/Lake",
+            "Blue\\Lake",
+            "Blue..Lake",
+            "Blue.",
+            "-BlueLake",
+            "CON.txt",
+            "agent_name",
+        ] {
+            assert!(!is_valid_agent_name(name), "unsafe explicit ID: {name}");
+        }
     }
 
     #[test]
@@ -5967,10 +6976,13 @@ mod tests {
             },
             pool_utilization: None,
             timeout_diagnostics: test_timeout_diagnostics(),
+            lock_activity: mcp_agent_mail_core::lock_order::LockActivitySnapshot::default(),
             queues: None,
             disk: None,
             retention: None,
             integrity: None,
+            lexical_backfill: None,
+            circuit_breakers: None,
             semantic_indexing: None,
             two_tier_indexing: None,
             recovery: None,
@@ -5990,6 +7002,8 @@ mod tests {
             "disk",
             "retention",
             "integrity",
+            "lexical_backfill",
+            "circuit_breakers",
             "semantic_indexing",
             "two_tier_indexing",
             "recovery",
@@ -6034,6 +7048,171 @@ mod tests {
         assert!(detail.contains("possible descriptor leak"), "{detail}");
         let steady = descriptor_health_detail(&snapshot, None);
         assert!(steady.ends_with("floor not rising"), "{steady}");
+    }
+
+    #[test]
+    fn lock_wait_health_uses_live_wait_age_and_never_clears_partial_evidence() {
+        use mcp_agent_mail_core::HealthLevel;
+        use mcp_agent_mail_core::lock_order::{
+            LOCK_WAIT_STALL_THRESHOLD, LockActivity, LockActivitySnapshot,
+        };
+
+        let threshold_ns = u64::try_from(LOCK_WAIT_STALL_THRESHOLD.as_nanos()).unwrap();
+        let mut snapshot = LockActivitySnapshot {
+            available: true,
+            locks: vec![LockActivity {
+                instance_id: 71,
+                lock_name: "StorageCommitQueue".into(),
+                rank: 60,
+                holder_count: 0,
+                waiter_count: 1,
+                oldest_observed_wait_ns: threshold_ns - 1,
+                holders: vec![],
+                waiters: vec![],
+                omitted_participants: 1,
+            }],
+            ..LockActivitySnapshot::default()
+        };
+        // Missing participant detail is not a green certificate, even when
+        // the observed wait has not yet crossed the critical threshold.
+        assert_eq!(
+            lock_wait_health_verdict(&snapshot).level(),
+            HealthLevel::Yellow
+        );
+        snapshot.locks[0].oldest_observed_wait_ns = threshold_ns;
+        let stalled = lock_wait_health_verdict(&snapshot);
+        assert_eq!(stalled.level(), HealthLevel::Red);
+        assert!(stalled.critical);
+        assert!(stalled.detail.contains("StorageCommitQueue#71"));
+        assert!(stalled.detail.contains("coverage_complete=false"));
+        snapshot.busy_instances = 1;
+        assert_eq!(
+            lock_wait_health_verdict(&snapshot).level(),
+            HealthLevel::Red
+        );
+
+        snapshot.locks[0].waiter_count = 0;
+        snapshot.locks[0].oldest_observed_wait_ns = u64::MAX;
+        snapshot.locks[0].omitted_participants = 0;
+        assert_eq!(
+            lock_wait_health_verdict(&snapshot).level(),
+            HealthLevel::Yellow
+        );
+        snapshot.busy_instances = 0;
+        assert_eq!(
+            lock_wait_health_verdict(&snapshot).level(),
+            HealthLevel::Green
+        );
+        snapshot.available = false;
+        assert_eq!(
+            lock_wait_health_verdict(&snapshot).level(),
+            HealthLevel::Yellow
+        );
+        snapshot.available = true;
+        snapshot.omitted_active_instances = 1;
+        assert_eq!(
+            lock_wait_health_verdict(&snapshot).level(),
+            HealthLevel::Yellow
+        );
+        snapshot.omitted_active_instances = 0;
+        snapshot.registrations_dropped = 1;
+        assert_eq!(
+            lock_wait_health_verdict(&snapshot).level(),
+            HealthLevel::Yellow
+        );
+    }
+
+    #[test]
+    fn health_check_exposes_real_blocked_lock_without_acquiring_it() {
+        use mcp_agent_mail_core::lock_order::{LockLevel, OrderedMutex, lock_activity_snapshot};
+        use std::sync::{Arc, mpsc};
+        use std::time::{Duration, Instant};
+
+        let _guard = HEALTH_CHECK_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = tempfile::tempdir().unwrap();
+        let database_url = format!("sqlite:///{}", root.path().join("health.sqlite3").display());
+        let storage_root = root.path().join("archive");
+        std::fs::create_dir(&storage_root).unwrap();
+        let response = with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+            ],
+            || {
+                Config::reset_cached();
+                // Acquire the test's environment authority before starting
+                // the bounded held-lock interval. Parallel fixture setup must
+                // not spend that interval waiting for the environment lock.
+                let lock = Arc::new(OrderedMutex::new(
+                    LockLevel::StorageCommitQueue,
+                    "protected data must not appear in health",
+                ));
+                let (ready_tx, ready_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                let owner_lock = Arc::clone(&lock);
+                let owner = std::thread::Builder::new()
+                    .name("health-lock-owner".into())
+                    .spawn(move || {
+                        let _held = owner_lock.lock();
+                        ready_tx.send(()).unwrap();
+                        let _ = release_rx.recv_timeout(Duration::from_secs(20));
+                    })
+                    .unwrap();
+                ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let waiter = std::thread::Builder::new()
+                    .name("health-lock-waiter".into())
+                    .spawn(move || drop(lock.lock()))
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let observed = loop {
+                    if lock_activity_snapshot().locks.iter().any(|activity| {
+                        activity.waiters.iter().any(|participant| {
+                            participant.thread_name.as_deref() == Some("health-lock-waiter")
+                        })
+                    }) {
+                        break true;
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                let response = health_check(&McpContext::new(Cx::for_testing(), 1));
+                let _ = release_tx.send(());
+                owner.join().unwrap();
+                waiter.join().unwrap();
+                assert!(observed, "real waiter never entered live lock tracking");
+                response
+            },
+        );
+        let response = response.expect("health must return while the application lock is held");
+        assert!(!response.contains("protected data must not appear in health"));
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let activity = value["lock_activity"]["locks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|lock| {
+                lock["waiters"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|waiter| waiter["thread_name"] == "health-lock-waiter")
+            })
+            .expect("health must carry the real waiter");
+        assert_eq!(activity["holder_count"], 1);
+        assert_eq!(activity["waiter_count"], 1);
+        assert_eq!(activity["holders"][0]["thread_name"], "health-lock-owner");
+        assert!(
+            value["health_level_contributors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|contributor| contributor["name"] == "lock_waits")
+        );
     }
 
     #[test]
@@ -6105,9 +7284,14 @@ mod tests {
         ).expect("persist a message before its archive copy");
         drop(conn);
 
-        let before = health_check_semantic_readiness(&config);
+        let mut observed_generation = None;
+        let before = health_check_semantic_readiness(&config, &mut observed_generation);
         assert_eq!(before.status, "ok", "{}", before.detail);
         assert_eq!(before.archive_message_gap, Some(1));
+        assert!(
+            observed_generation.is_none(),
+            "health probes must not seed an empty database identity"
+        );
         let verdicts = compute_health_verdicts(
             &config,
             true,
@@ -6130,8 +7314,27 @@ mod tests {
             messages.join("2026-10-01T00-00-00Z__persisted__1.md"),
             "---json\n{\"id\":1,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Persisted\",\"importance\":\"normal\",\"created_ts\":\"2026-10-01T00:00:00Z\"}\n---\n\nbody\n",
         ).expect("materialize canonical message");
-        let after = health_check_semantic_readiness(&config);
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("reopen db");
+        conn.execute_raw(
+            "INSERT INTO db_identity (singleton, generation_id) VALUES (0, 'health-gap-generation')",
+        )
+        .expect("seed the existing database identity independently of health");
+        drop(conn);
+        let after = health_check_semantic_readiness(&config, &mut observed_generation);
         assert_eq!(after.archive_message_gap, Some(0), "{}", after.detail);
+        #[cfg(unix)]
+        assert_eq!(
+            observed_generation
+                .as_ref()
+                .map(|probe| probe.generation.token.as_str()),
+            Some("health-gap-generation"),
+            "inventory counts and the existing generation must be read together"
+        );
+        #[cfg(not(unix))]
+        assert!(
+            observed_generation.is_none(),
+            "unknown physical file identity must not supply a persistence age"
+        );
         let repaired = compute_health_verdicts(
             &config,
             true,
@@ -6321,7 +7524,25 @@ body
                 let response = health_check(&ctx).expect("health_check should serialize");
                 let value: serde_json::Value =
                     serde_json::from_str(&response).expect("parse health_check json");
-                assert_eq!(value["semantic_readiness"]["status"], "ok");
+                assert_eq!(value["semantic_readiness"]["status"], "warn");
+                let lexical: mcp_agent_mail_db::search_service::LexicalBackfillHealth =
+                    serde_json::from_value(value["lexical_backfill"].clone())
+                        .expect("health exposes the admitted daemon's lexical index evidence");
+                assert_eq!(
+                    lexical,
+                    mcp_agent_mail_db::search_service::lexical_backfill_health(
+                        &get_authoritative_live_db_pool().expect("existing health pool")
+                    )
+                );
+                let circuits: mcp_agent_mail_db::DbHealthStatus =
+                    serde_json::from_value(value["circuit_breakers"].clone())
+                        .expect("health exposes the serving process's circuit state");
+                assert!(
+                    circuits
+                        .circuits
+                        .iter()
+                        .any(|circuit| circuit.subsystem == "db")
+                );
                 assert!(
                     value["semantic_readiness"]["detail"]
                         .as_str()
@@ -6527,6 +7748,120 @@ body
     }
 
     #[test]
+    fn health_check_observes_storage_without_starting_workers() {
+        const CASE: &str =
+            "identity::tests::health_check_observes_storage_without_starting_workers";
+        const CHILD: &str = "AM_TEST_HEALTH_STORAGE_OBSERVER";
+        if std::env::var(CHILD).as_deref() != Ok(CASE) {
+            // A fresh process makes absence of worker initialization observable,
+            // independently of other tests that intentionally start workers.
+            let root = tempfile::tempdir().expect("isolated health root");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", CASE, "--nocapture"])
+                .env(CHILD, CASE)
+                .env("STORAGE_ROOT", root.path())
+                .output()
+                .expect("run isolated health observer");
+            assert!(
+                output.status.success(),
+                "{CASE}:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            return;
+        }
+
+        let root = tempfile::tempdir().expect("health mailbox root");
+        let storage_root = root.path().join("archive");
+        std::fs::create_dir(&storage_root).unwrap();
+        let database_url = format!("sqlite:///{}", root.path().join("health.sqlite3").display());
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+                ("AM_WBQ_CHANNEL_CAPACITY", "257"),
+            ],
+            || {
+                Config::reset_cached();
+                let metrics = mcp_agent_mail_core::global_metrics();
+                let assert_not_started = || {
+                    assert_eq!(metrics.storage.wbq_capacity.load(), 0);
+                    assert_eq!(metrics.storage.commit_soft_cap.load(), 0);
+                    assert!(mcp_agent_mail_storage::commit_coalescer_worker_liveness().is_none());
+                };
+                assert_not_started();
+                let ctx = McpContext::new(Cx::for_testing(), 1);
+                let missing: serde_json::Value =
+                    serde_json::from_str(&health_check(&ctx).unwrap()).unwrap();
+                assert_eq!(missing["status"], "error");
+                assert_not_started();
+                assert_eq!(missing["queues"]["wbq"]["capacity"], 257);
+                let configured_soft_cap = missing["queues"]["commit_coalescer"]["soft_cap"]
+                    .as_u64()
+                    .expect("configured coalescer cap");
+                assert!(configured_soft_cap > 0);
+
+                // Bootstrap a real mailbox explicitly; health itself must not
+                // create the database or initialize storage workers.
+                let runtime = RuntimeBuilder::current_thread().build().unwrap();
+                let pool = get_db_pool().unwrap();
+                let conn = match runtime.block_on(pool.acquire(ctx.cx())) {
+                    Outcome::Ok(conn) => conn,
+                    Outcome::Err(error) => panic!("bootstrap acquire failed: {error}"),
+                    Outcome::Cancelled(_) => panic!("bootstrap acquire cancelled"),
+                    Outcome::Panicked(_) => panic!("bootstrap acquire panicked"),
+                };
+                drop(conn);
+                // The real producer must serialize accepted reconciliation
+                // evidence; a fresh caller cannot replace these gauges by zero.
+                mcp_agent_mail_db::integrity::record_reconciled_acceptance(
+                    mcp_agent_mail_db::CheckKind::Full,
+                    425,
+                );
+                let counters = mcp_agent_mail_db::integrity_metrics();
+                assert_eq!(counters.never_written_orphan_pages, 425);
+                let healthy: serde_json::Value =
+                    serde_json::from_str(&health_check(&ctx).unwrap()).unwrap();
+                assert_eq!(healthy["integrity"]["never_written_orphan_pages"], 425);
+                assert_eq!(
+                    healthy["integrity"]["failures_since_last_ok"],
+                    counters.failures_since_last_ok
+                );
+                assert_eq!(
+                    healthy["verdicts"]["db_health"]["status"], "green",
+                    "{healthy}"
+                );
+                assert_not_started();
+                assert_eq!(healthy["queues"]["wbq"]["capacity"], 257);
+                assert_eq!(
+                    healthy["queues"]["commit_coalescer"]["soft_cap"],
+                    configured_soft_cap
+                );
+
+                // Startup remains explicit and functional. Observational
+                // fallback limits must agree with the actual running workers.
+                mcp_agent_mail_storage::wbq_start();
+                let _ = mcp_agent_mail_storage::get_commit_coalescer();
+                assert_eq!(metrics.storage.wbq_capacity.load(), 257);
+                assert_eq!(metrics.storage.commit_soft_cap.load(), configured_soft_cap);
+                assert!(
+                    mcp_agent_mail_storage::commit_coalescer_worker_liveness()
+                        .is_some_and(|workers| workers.expected > 0)
+                );
+                let running: serde_json::Value =
+                    serde_json::from_str(&health_check(&ctx).unwrap()).unwrap();
+                assert_eq!(running["queues"]["wbq"]["capacity"], 257);
+                assert_eq!(
+                    running["queues"]["commit_coalescer"]["soft_cap"],
+                    configured_soft_cap
+                );
+                mcp_agent_mail_storage::wbq_shutdown();
+            },
+        );
+    }
+
+    #[test]
     fn health_check_does_not_initialize_missing_sqlite() {
         let _guard = HEALTH_CHECK_TEST_LOCK
             .get_or_init(|| Mutex::new(()))
@@ -6616,7 +7951,7 @@ body
                 let response = health_check(&ctx).expect("hot health check");
                 let value: serde_json::Value =
                     serde_json::from_str(&response).expect("health response json");
-                assert_ne!(value["db_health"]["status"], "fail", "{value}");
+                assert_eq!(value["verdicts"]["db_health"]["status"], "green", "{value}");
                 assert_eq!(
                     crate::archive_read::writer_epoch_for_test(),
                     before_epoch,

@@ -2130,6 +2130,18 @@ pub enum MailCommand {
     Status {
         project_path: PathBuf,
     },
+    /// Count a project's messages in the configured mailbox without changing it.
+    Count {
+        /// Project key (slug or human_key).
+        #[arg(long = "project", short = 'p')]
+        project_key: String,
+        /// Output format: table, json, or toon (default: table).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Send a message to one or more agents.
     Send {
         /// Project key (slug or human_key).
@@ -2593,6 +2605,11 @@ pub enum AgentCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum DoctorCommand {
+    /// Report mailbox diagnostics without changing state.
+    ///
+    /// Table output exits 1 when healthy is false. JSON and TOON output exit 0
+    /// after generating the report; inspect the healthy field for mailbox health.
+    /// Use `am doctor health` when scripts need findings to produce a nonzero exit.
     Check {
         project: Option<String>,
         #[arg(long, short = 'v')]
@@ -2912,16 +2929,18 @@ pub enum DoctorCommand {
         json: bool,
     },
 
-    /// Reclaim orphaned pages INSIDE the live database (VACUUM + ANALYZE).
+    /// Compact the mailbox database offline (verified backup, VACUUM + ANALYZE).
     ///
     /// GH#289: an archive reconstruct can leave the promoted database with a
     /// large share of orphaned pages (`Page N: never used`, freelist_count=0)
     /// — pure space-accounting waste that keeps `am doctor health` degraded
     /// forever with no supported reclaim path. This verb runs the
-    /// drain/ownership protocol (same guard as `repair`), then VACUUMs and
+    /// drain/ownership protocol, retains a verified backup, then VACUUMs and
     /// ANALYZEs the mailbox in place and reports the before/after integrity
-    /// class and page counts. Default (no `--yes`) previews. Refuses while a
-    /// live owner holds the mailbox unless `--allow-live-owner`.
+    /// class and page counts. Also rebuilds the sparse metrics index left by
+    /// FrankenSQLite before 0.4.13 (GH#372), even if integrity_check is clean.
+    /// Stop the server first and keep it stopped until completion. Default
+    /// (no `--yes`) previews; applying holds exclusive mailbox locks.
     Vacuum {
         /// Preview: report page counts and integrity class, mutate nothing.
         #[arg(long)]
@@ -2932,10 +2951,10 @@ pub enum DoctorCommand {
         /// Output JSON (shorthand for machine-readable output).
         #[arg(long)]
         json: bool,
-        /// Proceed even if a live owner currently holds the mailbox (unsafe).
+        /// Unsupported for VACUUM: stop the server first (kept for a clear error).
         #[arg(long)]
         allow_live_owner: bool,
-        /// Supervised takeover of a provably dead owner before vacuuming.
+        /// Unsupported for VACUUM: stop all owners without replacing their locks.
         #[arg(long)]
         take_ownership: bool,
     },
@@ -3858,6 +3877,7 @@ fn mail_command_is_read_only(action: &MailCommand) -> bool {
         action,
         // `Read` is absent: it marks a message read, a write like `Ack`.
         MailCommand::Status { .. }
+            | MailCommand::Count { .. }
             | MailCommand::Inbox { .. }
             | MailCommand::Search { .. }
             | MailCommand::SummarizeThread { .. }
@@ -10927,23 +10947,50 @@ fn local_server_url_from_parts(host: &str, port: u16, http_path: &str) -> String
 /// Resolve the CLI endpoint, discovering this mailbox's owner if unconfigured.
 ///
 /// Never infer authority from argv text.
-pub(crate) fn local_server_url(config: &Config) -> String {
+pub(crate) fn local_server_url(config: &Config) -> CliResult<String> {
     use mcp_agent_mail_core::config::env_value;
 
     if let Some(url) = env_value("AGENT_MAIL_URL").filter(|url| !url.trim().is_empty()) {
-        return normalize_agent_mail_url(&url, &config.http_path);
+        return Ok(normalize_agent_mail_url(&url, &config.http_path));
     }
-    let (host, port) = local_server_host_port(config);
-    local_server_url_from_parts(&host, port, &config.http_path)
+    let (host, port) = local_server_host_port(config)?;
+    Ok(local_server_url_from_parts(&host, port, &config.http_path))
+}
+
+/// The port of an endpoint nothing can answer. A mailbox with no server to
+/// call gets it, so the caller's connection fails before any request or token
+/// leaves the process and the caller takes its local path (br-eos8u).
+const NO_SERVER_PORT: u16 = 0;
+
+/// The waits before each further look for a live server's listener.
+const OWNER_LISTENER_RETRY_DELAYS: [std::time::Duration; 2] = [
+    std::time::Duration::from_millis(100),
+    std::time::Duration::from_millis(300),
+];
+
+/// What discovery learned about the server that owns this mailbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OwnerDiscovery {
+    /// The owner's own listener, confirmed by the operating system.
+    Listener(String, u16),
+    /// No server owns the mailbox.
+    Unowned,
+    /// Mailbox ownership or its listener could not authorize an endpoint.
+    /// `pid` is set when ownership names exactly one process.
+    Unresolved { pid: Option<u32>, detail: String },
 }
 
 /// The daemon's host and port, ignoring `AGENT_MAIL_URL`: the configured
 /// `HTTP_HOST`/`HTTP_PORT` (process env or user config), or this mailbox's
 /// verified owner listener when neither is configured.
-pub(crate) fn local_server_host_port(config: &Config) -> (String, u16) {
+///
+/// With neither, see [`endpoint_without_owner`]. The default endpoint can
+/// belong to another mailbox's server, so it is not a safe guess for every
+/// mailbox (br-eos8u).
+pub(crate) fn local_server_host_port(config: &Config) -> CliResult<(String, u16)> {
     use mcp_agent_mail_core::config::env_value;
 
-    let configured = || (config.http_host.clone(), config.http_port);
+    let configured = (config.http_host.clone(), config.http_port);
     if ["HTTP_HOST", "HTTP_PORT"]
         .iter()
         .any(|key| env_value(key).is_some())
@@ -10951,39 +10998,147 @@ pub(crate) fn local_server_host_port(config: &Config) -> (String, u16) {
         || config.http_port != Config::default().http_port
         || mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url)
     {
-        return configured();
+        return Ok(configured);
     }
+    let default_root = is_default_mailbox_root(&config.storage_root);
     let Ok(sqlite_path) = resolve_mailbox_activity_sqlite_path(&config.database_url) else {
-        return configured();
+        return endpoint_without_owner(
+            &OwnerDiscovery::Unresolved {
+                pid: None,
+                detail: "the configured database path could not be resolved; check DATABASE_URL"
+                    .to_string(),
+            },
+            default_root,
+            configured,
+        );
     };
-    let ownership =
-        mcp_agent_mail_db::pool::inspect_mailbox_ownership(&sqlite_path, &config.storage_root);
-    let Some(pid) = sole_proxy_mailbox_owner(&ownership) else {
-        return configured();
+    let mut discovery = discover_mailbox_owner(config, &sqlite_path);
+    for delay in OWNER_LISTENER_RETRY_DELAYS {
+        if !matches!(discovery, OwnerDiscovery::Unresolved { .. }) {
+            break;
+        }
+        std::thread::sleep(delay);
+        discovery = discover_mailbox_owner(config, &sqlite_path);
+    }
+    endpoint_without_owner(&discovery, default_root, configured)
+}
+
+/// The endpoint for a mailbox once discovery has finished.
+///
+/// Only an unowned default mailbox keeps the default endpoint. Other unowned
+/// mailboxes get [`NO_SERVER_PORT`] and the local path. An unresolved owner
+/// always prevents routing, including when its command or listener is unreadable.
+fn endpoint_without_owner(
+    discovery: &OwnerDiscovery,
+    default_root: bool,
+    configured: (String, u16),
+) -> CliResult<(String, u16)> {
+    match discovery {
+        OwnerDiscovery::Listener(host, port) => Ok((host.clone(), *port)),
+        OwnerDiscovery::Unowned if default_root => Ok(configured),
+        OwnerDiscovery::Unowned => Ok((configured.0, NO_SERVER_PORT)),
+        OwnerDiscovery::Unresolved { pid, detail } => {
+            let owner = pid.map_or_else(
+                || "owner PID is not uniquely confirmed".to_string(),
+                |pid| format!("owner PID {pid}"),
+            );
+            Err(CliError::Other(format!(
+                "this mailbox's server could not be confirmed ({owner}), so nothing was sent to \
+                 {}:{}: {detail}. Set AGENT_MAIL_URL or HTTP_PORT to reach it",
+                configured.0, configured.1
+            )))
+        }
+    }
+}
+
+/// One look at who owns this mailbox and where that owner listens.
+fn discover_mailbox_owner(config: &Config, sqlite_path: &Path) -> OwnerDiscovery {
+    use mcp_agent_mail_db::pool::inspect_mailbox_ownership;
+    use mcp_agent_mail_server::startup_checks::{
+        listener_port_holder_pids_with_hint, verified_listener_for_pid,
     };
-    let Some((host, port)) = mcp_agent_mail_server::startup_checks::verified_listener_for_pid(pid)
-    else {
-        return configured();
+
+    discover_mailbox_owner_with_probes(
+        &inspect_mailbox_ownership(sqlite_path, &config.storage_root),
+        |pid| {
+            // A different TMPDIR can hide the daemon's listener hint. The
+            // configured port is usable only when its actual holder is this PID.
+            verified_listener_for_pid(pid).or_else(|| {
+                (listener_port_holder_pids_with_hint(&config.http_host, config.http_port) == [pid])
+                    .then(|| (config.http_host.clone(), config.http_port))
+            })
+        },
+        || inspect_mailbox_ownership(sqlite_path, &config.storage_root),
+    )
+}
+
+fn unresolved_mailbox_owner(
+    ownership: &mcp_agent_mail_db::pool::MailboxOwnershipState,
+    reason: &str,
+) -> OwnerDiscovery {
+    OwnerDiscovery::Unresolved {
+        pid: match ownership.competing_pids.as_slice() {
+            [pid] => Some(*pid),
+            _ => None,
+        },
+        // Ownership detail contains process argv. Do not echo credentials that
+        // an owner may have received on its command line into a client error.
+        detail: format!(
+            "{reason}; ownership {:?}, owner PIDs {:?}",
+            ownership.disposition, ownership.competing_pids
+        ),
+    }
+}
+
+fn discover_mailbox_owner_with_probes(
+    ownership: &mcp_agent_mail_db::pool::MailboxOwnershipState,
+    listener_for_pid: impl FnOnce(u32) -> Option<(String, u16)>,
+    inspect_again: impl FnOnce() -> mcp_agent_mail_db::pool::MailboxOwnershipState,
+) -> OwnerDiscovery {
+    if !ownership.blocks_mutation() {
+        return OwnerDiscovery::Unowned;
+    }
+    let Some(pid) = sole_proxy_mailbox_owner(ownership) else {
+        return unresolved_mailbox_owner(ownership, "no single fully locked owner was confirmed");
+    };
+    let Some((host, port)) = listener_for_pid(pid) else {
+        return unresolved_mailbox_owner(ownership, "the owner's listener was not confirmed");
     };
     // Recheck mailbox ownership after listener discovery, before using the URL.
-    let current =
-        mcp_agent_mail_db::pool::inspect_mailbox_ownership(&sqlite_path, &config.storage_root);
+    let current = inspect_again();
     if sole_proxy_mailbox_owner(&current) != Some(pid) {
-        return configured();
+        return unresolved_mailbox_owner(&current, "mailbox ownership changed during discovery");
     }
-    (host, port)
+    OwnerDiscovery::Listener(host, port)
+}
+
+/// Whether `storage_root` is the mailbox a default install uses, under any
+/// spelling of its path.
+fn is_default_mailbox_root(storage_root: &Path) -> bool {
+    use mcp_agent_mail_core::config::{default_storage_root_path, is_default_storage_root};
+
+    is_default_storage_root(storage_root)
+        || matches!(
+            (
+                std::fs::canonicalize(storage_root),
+                std::fs::canonicalize(default_storage_root_path()),
+            ),
+            (Ok(root), Ok(default)) if root == default
+        )
 }
 
 /// The host and port the inbox hook commands (`check-inbox`, `mark-all-read`,
 /// `inbox-events`) probe and call: explicit `--host`/`--port` win, otherwise
-/// the same endpoint `am mail` resolves.
+/// the same endpoint `am mail` resolves. These commands never interrupt agent
+/// work, so an unconfirmed server becomes no server rather than an error.
 fn hook_server_host_port(
     config: &Config,
     host: Option<String>,
     port: Option<u16>,
 ) -> (String, u16) {
     if host.is_none() && port.is_none() {
-        return local_server_host_port(config);
+        return local_server_host_port(config)
+            .unwrap_or_else(|_| (config.http_host.clone(), NO_SERVER_PORT));
     }
     (
         host.unwrap_or_else(|| config.http_host.clone()),
@@ -11653,8 +11808,275 @@ fn doctor_vacuum_stats(db_path: &Path) -> CliResult<DoctorVacuumStats> {
     })
 }
 
-/// `am doctor vacuum` — in-place VACUUM + ANALYZE of the live mailbox, with
-/// the same supervised-owner protocol as `repair` (GH#289).
+/// The owner census is advisory: exclusive activity locks close the race with
+/// a server starting immediately after the census. Keep both locks until the
+/// backup, compaction and post-check have finished. A live-owner override is
+/// deliberately unavailable for this whole-file rewrite (GH#372).
+fn acquire_doctor_vacuum_locks(
+    database_url: &str,
+    storage_root: &Path,
+    allow_live_owner: bool,
+    take_ownership: bool,
+) -> CliResult<CliMailboxMutationLocks> {
+    if allow_live_owner || take_ownership {
+        return Err(CliError::Usage(
+            "doctor vacuum is offline-only; --allow-live-owner and --take-ownership cannot bypass this requirement. \
+             Stop every server using this mailbox, run `am doctor drain`, then retry \
+             `am doctor vacuum --yes` without ownership overrides."
+                .to_string(),
+        ));
+    }
+    enforce_supervised_owner_guard(database_url, storage_root, "vacuum", false, false, false)?;
+    acquire_cli_mailbox_mutation_locks(database_url, Some(storage_root))
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct DoctorVacuumTableWitness {
+    rows: u64,
+    sha256: String,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct DoctorVacuumContentWitness {
+    user_version: i64,
+    application_id: i64,
+    schema_sha256: String,
+    tables: BTreeMap<String, DoctorVacuumTableWitness>,
+}
+
+/// Hash the complete contents of message and identity tables, including every
+/// stored column (bodies, attachments, tokens, read/ack times). Keyset pagination
+/// bounds each materialized batch to 32 rows and avoids loading a whole mailbox
+/// into memory or repeatedly scanning growing OFFSETs. The key names below are
+/// fixed schema identifiers, never operator input. Missing newer tables remain
+/// missing on older mailboxes: compaction must not run migrations.
+fn doctor_vacuum_content_witness(db_path: &Path) -> CliResult<DoctorVacuumContentWitness> {
+    use mcp_agent_mail_db::sqlmodel_core::Value;
+    use sha2::Digest as _;
+
+    const TABLES: &[(&str, &[&str])] = &[
+        ("projects", &["id"]),
+        ("agents", &["id"]),
+        ("messages", &["id"]),
+        ("message_recipients", &["message_id", "agent_id", "kind"]),
+        ("project_mailbox_deliveries", &["message_id"]),
+        ("project_mailbox_receipts", &["message_id", "agent_id"]),
+        // AUTOINCREMENT high-water marks can exceed every surviving row ID.
+        // Reconstructing them from MAX(id) would silently permit ID reuse.
+        ("sqlite_sequence", &["name"]),
+    ];
+    let conn = mcp_agent_mail_db::pool::open_guarded_read_only_sqlite_file(
+        db_path,
+        "doctor vacuum message-content verification",
+    )
+    .map_err(|error| CliError::Other(format!("cannot verify mailbox contents: {error}")))?;
+    let header_value = |sql: &str| -> CliResult<i64> {
+        let rows = conn
+            .query_sync(sql, &[])
+            .map_err(|error| CliError::Other(format!("cannot read {sql}: {error}")))?;
+        rows.first()
+            .and_then(|row| {
+                row.values().find_map(|value| match value {
+                    Value::BigInt(value) => Some(*value),
+                    Value::Int(value) => Some(i64::from(*value)),
+                    _ => None,
+                })
+            })
+            .ok_or_else(|| CliError::Other(format!("{sql} returned no integer")))
+    };
+    let user_version = header_value("PRAGMA user_version")?;
+    let application_id = header_value("PRAGMA application_id")?;
+    // Root page numbers necessarily change during VACUUM. ANALYZE may create
+    // sqlite_stat* tables; every other table, index, view and trigger definition
+    // must remain exactly as stored, including extension schemas we do not own.
+    let schema = conn
+        .query_sync(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master \
+             WHERE name NOT LIKE 'sqlite_stat%' ORDER BY type, name",
+            &[],
+        )
+        .map_err(|error| CliError::Other(format!("cannot verify mailbox schema: {error}")))?;
+    let schema_json: Vec<_> = schema.iter().map(tooling_row_to_json).collect();
+    let schema_bytes = serde_json::to_vec(&schema_json)
+        .map_err(|error| CliError::Other(format!("cannot hash mailbox schema: {error}")))?;
+    let schema_sha256 = hex::encode(sha2::Sha256::digest(&schema_bytes));
+    let mut witness = BTreeMap::new();
+    for &(table, keys) in TABLES {
+        let present = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                &[Value::Text(table.to_string())],
+            )
+            .map_err(|error| CliError::Other(format!("cannot inspect {table}: {error}")))?;
+        if present.is_empty() {
+            continue;
+        }
+        let mut digest = sha2::Sha256::new();
+        let mut count = 0_u64;
+        let mut last_key: Option<Vec<Value>> = None;
+        loop {
+            let mut params = Vec::new();
+            let predicate = if let Some(last) = &last_key {
+                let mut alternatives = Vec::with_capacity(keys.len());
+                for (index, key) in keys.iter().enumerate() {
+                    let mut terms = Vec::with_capacity(index + 1);
+                    for (prefix, previous) in keys.iter().zip(last).take(index) {
+                        terms.push(format!("{prefix} = ?"));
+                        params.push(previous.clone());
+                    }
+                    terms.push(format!("{key} > ?"));
+                    params.push(last[index].clone());
+                    alternatives.push(format!("({})", terms.join(" AND ")));
+                }
+                format!("WHERE {}", alternatives.join(" OR "))
+            } else {
+                String::new()
+            };
+            let rows = conn
+                .query_sync(
+                    &format!(
+                        "SELECT * FROM {table} {predicate} ORDER BY {} LIMIT 32",
+                        keys.join(", ")
+                    ),
+                    &params,
+                )
+                .map_err(|error| CliError::Other(format!("cannot verify {table}: {error}")))?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                // Preserve SQLite storage-class distinctions, including a BLOB
+                // versus TEXT with the same printable bytes. Integer widths
+                // are normalized by the existing SQL-to-JSON conversion.
+                let fields: Vec<_> = row
+                    .column_names()
+                    .zip(row.values())
+                    .map(|(name, value)| {
+                        let kind = match value {
+                            Value::Null => "null",
+                            Value::Bytes(_) => "blob",
+                            Value::Text(_) => "text",
+                            Value::Float(_) | Value::Double(_) => "real",
+                            _ => "scalar",
+                        };
+                        (name, kind, tooling_sql_value_to_json(value.clone()))
+                    })
+                    .collect();
+                let bytes = serde_json::to_vec(&fields)
+                    .map_err(|error| CliError::Other(format!("cannot hash {table}: {error}")))?;
+                digest.update((bytes.len() as u64).to_be_bytes());
+                digest.update(bytes);
+                count += 1;
+            }
+            let last_row = &rows[rows.len() - 1];
+            let next_key = keys
+                .iter()
+                .map(|key| {
+                    last_row
+                        .column_names()
+                        .zip(last_row.values())
+                        .find_map(|(name, value)| (name == *key).then(|| value.clone()))
+                        .ok_or_else(|| {
+                            CliError::Other(format!("cannot find {table}.{key} for verification"))
+                        })
+                })
+                .collect::<CliResult<Vec<_>>>()?;
+            if last_key.as_ref() == Some(&next_key) {
+                return Err(CliError::Other(format!(
+                    "message-content verification made no progress in {table}"
+                )));
+            }
+            last_key = Some(next_key);
+        }
+        // Fail closed if an unexpected legacy key shape (NULL/duplicates) or
+        // engine scan bug skipped rows across a page boundary. A count alone
+        // cannot prove content preservation, but it proves this digest covered
+        // every row when combined with strict keyset progress.
+        let totals = conn
+            .query_sync(&format!("SELECT COUNT(*) AS total FROM {table}"), &[])
+            .map_err(|error| CliError::Other(format!("cannot count {table}: {error}")))?;
+        let total = totals
+            .first()
+            .ok_or_else(|| CliError::Other(format!("no count for {table}")))?
+            .get_named::<i64>("total")
+            .map_err(|error| CliError::Other(format!("invalid count for {table}: {error}")))?;
+        if u64::try_from(total).ok() != Some(count) {
+            return Err(CliError::Other(format!(
+                "content verification covered {count} of {total} rows in {table}; refusing compaction"
+            )));
+        }
+        witness.insert(
+            table.to_string(),
+            DoctorVacuumTableWitness {
+                rows: count,
+                sha256: hex::encode(digest.finalize()),
+            },
+        );
+    }
+    Ok(DoctorVacuumContentWitness {
+        user_version,
+        application_id,
+        schema_sha256,
+        tables: witness,
+    })
+}
+
+/// Retain an independently readable, full-schema backup before any in-place
+/// rewrite. Export includes committed WAL rows through the owning engine; a
+/// raw copy of the main file alone would silently omit them. A failed export,
+/// validation or durability barrier aborts before VACUUM touches the source.
+/// The private directory is intentionally retained on success AND failure.
+fn create_doctor_vacuum_backup(
+    db_path: &Path,
+    expected: &DoctorVacuumContentWitness,
+) -> CliResult<PathBuf> {
+    let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let backup_dir = tempfile::Builder::new()
+        .prefix("doctor-vacuum-backup-")
+        .tempdir_in(parent)?
+        .keep();
+    let backup_path = backup_dir.join("mailbox.sqlite3");
+    let backup = || -> CliResult<()> {
+        vacuum_live_franken_sqlite_into_snapshot(
+            db_path,
+            &backup_path,
+            "doctor vacuum pre-compaction backup",
+        )?;
+        let stats = doctor_vacuum_stats(&backup_path)?;
+        if stats.structural_errors != 0 || stats.leaked_pages != 0 {
+            return Err(CliError::Other(format!(
+                "backup integrity class is {}",
+                stats.integrity_class
+            )));
+        }
+        if &doctor_vacuum_content_witness(&backup_path)? != expected {
+            return Err(CliError::Other(
+                "backup changed message, recipient, identity, schema, or header metadata"
+                    .to_string(),
+            ));
+        }
+        // FlushFileBuffers (Windows' sync_all implementation) requires write
+        // access. This is only the new private backup, never the live inode.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&backup_path)?
+            .sync_all()?;
+        sync_startup_artifact_parents(&backup_dir, &backup_path)?;
+        Ok(())
+    };
+    backup().map_err(|error| {
+        CliError::Other(format!(
+            "refusing in-place VACUUM because its backup could not be verified: {error}; \
+             source was not compacted; backup attempt retained at {}",
+            backup_dir.display()
+        ))
+    })?;
+    Ok(backup_path)
+}
+
+/// `am doctor vacuum` — explicit offline compaction, never a startup migration
+/// or an automatic repair. The operator stops the server before `--yes`.
 fn handle_doctor_vacuum(
     dry_run: bool,
     yes: bool,
@@ -11682,8 +12104,20 @@ fn handle_doctor_vacuum(
         )));
     }
 
-    let before = doctor_vacuum_stats(&db_path)?;
     let apply = yes && !dry_run;
+    // On apply, refuse a live mailbox before even the expensive integrity
+    // probe: opening a badly bloated file can itself consume substantial RSS.
+    let _mutation_locks = if apply {
+        Some(acquire_doctor_vacuum_locks(
+            &database_url,
+            &config.storage_root,
+            allow_live_owner,
+            take_ownership,
+        )?)
+    } else {
+        None
+    };
+    let before = doctor_vacuum_stats(&db_path)?;
 
     if !apply {
         if before.structural_errors > 0 {
@@ -11718,6 +12152,8 @@ fn handle_doctor_vacuum(
                     "mode": "plan",
                     "before": before,
                     "would_run": ["VACUUM", "ANALYZE"],
+                    "requires_server_stopped": true,
+                    "retains_verified_backup": true,
                     "apply_command": "am doctor vacuum --yes",
                 })
             );
@@ -11731,7 +12167,11 @@ fn handle_doctor_vacuum(
                 before.file_bytes
             );
             ftui_runtime::ftui_println!(
-                "would run VACUUM + ANALYZE in place; apply with: am doctor vacuum --yes"
+                "stop every server using this mailbox first, then run: am doctor vacuum --yes; \
+                 a verified backup is retained before VACUUM + ANALYZE"
+            );
+            ftui_runtime::ftui_println!(
+                "a clean integrity_check does not rule out sparse metrics-index pages (GH#372)"
             );
         }
         return Ok(());
@@ -11746,34 +12186,61 @@ fn handle_doctor_vacuum(
         )));
     }
 
-    enforce_supervised_owner_guard(
-        &database_url,
-        &config.storage_root,
-        "vacuum",
-        false,
-        allow_live_owner,
-        take_ownership,
-    )?;
+    let content_before = doctor_vacuum_content_witness(&db_path)?;
+    let backup_path = create_doctor_vacuum_backup(&db_path, &content_before)?;
+    ftui_runtime::ftui_eprintln!(
+        "Verified pre-vacuum backup retained at {}. Keep the server stopped until verification completes.",
+        backup_path.display()
+    );
 
-    {
+    let compact = || -> CliResult<()> {
         let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
             .map_err(|e| CliError::Other(format!("cannot open {}: {e}", db_path.display())))?;
-        conn.execute_raw("VACUUM")
-            .map_err(|e| CliError::Other(format!("VACUUM failed: {e}")))?;
-        if let Err(e) = conn.execute_raw("ANALYZE") {
+        let vacuum = conn.execute_raw("VACUUM");
+        if vacuum.is_ok()
+            && let Err(e) = conn.execute_raw("ANALYZE")
+        {
             tracing::warn!(error = %e, "doctor vacuum: ANALYZE failed after successful VACUUM");
         }
-        mcp_agent_mail_db::close_db_conn(conn, "doctor vacuum");
-    }
+        let close = conn.close_sync();
+        vacuum.map_err(|e| CliError::Other(format!("VACUUM failed: {e}")))?;
+        close.map_err(|e| {
+            CliError::Other(format!("cannot flush and close compacted mailbox: {e}"))
+        })?;
+        Ok(())
+    };
+    compact().map_err(|error| {
+        CliError::Other(format!(
+            "{error}; keep the server stopped and inspect the mailbox; verified backup retained at {}",
+            backup_path.display()
+        ))
+    })?;
 
-    let after = doctor_vacuum_stats(&db_path)?;
+    let after = doctor_vacuum_stats(&db_path).map_err(|error| {
+        CliError::Other(format!(
+            "post-vacuum verification failed: {error}; keep the server stopped; verified backup retained at {}",
+            backup_path.display()
+        ))
+    })?;
+    let content_after = doctor_vacuum_content_witness(&db_path).map_err(|error| {
+        CliError::Other(format!(
+            "post-vacuum content verification failed: {error}; keep the server stopped; \
+             verified backup retained at {}",
+            backup_path.display()
+        ))
+    })?;
+    let content_preserved = content_before == content_after;
+    let healthy = after.leaked_pages == 0 && after.structural_errors == 0 && content_preserved;
     let reclaimed_pages = before.page_count.saturating_sub(after.page_count);
     if json_mode {
         ftui_runtime::ftui_println!(
             "{}",
             serde_json::json!({
-                "ok": true,
+                "ok": healthy,
                 "mode": "applied",
+                "backup_path": backup_path,
+                "message_content_preserved": content_preserved,
+                "message_content_witness": content_after,
                 "before": before,
                 "after": after,
                 "reclaimed_pages": reclaimed_pages,
@@ -11792,12 +12259,17 @@ fn handle_doctor_vacuum(
             before.file_bytes,
             after.file_bytes
         );
-    }
-    if after.leaked_pages > 0 || after.structural_errors > 0 {
         ftui_runtime::ftui_println!(
-            "warn: integrity class {} with {} leaked page(s) remain after VACUUM; next: am doctor health",
+            "message/recipient/identity contents preserved: {content_preserved}"
+        );
+    }
+    if !healthy {
+        ftui_runtime::ftui_eprintln!(
+            "warn: vacuum verification failed (integrity class {}, {} leaked page(s), contents preserved={content_preserved}); keep the server stopped; \
+             next: am doctor health; verified backup retained at {}",
             after.integrity_class,
-            after.leaked_pages
+            after.leaked_pages,
+            backup_path.display()
         );
         return Err(CliError::ExitCode(1));
     }
@@ -16322,7 +16794,6 @@ fn open_db_sync_with_database_url_with_path(
     open_db_sync_with_database_url_and_storage_root_with_path(database_url, None)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn open_db_sync_with_database_url_and_storage_root(
     database_url: &str,
     storage_root_override: Option<&Path>,
@@ -16444,7 +16915,8 @@ fn open_db_sync_after_mutation_locks(
                 return Err(init_error);
             }
         }
-        let (reopened, resolved_path) = open_sqlite_with_fallback(&opened_path)?;
+        let (reopened, resolved_path) =
+            open_sqlite_with_fallback_and_storage_root(&opened_path, storage_root_override)?;
         return maybe_reconcile_sync_opened_sqlite_archive_drift(
             reopened,
             resolved_path,
@@ -20864,7 +21336,7 @@ fn try_proxy_file_reservations_mutation(
 ) -> CliResult<Option<serde_json::Value>> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
-    let server_url = local_server_url(&server_config);
+    let server_url = local_server_url(&server_config)?;
     let bearer = local_server_bearer_token(&server_config);
 
     let Some((tool_name, command_label, arguments)) = file_reservations_proxy_request(action)
@@ -22086,7 +22558,7 @@ fn handle_contacts_with_conn(
 fn try_proxy_contacts_mutation(action: &ContactsCommand) -> CliResult<bool> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
-    let server_url = local_server_url(&server_config);
+    let server_url = local_server_url(&server_config)?;
     let bearer = local_server_bearer_token(&server_config);
 
     let (tool_name, command_label, arguments) = match action {
@@ -22350,7 +22822,7 @@ async fn try_proxy_contact_handshake(
 ) -> CliResult<Option<serde_json::Value>> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
-    let server_url = local_server_url(&server_config);
+    let server_url = local_server_url(&server_config)?;
     let bearer = local_server_bearer_token(&server_config);
 
     let mut arguments = serde_json::Map::new();
@@ -22407,6 +22879,10 @@ async fn try_proxy_contact_handshake(
 // Beads integration
 // ---------------------------------------------------------------------------
 
+fn is_beads_dir_name(name: &std::ffi::OsStr) -> bool {
+    name == ".beads" || name == "_beads"
+}
+
 fn resolve_beads_dir(path: Option<&Path>) -> CliResult<PathBuf> {
     let start = match path {
         Some(p) => p.to_path_buf(),
@@ -22418,11 +22894,7 @@ fn resolve_beads_dir(path: Option<&Path>) -> CliResult<PathBuf> {
     // workspace, not ancestor discovery. Validate without following arbitrary
     // symlinks, and accept only a self-redirect so an explicit path cannot be
     // silently rebound to an unrelated workspace.
-    if path.is_some()
-        && start
-            .file_name()
-            .is_some_and(beads_rust::config::is_beads_dir_name)
-    {
+    if path.is_some() && start.file_name().is_some_and(is_beads_dir_name) {
         let absolute = if start.is_absolute() {
             start.clone()
         } else {
@@ -22437,10 +22909,7 @@ fn resolve_beads_dir(path: Option<&Path>) -> CliResult<PathBuf> {
                 absolute.display()
             ))
         })?;
-        if !canonical
-            .file_name()
-            .is_some_and(beads_rust::config::is_beads_dir_name)
-        {
+        if !canonical.file_name().is_some_and(is_beads_dir_name) {
             return Err(CliError::InvalidArgument(format!(
                 "explicit beads directory resolved to an invalid target: {}",
                 canonical.display()
@@ -22456,27 +22925,13 @@ fn resolve_beads_dir(path: Option<&Path>) -> CliResult<PathBuf> {
                 redirect_path.display()
             )));
         }
-        if let Some(redirect) =
-            beads_rust::config::routing::read_redirect(&canonical).map_err(|e| {
-                CliError::InvalidArgument(format!(
-                    "cannot read explicit beads redirect {}: {e}",
-                    redirect_path.display()
-                ))
-            })?
-        {
-            let redirect = std::fs::canonicalize(&redirect).map_err(|e| {
-                CliError::InvalidArgument(format!(
-                    "cannot resolve explicit beads redirect {}: {e}",
-                    redirect.display()
-                ))
-            })?;
-            if redirect != canonical {
-                return Err(CliError::InvalidArgument(format!(
-                    "explicit beads directory {} redirects to a different workspace {}; pass the target project path explicitly",
-                    canonical.display(),
-                    redirect.display()
-                )));
-            }
+        let selected = discover_beads_dir_via_cli(&canonical, Some(&canonical))?;
+        if selected != canonical {
+            return Err(CliError::InvalidArgument(format!(
+                "explicit beads directory {} redirects to a different workspace {}; pass the target project path explicitly",
+                canonical.display(),
+                selected.display()
+            )));
         }
         return Ok(canonical);
     }
@@ -22513,25 +22968,11 @@ fn resolve_beads_dir(path: Option<&Path>) -> CliResult<PathBuf> {
         )));
     }
 
-    let beads_dir = beads_rust::config::discover_beads_dir(Some(&start)).map_err(|e| {
-        CliError::InvalidArgument(format!(
-            "no beads directory found from {}: {e}",
-            start.display()
-        ))
-    })?;
-    std::fs::canonicalize(&beads_dir).map_err(|e| {
-        CliError::InvalidArgument(format!(
-            "cannot resolve beads directory {}: {e}",
-            beads_dir.display()
-        ))
-    })
+    discover_beads_dir_via_cli(&start, None)
 }
 
 fn beads_project_dir(beads_dir: &Path) -> PathBuf {
-    if beads_dir
-        .file_name()
-        .is_some_and(beads_rust::config::is_beads_dir_name)
-    {
+    if beads_dir.file_name().is_some_and(is_beads_dir_name) {
         beads_dir
             .parent()
             .map(Path::to_path_buf)
@@ -22554,19 +22995,11 @@ fn br_cli_path() -> PathBuf {
     PathBuf::from("br")
 }
 
-fn br_json_command(beads_dir: &Path, args: &[String]) -> Result<std::process::Command, String> {
-    let beads_dir_utf8 = beads_dir.to_str().ok_or_else(|| {
-        format!(
-            "cannot pin br to non-UTF-8 beads directory {}; Beads currently reads BEADS_DIR as UTF-8",
-            beads_dir.display()
-        )
-    })?;
-    let project_dir = beads_project_dir(beads_dir);
+fn br_base_command(working_dir: &Path) -> std::process::Command {
     let mut command = std::process::Command::new(br_cli_path());
     command
-        .current_dir(project_dir)
+        .current_dir(working_dir)
         .env("RUST_LOG", "error")
-        .env("BEADS_DIR", beads_dir_utf8)
         .env_remove("BEADS_DB")
         .env_remove("BD_DB")
         .env_remove("BD_DATABASE")
@@ -22577,13 +23010,28 @@ fn br_json_command(beads_dir: &Path, args: &[String]) -> Result<std::process::Co
             "--allow-stale",
             "--no-auto-import",
             "--no-auto-flush",
-        ])
-        .args(args);
+        ]);
+    command
+}
+
+fn br_json_command(beads_dir: &Path, args: &[String]) -> Result<std::process::Command, String> {
+    let beads_dir_utf8 = beads_dir.to_str().ok_or_else(|| {
+        format!(
+            "cannot pin br to non-UTF-8 beads directory {}; Beads currently reads BEADS_DIR as UTF-8",
+            beads_dir.display()
+        )
+    })?;
+    let mut command = br_base_command(&beads_project_dir(beads_dir));
+    command.env("BEADS_DIR", beads_dir_utf8).args(args);
     Ok(command)
 }
 
 fn run_br_json(beads_dir: &Path, args: &[String]) -> Result<serde_json::Value, String> {
-    let output = br_json_command(beads_dir, args)?
+    br_command_json(br_json_command(beads_dir, args)?)
+}
+
+fn br_command_json(mut command: std::process::Command) -> Result<serde_json::Value, String> {
+    let output = command
         .output()
         .map_err(|e| format!("failed to execute br: {e}"))?;
 
@@ -22603,6 +23051,58 @@ fn run_br_json(beads_dir: &Path, args: &[String]) -> Result<serde_json::Value, S
     serde_json::from_slice(&output.stdout).map_err(|e| {
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         format!("failed to parse br JSON output: {e}; output={stdout}")
+    })
+}
+
+fn discover_beads_dir_via_cli(start: &Path, pinned: Option<&Path>) -> CliResult<PathBuf> {
+    // `where` can inspect SQLite to infer a prefix, even with --no-db. Config
+    // paths need only directory/config metadata and use the same discovery and
+    // redirect rules as the installed CLI that handles every subsequent query.
+    let args = ["--no-db", "config", "path"].map(str::to_string);
+    let working_dir = pinned.map_or_else(|| start.to_path_buf(), beads_project_dir);
+    let result = (|| -> Result<PathBuf, String> {
+        let command = if let Some(beads_dir) = pinned {
+            br_json_command(beads_dir, &args)?
+        } else {
+            let mut command = br_base_command(&working_dir);
+            command.args(&args);
+            command
+        };
+        let value = br_command_json(command)?;
+        let config_path = match value.get("project_config") {
+            Some(serde_json::Value::String(path)) => path.as_str(),
+            Some(serde_json::Value::Null) => {
+                return Err(
+                    "no beads directory found; run br init in the project directory".to_string(),
+                );
+            }
+            _ => return Err("br reported no project config path".to_string()),
+        };
+        // br prints paths with Path::display(), which loses invalid UTF-8.
+        // Implicit discovery cannot distinguish that spelling from a different
+        // real workspace. Exact mode can verify even a literal U+FFFD name
+        // against the caller's canonical path before any data query.
+        if pinned.is_none() && config_path.contains('\u{fffd}') {
+            return Err(
+                "br reported a replacement character in its config path; pass an explicit UTF-8 project path so its identity can be verified"
+                    .to_string(),
+            );
+        }
+        let beads_dir = Path::new(config_path)
+            .parent()
+            .ok_or_else(|| "br reported no project config directory".to_string())?;
+        std::fs::canonicalize(working_dir.join(beads_dir)).map_err(|error| {
+            format!(
+                "cannot resolve beads directory {}: {error}",
+                beads_dir.display()
+            )
+        })
+    })();
+    result.map_err(|error| {
+        CliError::InvalidArgument(format!(
+            "cannot discover beads directory from {}: {error}",
+            start.display()
+        ))
     })
 }
 
@@ -22824,6 +23324,12 @@ fn handle_beads_show(
         .map_err(|e| CliError::Other(format!("br query failed: {e}")))?;
 
     output::emit_output(&issue, fmt, || {
+        // `br show <id>` returns a one-element array. Keep that complete wire
+        // value for JSON/TOON, but render the issue itself in the table view.
+        let issue = issue
+            .as_array()
+            .and_then(|items| items.first())
+            .unwrap_or(&issue);
         output::section(&format!(
             "{}: {}",
             issue.get("id").and_then(|v| v.as_str()).unwrap_or(&id),
@@ -23139,10 +23645,33 @@ fn migrate_format_needs_conversion_attempt(
     format.needs_migration() || migrate_format_requires_force(format)
 }
 
-fn ensure_sidecarless_sqlite_family_offline_for_format_detection(
+#[cfg(test)]
+type MigrationFormatReadObserver = Box<dyn FnMut(&Path, &'static str)>;
+
+#[cfg(test)]
+thread_local! {
+    static MIGRATION_FORMAT_READ_OBSERVER: std::cell::RefCell<Option<MigrationFormatReadObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn observe_migration_format_read(path: &Path, phase: &'static str) {
+    MIGRATION_FORMAT_READ_OBSERVER.with(|cell| {
+        if let Some(observer) = cell.borrow_mut().as_mut() {
+            observer(path, phase);
+        }
+    });
+}
+
+/// Retain the runtime's exclusive admission while a sidecarless database is
+/// read by canonical SQLite. A preflight alone cannot keep a server from
+/// entering between the ownership check and the first format query.
+/// Bare engine opens do not consult this cooperative activity authority;
+/// excluding them still requires a separate namespace reservation.
+fn acquire_migration_format_detection_locks(
     db_path: &Path,
     database_url: &str,
-) -> CliResult<()> {
+) -> CliResult<Option<CliMailboxMutationLocks>> {
     let context = "migration format detection";
     let franken_admitted = mcp_agent_mail_db::pool::is_franken_admitted_family(db_path, context)
         .map_err(|error| {
@@ -23152,7 +23681,7 @@ fn ensure_sidecarless_sqlite_family_offline_for_format_detection(
             ))
         })?;
     if franken_admitted {
-        return Ok(());
+        return Ok(None);
     }
 
     let sqlite_activity_path = resolve_mailbox_activity_sqlite_path(database_url)?;
@@ -23228,7 +23757,29 @@ fn ensure_sidecarless_sqlite_family_offline_for_format_detection(
         )));
     }
 
-    Ok(())
+    // Acquire after the read-only refusals above, then retain these guards
+    // through the canonical connection's complete lifetime. Contending
+    // startup or repair that wins the check/acquire race is refused here.
+    let storage_root_lock =
+        if should_lock_mailbox_storage_root(&sqlite_activity_path, &storage_root, None)
+            || should_lock_mailbox_storage_root(db_path, &storage_root, None)
+        {
+            acquire_doctor_mailbox_activity_lock_for_storage_root(&storage_root, false)?
+        } else {
+            None
+        };
+    // Lock the already selected source. Re-resolving DATABASE_URL here could
+    // choose a different legacy absolute fallback from the file being read.
+    let selected_path = if db_path.is_absolute() {
+        db_path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(db_path)
+    };
+    let sqlite_lock = acquire_doctor_mailbox_activity_lock_for_sqlite_path(&selected_path, false)?;
+    Ok(Some(CliMailboxMutationLocks {
+        _storage_root_lock: storage_root_lock,
+        _sqlite_lock: sqlite_lock,
+    }))
 }
 
 fn handle_migrate_cmd(
@@ -23265,8 +23816,8 @@ fn handle_migrate_cmd(
         return Ok(());
     }
 
-    let mut resolved_path = resolve_sqlite_runtime_path(&path);
-    let mut db_path = PathBuf::from(&resolved_path);
+    let resolved_path = resolve_sqlite_runtime_path(&path);
+    let db_path = PathBuf::from(&resolved_path);
     if !db_path.exists() {
         if !check {
             return handle_migrate_with_database_url(&cfg.database_url);
@@ -23276,11 +23827,36 @@ fn handle_migrate_cmd(
         return Ok(());
     }
 
-    ensure_sidecarless_sqlite_family_offline_for_format_detection(&db_path, &cfg.database_url)?;
-    let (format_conn, opened_path) =
-        open_live_sqlite_read_only(&resolved_path, "migration format detection")?;
-    resolved_path = opened_path;
-    db_path = PathBuf::from(&resolved_path);
+    let format_detection_locks =
+        acquire_migration_format_detection_locks(&db_path, &cfg.database_url)?;
+    #[cfg(test)]
+    observe_migration_format_read(&db_path, "before_open");
+    // Keep the engine chosen by admission. If the namespace appears or
+    // disappears before this open, the bound opener refuses; a live
+    // Franken read must never silently fall back to an unlocked canonical
+    // read merely because its namespace disappeared.
+    let context = "migration format detection";
+    let format_conn = if format_detection_locks.is_some() {
+        mcp_agent_mail_db::pool::open_guarded_read_only_canonical_sqlite_file(&db_path, context)
+            .map(mcp_agent_mail_db::pool::GuardedReadOnlyConn::Canonical)
+    } else {
+        mcp_agent_mail_db::pool::open_guarded_read_only_franken_existing_file(&db_path, context)
+            .map(mcp_agent_mail_db::pool::GuardedReadOnlyConn::Franken)
+    }
+    .map_err(|error| {
+        CliError::Other(format!(
+            "{context}: cannot open DB at {resolved_path} read-only: {error}"
+        ))
+    })?;
+    format_conn
+        .execute_raw("PRAGMA busy_timeout = 20000;")
+        .map_err(|error| {
+            CliError::Other(format!(
+                "{context}: cannot configure DB at {resolved_path} read-only: {error}"
+            ))
+        })?;
+    #[cfg(test)]
+    observe_migration_format_read(&db_path, "read_open");
     let format = migrate::detect_timestamp_format(&format_conn)
         .map_err(|e| CliError::Other(format!("format detection failed: {e}")))?;
     drop(format_conn);
@@ -23314,7 +23890,12 @@ fn handle_migrate_cmd(
         ));
     }
 
-    let _mailbox_mutation_locks = acquire_cli_mailbox_mutation_locks(&cfg.database_url, None)?;
+    // Sidecarless detection already owns this admission. Keep it through
+    // migration instead of releasing/reacquiring or contending with ourselves.
+    let _mailbox_mutation_locks = match format_detection_locks {
+        Some(locks) => locks,
+        None => acquire_cli_mailbox_mutation_locks(&cfg.database_url, None)?,
+    };
 
     // Create a pristine backup before schema migration whenever conversion may be attempted.
     let mut backup_path = if needs_conversion_attempt {
@@ -24955,7 +25536,11 @@ fn extract_zip(archive_data: &[u8], dest_dir: &Path) -> Result<(), String> {
         let Some(enclosed_name) = file.enclosed_name() else {
             continue;
         };
-        let name = file.name().to_string(); // Keep original name for executable checks
+        // Keep original name for executable checks
+        let name = file
+            .name()
+            .map_err(|e| format!("zip entry name error: {e}"))?
+            .into_owned();
         let outpath = dest_dir.join(enclosed_name);
         if file.is_dir() {
             std::fs::create_dir_all(&outpath)
@@ -26402,16 +26987,42 @@ struct BenchRunFailure {
 #[derive(Debug, Serialize)]
 struct BenchRunReport {
     summary: bench::BenchSummary,
+    timings: std::collections::BTreeMap<String, bench::TimingResult>,
     profile: bench::BenchProfile,
     warmup: u32,
     runs: u32,
     filter: Option<String>,
     baseline_path: Option<String>,
     save_baseline_path: Option<String>,
+    baseline_saved: bool,
     seed_report: Option<bench::BenchSeedReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seeded_database_route: Option<&'static str>,
     skipped: Vec<String>,
     failures: Vec<BenchRunFailure>,
     regression_count: usize,
+}
+
+fn write_bench_report(results_dir: &Path, timestamp: &str, encoded: &str) -> CliResult<PathBuf> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::fs::create_dir_all(results_dir)
+        .map_err(|err| CliError::Other(format!("failed to create benches/results: {err}")))?;
+    let report_path = results_dir.join(format!(
+        "summary_{}_{}_{}.json",
+        timestamp,
+        std::process::id(),
+        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    // Separate processes and repeated calls in one process retain distinct
+    // reports. Exclusive creation also preserves existing files on collision.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&report_path)
+        .map_err(|err| CliError::Other(format!("failed to create bench report: {err}")))?;
+    std::io::Write::write_all(&mut file, encoded.as_bytes())
+        .map_err(|err| CliError::Other(format!("failed to write bench report: {err}")))?;
+    Ok(report_path)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -26508,12 +27119,39 @@ fn handle_bench(
 
     let cwd = std::env::current_dir()
         .map_err(|err| CliError::Other(format!("failed to read current directory: {err}")))?;
+    let needs_seeded_db = configs.iter().any(|cfg| cfg.requires_seeded_db);
+    let condition_context = bench::BenchConditionContext {
+        stub_encoder_available: cwd.join("scripts/toon_stub_encoder.sh").is_file(),
+        seeded_database_available: needs_seeded_db,
+    };
+    let baseline_data = baseline
+        .as_ref()
+        .map(|path| {
+            bench::load_baseline(path)
+                .map_err(|err| CliError::Other(format!("failed to load baseline: {err}")))
+        })
+        .transpose()?;
+    // Admit the comparison before seeding or running any command. A missing
+    // reference must never look like a passing comparison and replace itself.
+    for cfg in &configs {
+        cfg.validate().map_err(|err| {
+            CliError::Other(format!("invalid benchmark config '{}': {err}", cfg.name))
+        })?;
+        if cfg.enabled_for(condition_context)
+            && let Some(data) = &baseline_data
+            && !data.contains_key(&cfg.name)
+        {
+            return Err(CliError::InvalidArgument(format!(
+                "baseline has no entry for enabled benchmark '{}'",
+                cfg.name
+            )));
+        }
+    }
     let executable = std::env::current_exe()
         .map_err(|err| CliError::Other(format!("failed to resolve current executable: {err}")))?;
     let executable = executable.to_string_lossy().into_owned();
     let hardware = bench::HardwareInfo::detect();
 
-    let needs_seeded_db = configs.iter().any(|cfg| cfg.requires_seeded_db);
     let mut bench_env = std::collections::BTreeMap::new();
     let mut seed_report = None;
     let mut temp_workspace: Option<tempfile::TempDir> = None;
@@ -26540,7 +27178,8 @@ fn handle_bench(
             CliError::Other(format!("failed to create bench archive root: {err}"))
         })?;
         let database_url = format!("sqlite:///{}", db_path.display());
-        let conn = open_db_sync_with_database_url(&database_url)?;
+        let conn =
+            open_db_sync_with_database_url_and_storage_root(&database_url, Some(&storage_root))?;
         let report = bench::seed_bench_database(&conn, false)
             .map_err(|err| CliError::Other(format!("benchmark seed failed: {err}")))?;
         bench_env.insert("DATABASE_URL".to_string(), database_url);
@@ -26551,17 +27190,11 @@ fn handle_bench(
         seed_report = Some(report);
     }
 
-    let condition_context = bench::BenchConditionContext {
-        stub_encoder_available: cwd.join("scripts/toon_stub_encoder.sh").is_file(),
-        seeded_database_available: needs_seeded_db,
-    };
     let mut summary = bench::BenchSummary::new(hardware.clone());
+    let mut timings = std::collections::BTreeMap::new();
     let mut skipped = Vec::new();
     let mut failures = Vec::new();
     for cfg in &configs {
-        cfg.validate().map_err(|err| {
-            CliError::Other(format!("invalid benchmark config '{}': {err}", cfg.name))
-        })?;
         if !cfg.enabled_for(condition_context) {
             skipped.push(cfg.name.clone());
             continue;
@@ -26569,54 +27202,66 @@ fn handle_bench(
         let mut command = vec![executable.clone()];
         command.extend(cfg.command.iter().cloned());
         let command_display = command.join(" ");
+        let mut benchmark_env = bench_env.clone();
+        benchmark_env.extend(cfg.env.clone());
+        if cfg.requires_seeded_db {
+            // Use the CLI's existing no-server route for this private fixture.
+            // Inherited endpoints would otherwise select a different mailbox;
+            // the ordinary local-path ownership checks still apply.
+            benchmark_env.insert("HTTP_HOST".into(), "127.0.0.1".into());
+            benchmark_env.insert("HTTP_PORT".into(), NO_SERVER_PORT.to_string());
+            benchmark_env.insert(
+                "AGENT_MAIL_URL".into(),
+                local_server_url_from_parts("127.0.0.1", NO_SERVER_PORT, "/mcp/"),
+            );
+        }
         let params_json = serde_json::json!({
             "warmup": cfg.warmup,
             "runs": cfg.runs,
             "requires_seeded_db": cfg.requires_seeded_db,
             "conditional": cfg.conditional,
             "env": cfg.env,
+            "seeded_database_route": cfg.requires_seeded_db.then_some("local"),
         })
         .to_string();
         let signature =
             bench::fixture_signature(&cfg.name, &command_display, &params_json, &hardware);
-        let mut benchmark_env = bench_env.clone();
-        benchmark_env.extend(cfg.env.clone());
         match bench::run_timed(&command, cfg.warmup, cfg.runs, &benchmark_env, Some(&cwd)) {
-            Ok(timing) => match bench::BenchResult::from_samples(
-                cfg.name.clone(),
-                command_display,
-                &timing.samples_seconds,
-                signature,
-                None,
-            ) {
-                Ok(result) => summary.insert(result),
-                Err(err) => failures.push(BenchRunFailure {
+            Ok(timing) => {
+                match bench::BenchResult::from_timing(
+                    cfg.name.clone(),
+                    command_display,
+                    &timing,
+                    signature,
+                ) {
+                    Ok(result) => summary.insert(result),
+                    Err(err) => failures.push(BenchRunFailure {
+                        name: cfg.name.clone(),
+                        command: command.join(" "),
+                        error: err.to_string(),
+                    }),
+                }
+                timings.insert(cfg.name.clone(), timing);
+            }
+            Err(err) => {
+                let error = err.to_string();
+                if let bench::BenchTimingError::NoSuccessfulMeasurementRuns { timing, .. } = err {
+                    timings.insert(cfg.name.clone(), *timing);
+                }
+                failures.push(BenchRunFailure {
                     name: cfg.name.clone(),
                     command: command.join(" "),
-                    error: err.to_string(),
-                }),
-            },
-            Err(err) => failures.push(BenchRunFailure {
-                name: cfg.name.clone(),
-                command: command.join(" "),
-                error: err.to_string(),
-            }),
+                    error,
+                });
+            }
         }
     }
-    if summary.benchmarks.is_empty() {
+    if summary.benchmarks.is_empty() && failures.is_empty() {
         return Err(CliError::Other(
             "no benchmarks completed successfully; check failure diagnostics".to_string(),
         ));
     }
 
-    let baseline_data = if let Some(path) = baseline.as_ref() {
-        Some(
-            bench::load_baseline(path)
-                .map_err(|err| CliError::Other(format!("failed to load baseline: {err}")))?,
-        )
-    } else {
-        None
-    };
     if let Some(data) = baseline_data.as_ref() {
         bench::apply_baseline_comparison(
             &mut summary.benchmarks,
@@ -26624,38 +27269,46 @@ fn handle_bench(
             BENCH_DEFAULT_REGRESSION_THRESHOLD,
         );
     }
-    if let Some(path) = save_baseline.as_ref() {
-        bench::save_baseline(&summary.benchmarks, path)
-            .map_err(|err| CliError::Other(format!("failed to save baseline: {err}")))?;
-    }
-
     let regression_count = summary
         .benchmarks
         .values()
         .filter(|result| result.baseline.regression)
         .count();
+    let baseline_saved = if let Some(path) = save_baseline
+        .as_ref()
+        .filter(|_| failures.is_empty() && regression_count == 0)
+    {
+        bench::save_baseline(&summary.benchmarks, path)
+            .map_err(|err| CliError::Other(format!("failed to save baseline: {err}")))?;
+        true
+    } else {
+        false
+    };
+
     let report = BenchRunReport {
         summary,
+        timings,
         profile,
         warmup,
         runs,
         filter: filter.clone(),
         baseline_path: baseline.map(|path| path.to_string_lossy().into_owned()),
         save_baseline_path: save_baseline.map(|path| path.to_string_lossy().into_owned()),
+        baseline_saved,
         seed_report,
+        seeded_database_route: needs_seeded_db.then_some("local"),
         skipped,
         failures,
         regression_count,
     };
 
-    let results_dir = PathBuf::from("benches/results");
-    std::fs::create_dir_all(&results_dir)
-        .map_err(|err| CliError::Other(format!("failed to create benches/results: {err}")))?;
-    let report_path = results_dir.join(format!("summary_{}.json", report.summary.timestamp));
     let encoded = serde_json::to_string_pretty(&report)
         .map_err(|err| CliError::Other(format!("failed to encode bench report: {err}")))?;
-    std::fs::write(&report_path, &encoded)
-        .map_err(|err| CliError::Other(format!("failed to write bench report: {err}")))?;
+    let report_path = write_bench_report(
+        Path::new("benches/results"),
+        &report.summary.timestamp,
+        &encoded,
+    )?;
 
     output::emit_output(&report, fmt, || {
         ftui_runtime::ftui_println!(
@@ -26664,6 +27317,9 @@ fn handle_bench(
             report.warmup,
             report.runs
         );
+        if let Some(route) = report.seeded_database_route {
+            ftui_runtime::ftui_println!("seeded fixture route: {route}");
+        }
         ftui_runtime::ftui_println!(
             "{:<18} {:>9} {:>9} {:>9} {:>12}",
             "Benchmark",
@@ -27336,11 +27992,12 @@ fn resolve_deploy_tooling_repo_root(bundle_dir: &Path) -> CliResult<PathBuf> {
 fn git_common_dir(path: &Path) -> Option<PathBuf> {
     let value = git_output_text(path, &["rev-parse", "--git-common-dir"])?;
     let common = PathBuf::from(value);
+    // Git prints a relative common dir against the directory it ran in
+    // (`../.git` from a subdirectory), not against the repository root.
     let resolved = if common.is_absolute() {
         common
     } else {
-        let root = git_repo_root(path).unwrap_or_else(|| path.to_path_buf());
-        root.join(common)
+        path.join(common)
     };
     std::fs::canonicalize(&resolved).ok().or(Some(resolved))
 }
@@ -27668,37 +28325,25 @@ fn handle_projects_adopt_with_conn(
     );
 
     if !same_repo {
+        // GH#366: a refused plan is not an executable plan. Mark it next to
+        // the plan and exit nonzero, so a script cannot read a refusal as a
+        // planned or applied move.
+        ftui_runtime::ftui_println!("- Plan status: refused; nothing was changed");
         ftui_runtime::ftui_eprintln!(
             "Refusing to adopt: projects do not appear to belong to the same repository."
         );
-        return Ok(());
+        if source_common.is_none() || target_common.is_none() {
+            ftui_runtime::ftui_eprintln!(
+                "adopt only merges projects whose keys are checkouts of one Git repository \
+                 (same git-common-dir). A project key outside a Git repository cannot be \
+                 re-keyed; keep using its existing key."
+            );
+        }
+        return Err(CliError::ExitCode(1));
     }
 
-    // Safety contract: adoption is dry-run by default; --apply is required to mutate.
-    let effective_dry_run = !apply;
-    if effective_dry_run {
-        return Ok(());
-    }
-
-    let aliases_path = target_archive.join("aliases.json");
-    let mut alias_doc = load_project_alias_doc_for_update(&aliases_path)?;
-    let mut former_slugs: std::collections::BTreeSet<String> = alias_doc
-        .get("former_slugs")
-        .and_then(|value| value.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|value| value.as_str().map(ToString::to_string))
-                .collect::<std::collections::BTreeSet<_>>()
-        })
-        .unwrap_or_default();
-    former_slugs.insert(source_project.slug.clone());
-    alias_doc["former_slugs"] = serde_json::Value::Array(
-        former_slugs
-            .into_iter()
-            .map(serde_json::Value::String)
-            .collect(),
-    );
-
+    // --apply refuses an agent name present in both projects, so the dry run
+    // must report that plan as refused rather than executable.
     let duplicate_agent_rows = conn
         .query_sync(
             "SELECT s.name AS name FROM agents s \
@@ -27720,6 +28365,7 @@ fn handle_projects_adopt_with_conn(
         }
     }
     if !duplicate_agent_names.is_empty() {
+        ftui_runtime::ftui_println!("- Plan status: refused; nothing was changed");
         return Err(CliError::InvalidArgument(format!(
             "agent name conflicts in target project: {}",
             duplicate_agent_names
@@ -27728,6 +28374,32 @@ fn handle_projects_adopt_with_conn(
                 .join(", ")
         )));
     }
+
+    // Safety contract: adoption is dry-run by default; --apply is required to mutate.
+    let effective_dry_run = !apply;
+    if effective_dry_run {
+        ftui_runtime::ftui_println!("- Plan status: executable; rerun with --apply to perform it");
+        return Ok(());
+    }
+
+    let aliases_path = target_archive.join("aliases.json");
+    let mut alias_doc = load_project_alias_doc_for_update(&aliases_path)?;
+    let mut former_slugs: std::collections::BTreeSet<String> = alias_doc
+        .get("former_slugs")
+        .and_then(|value| value.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|value| value.as_str().map(ToString::to_string))
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    former_slugs.insert(source_project.slug.clone());
+    alias_doc["former_slugs"] = serde_json::Value::Array(
+        former_slugs
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect(),
+    );
 
     std::fs::create_dir_all(&source_archive)?;
     std::fs::create_dir_all(&target_archive)?;
@@ -32784,45 +33456,31 @@ fn probe_local_jsonrpc_health(
 
 pub(crate) fn probe_local_jsonrpc_health_with_latency(
     config: &Config,
-) -> Option<(serde_json::Value, f64)> {
-    let urls = check_inbox_server_urls(&config.http_host, config.http_port, &config.http_path);
-    if urls.is_empty() {
-        return None;
-    }
-    let bearer = local_server_bearer_token(config);
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": "doctor-health-check",
-        "method": "tools/call",
-        "params": {
-            "name": "health_check",
-            "arguments": {},
-        }
-    });
-
+) -> CliResult<Option<(serde_json::Value, f64)>> {
     context::run_async(async {
-        for url in &urls {
-            let start = std::time::Instant::now();
-            let response = post_jsonrpc_request(
-                url,
-                bearer.as_deref(),
-                &request,
+        let Some(session) =
+            reservation_read::ServerResourceSession::for_local_mailbox(config).await?
+        else {
+            return Ok(None);
+        };
+        let start = std::time::Instant::now();
+        let payload = session
+            .call_tool_with_timeout(
+                "health_check",
+                serde_json::json!({}),
                 DOCTOR_RUNTIME_JSONRPC_TIMEOUT_SECS,
             )
-            .await;
-            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-            if let Ok(payload) = response
-                && parse_jsonrpc_error(&payload).is_none()
-                && let Some(result_payload) = payload.get("result").cloned()
-                && let Some(parsed) = coerce_tool_result_json(result_payload)
-            {
-                return Ok(Some((parsed, elapsed_ms)));
-            }
+            .await?;
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        if !reservation_read::mailbox_config_matches(&payload, config)? {
+            return Err(CliError::Other(
+                "server health response names a different mailbox; refusing unverified health"
+                    .to_string(),
+            ));
         }
-        Ok(None)
+        session.verify_local_mailbox(config).await?;
+        Ok(Some((payload, elapsed_ms)))
     })
-    .ok()
-    .flatten()
 }
 
 fn sample_agent_mail_process_cpu(pids: &[u32]) -> (Vec<DoctorProcessSample>, Option<String>) {
@@ -39410,6 +40068,24 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
 
 fn handle_mail(action: MailCommand) -> CliResult<()> {
     match action {
+        MailCommand::Count {
+            project_key,
+            format,
+            json,
+        } => {
+            let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+            let config = Config::from_env();
+            let opened = open_db_sync_canonical_read_with_database_url(
+                &cfg.database_url,
+                Some(&config.storage_root),
+                "mail count",
+            )?;
+            handle_mail_count_sync(
+                opened.conn(),
+                &project_key,
+                output::CliOutputFormat::resolve(format, json),
+            )
+        }
         MailCommand::Status { .. } => {
             let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
             let config = Config::from_env();
@@ -39422,6 +40098,34 @@ fn handle_mail(action: MailCommand) -> CliResult<()> {
         }
         _ => context::run_async(async move { handle_mail_async(action).await }),
     }
+}
+
+fn handle_mail_count_sync(
+    conn: &impl mcp_agent_mail_db::pool::SyncQuery,
+    project_key: &str,
+    format: output::CliOutputFormat,
+) -> CliResult<()> {
+    let project = crate::context::resolve_project(conn, project_key)?;
+    let rows = conn
+        .query_sync(
+            "SELECT COUNT(*) AS cnt FROM messages WHERE project_id = ?",
+            &[sqlmodel_core::Value::BigInt(project.id)],
+        )
+        .map_err(|error| CliError::Other(format!("message count query failed: {error}")))?;
+    let count: i64 = rows
+        .first()
+        .ok_or_else(|| CliError::Other("message count query returned no row".into()))?
+        .get_named("cnt")
+        .map_err(|error| CliError::Other(format!("invalid message count: {error}")))?;
+    if count < 0 {
+        return Err(CliError::Other("message count must not be negative".into()));
+    }
+    let data = serde_json::json!({"project": project.slug, "count": count});
+    output::emit_output(&data, format, || {
+        output::kv("Project", &project.slug);
+        output::kv("Messages", &count.to_string());
+    });
+    Ok(())
 }
 
 fn archive_mail_status_counts(storage_root: &Path, slug: &str) -> Option<(i64, i64)> {
@@ -40242,11 +40946,13 @@ fn write_pending_send_receipt(
 async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
-    let server_url = local_server_url(&server_config);
+    let server_url = local_server_url(&server_config)?;
     let bearer = local_server_bearer_token(&server_config);
 
     match action {
-        MailCommand::Status { .. } => unreachable!("handled in sync path"),
+        MailCommand::Status { .. } | MailCommand::Count { .. } => {
+            unreachable!("handled in sync path")
+        }
 
         MailCommand::Send {
             project_key,
@@ -40971,7 +41677,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             // its worst-case fallback) snapshot + migrate + rebuild a fresh
             // Tantivy index for a single query, which scales with mailbox
             // size, not answer size.
-            let server_url = local_server_url(&server_config);
+            let server_url = local_server_url(&server_config)?;
             let bearer = local_server_bearer_token(&server_config);
             match try_call_server_tool(
                 &server_url,
@@ -41466,9 +42172,9 @@ fn normalize_cli_macro_agent_name_value(name: &str) -> CliResult<String> {
     let message = mcp_agent_mail_core::models::detect_agent_name_mistake(name).map_or_else(
         || {
             format!(
-                "Invalid agent name format: '{name}'. Agent names MUST be randomly generated \
-                     adjective+noun combinations (e.g., 'GreenLake', 'BlueDog'), NOT descriptive \
-                     names. Omit --agent-name to auto-generate a valid name."
+                "Invalid agent name format: '{name}'. Use an adjective+noun name \
+                     (e.g., 'GreenLake') or a safe task identifier (e.g., 'app-x-refactor', \
+                     'worker_42'). Omit --agent-name to auto-generate a valid name."
             )
         },
         |(_, message)| message,
@@ -41575,7 +42281,7 @@ fn handle_agents(action: AgentsCommand) -> CliResult<()> {
 
 async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
-    let server_url = local_server_url(&server_config);
+    let server_url = local_server_url(&server_config)?;
     let bearer = local_server_bearer_token(&server_config);
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
 
@@ -42810,7 +43516,7 @@ fn handle_macros(action: MacroCommand) -> CliResult<()> {
 #[allow(clippy::too_many_lines)]
 async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
-    let server_url = local_server_url(&server_config);
+    let server_url = local_server_url(&server_config)?;
     let bearer = local_server_bearer_token(&server_config);
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
 
@@ -48928,6 +49634,362 @@ Environment="HTTP_BEARER_TOKEN=tok&en with spaces"
         );
     }
 
+    fn endpoint_for(discovery: &OwnerDiscovery, default_root: bool) -> CliResult<(String, u16)> {
+        endpoint_without_owner(discovery, default_root, ("127.0.0.1".to_string(), 8765))
+    }
+
+    fn unresolved_owner(pid: Option<u32>) -> OwnerDiscovery {
+        OwnerDiscovery::Unresolved {
+            pid,
+            detail: "another Agent Mail process already owns the mailbox".to_string(),
+        }
+    }
+
+    #[test]
+    fn default_mailbox_keeps_the_default_endpoint_only_when_unowned() {
+        assert_eq!(
+            endpoint_for(&OwnerDiscovery::Unowned, true).unwrap(),
+            ("127.0.0.1".to_string(), 8765)
+        );
+        for discovery in [unresolved_owner(None), unresolved_owner(Some(7))] {
+            let refused = endpoint_for(&discovery, true).unwrap_err().to_string();
+            assert!(refused.contains("could not be confirmed"), "{refused}");
+            assert!(refused.contains("HTTP_PORT"), "{refused}");
+            assert!(refused.contains("owner PID"), "{refused}");
+        }
+    }
+
+    #[test]
+    fn other_mailboxes_never_guess_the_default_endpoint() {
+        assert_eq!(
+            endpoint_for(&OwnerDiscovery::Unowned, false).unwrap(),
+            ("127.0.0.1".to_string(), NO_SERVER_PORT)
+        );
+        for discovery in [unresolved_owner(None), unresolved_owner(Some(7))] {
+            let refused = endpoint_for(&discovery, false).unwrap_err();
+            assert!(
+                refused.to_string().contains("nothing was sent to"),
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_confirmed_listener_wins_for_every_mailbox() {
+        let listener = OwnerDiscovery::Listener("127.0.0.1".to_string(), 9100);
+        for default_root in [true, false] {
+            assert_eq!(
+                endpoint_for(&listener, default_root).unwrap(),
+                ("127.0.0.1".to_string(), 9100)
+            );
+        }
+    }
+
+    fn proxy_mailbox_owner(
+        pid: u32,
+        command: Option<&str>,
+    ) -> mcp_agent_mail_db::pool::MailboxOwnershipState {
+        use mcp_agent_mail_db::pool::{
+            MailboxOwnershipDisposition, MailboxOwnershipProcess, MailboxOwnershipState,
+        };
+        MailboxOwnershipState {
+            disposition: MailboxOwnershipDisposition::ActiveOtherOwner,
+            storage_lock_path: String::new(),
+            sqlite_lock_path: String::new(),
+            processes: vec![MailboxOwnershipProcess {
+                pid,
+                command: command.map(str::to_string),
+                executable_path: None,
+                executable_deleted: false,
+                holds_storage_root_lock: true,
+                holds_sqlite_lock: true,
+                holds_exclusive_lock: true,
+                holds_database_file: true,
+            }],
+            competing_pids: vec![pid],
+            readers: Vec::new(),
+            supervised_restart_required: false,
+            detail: "owner command contains secret-from-owner-argv".to_string(),
+        }
+    }
+
+    #[test]
+    fn mailbox_owner_discovery_never_discards_an_owner_based_on_argv() {
+        for command in [
+            Some("/usr/local/bin/am serve-http --no-tui"),
+            Some("/usr/local/bin/mcp-agent-mail serve"),
+            Some("/usr/local/bin/am mail send"),
+            None,
+        ] {
+            let discovery = discover_mailbox_owner_with_probes(
+                &proxy_mailbox_owner(7, command),
+                |pid| {
+                    assert_eq!(pid, 7);
+                    None
+                },
+                || panic!("no listener to recheck"),
+            );
+            assert!(matches!(
+                discovery,
+                OwnerDiscovery::Unresolved { pid: Some(7), .. }
+            ));
+            for default_root in [true, false] {
+                let error = endpoint_for(&discovery, default_root)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("owner PID 7"), "{error}");
+                assert!(!error.contains("secret-from-owner-argv"), "{error}");
+                if let Some(command) = command {
+                    assert!(!error.contains(command), "{error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mailbox_owner_discovery_rejects_unresolvable_database_path() {
+        const CHILD_FLAG: &str = "AM_TEST_UNRESOLVABLE_MAILBOX_PATH_CHILD";
+        if std::env::var(CHILD_FLAG).is_ok_and(|value| value == "1") {
+            let roots = [
+                mcp_agent_mail_core::config::default_storage_root_path(),
+                std::env::current_dir().unwrap().join("private-mailbox"),
+            ];
+            for storage_root in roots {
+                for database_url in [
+                    "sqlite:///",
+                    "sqlite:///?fixture-token=credential-must-not-appear",
+                ] {
+                    let config = Config {
+                        database_url: database_url.to_string(),
+                        storage_root: storage_root.clone(),
+                        ..Config::default()
+                    };
+                    let error = local_server_host_port(&config)
+                        .expect_err("an unknown mailbox path must never mean unowned");
+                    assert!(!server_tool_error_is_unavailable(&error));
+                    let message = error.to_string();
+                    assert!(message.contains("nothing was sent to"), "{message}");
+                    assert!(message.contains("DATABASE_URL"), "{message}");
+                    assert!(message.contains("HTTP_PORT"), "{message}");
+                    assert!(!message.contains("credential-must-not-appear"), "{message}");
+                }
+            }
+            let explicit = Config {
+                database_url: "sqlite:///".to_string(),
+                http_port: 1,
+                ..Config::default()
+            };
+            assert_eq!(
+                local_server_host_port(&explicit).unwrap(),
+                (explicit.http_host.clone(), 1)
+            );
+            return;
+        }
+        // Clear ambient endpoint settings in a child rather than mutating this
+        // process's environment. This calls only the resolver, never HTTP.
+        let scratch = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "tests::mailbox_owner_discovery_rejects_unresolvable_database_path",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(CHILD_FLAG, "1")
+            .env("HOME", scratch.path())
+            .env("USERPROFILE", scratch.path())
+            .env("XDG_DATA_HOME", scratch.path().join("data"))
+            .current_dir(scratch.path());
+        for key in ["SYSTEMROOT", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                child.env(key, value);
+            }
+        }
+        let output = child.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("1 passed;"), "{stdout}\n{stderr}");
+    }
+
+    #[test]
+    fn mailbox_owner_discovery_requires_stable_owner_after_listener_lookup() {
+        let listener = ("127.0.0.1".to_string(), 9100);
+        assert_eq!(
+            discover_mailbox_owner_with_probes(
+                &proxy_mailbox_owner(7, None),
+                |pid| {
+                    assert_eq!(pid, 7);
+                    Some(listener.clone())
+                },
+                || proxy_mailbox_owner(7, None),
+            ),
+            OwnerDiscovery::Listener(listener.0.clone(), listener.1)
+        );
+        let changed = discover_mailbox_owner_with_probes(
+            &proxy_mailbox_owner(7, None),
+            |_| Some(listener.clone()),
+            || proxy_mailbox_owner(8, None),
+        );
+        assert!(matches!(
+            changed,
+            OwnerDiscovery::Unresolved { pid: Some(8), .. }
+        ));
+        let mut unowned = proxy_mailbox_owner(7, None);
+        unowned.disposition = mcp_agent_mail_db::pool::MailboxOwnershipDisposition::Unowned;
+        unowned.competing_pids.clear();
+        unowned.processes.clear();
+        let disappeared = discover_mailbox_owner_with_probes(
+            &proxy_mailbox_owner(7, None),
+            |_| Some(listener),
+            || unowned.clone(),
+        );
+        assert!(matches!(
+            disappeared,
+            OwnerDiscovery::Unresolved { pid: None, .. }
+        ));
+        assert_eq!(
+            discover_mailbox_owner_with_probes(
+                &unowned,
+                |_| panic!("unowned mailbox has no listener to discover"),
+                || panic!("unowned mailbox needs no recheck"),
+            ),
+            OwnerDiscovery::Unowned
+        );
+    }
+
+    #[test]
+    fn mailbox_owner_discovery_refuses_ambiguous_or_incomplete_ownership() {
+        use mcp_agent_mail_db::pool::MailboxOwnershipDisposition;
+        let mut split = proxy_mailbox_owner(7, None);
+        split.disposition = MailboxOwnershipDisposition::SplitBrain;
+        split.competing_pids.push(8);
+        let mut missing_storage_lock = proxy_mailbox_owner(7, None);
+        missing_storage_lock.processes[0].holds_storage_root_lock = false;
+        let mut missing_sqlite_lock = proxy_mailbox_owner(7, None);
+        missing_sqlite_lock.processes[0].holds_sqlite_lock = false;
+        let mut no_exclusive_lock = proxy_mailbox_owner(7, None);
+        no_exclusive_lock.processes[0].holds_exclusive_lock = false;
+        let mut unknown_pid = proxy_mailbox_owner(7, None);
+        unknown_pid.competing_pids.clear();
+        for ownership in [
+            split,
+            missing_storage_lock,
+            missing_sqlite_lock,
+            no_exclusive_lock,
+            unknown_pid,
+        ] {
+            let discovery = discover_mailbox_owner_with_probes(
+                &ownership,
+                |_| panic!("ambiguous ownership cannot authorize listener discovery"),
+                || panic!("unconfirmed ownership has no verified listener"),
+            );
+            assert!(matches!(discovery, OwnerDiscovery::Unresolved { .. }));
+            assert!(endpoint_for(&discovery, true).is_err());
+            assert!(endpoint_for(&discovery, false).is_err());
+        }
+    }
+
+    #[test]
+    fn unresolved_mailbox_owner_sends_no_request_or_bearer_to_recording_endpoint() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let payload = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"});
+        let payload_len = serde_json::to_vec(&payload).unwrap().len();
+        for (discovery, default_root, should_send) in [
+            (OwnerDiscovery::Unowned, true, true),
+            (unresolved_owner(None), true, false),
+            (unresolved_owner(Some(7)), true, false),
+            (unresolved_owner(None), false, false),
+            (unresolved_owner(Some(7)), false, false),
+        ] {
+            // Model the configured default using an ephemeral endpoint. Never
+            // bind or contact the actual shared mailbox's default port.
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let finished = AtomicBool::new(false);
+            let (result, recorded) = std::thread::scope(|scope| {
+                let recorder = scope.spawn(|| {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    loop {
+                        match listener.accept() {
+                            Ok((mut stream, _)) => {
+                                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                                stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                                let mut request = Vec::new();
+                                let mut buffer = [0_u8; 1024];
+                                loop {
+                                    let n = stream.read(&mut buffer).unwrap();
+                                    assert_ne!(n, 0, "client must send a complete request");
+                                    request.extend_from_slice(&buffer[..n]);
+                                    if find_http_header_end(&request)
+                                        .is_some_and(|end| request.len() >= end + payload_len)
+                                    {
+                                        break;
+                                    }
+                                }
+                                let body = br#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+                                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                                stream.write_all(body).unwrap();
+                                return Some(String::from_utf8(request).unwrap());
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                if finished.load(Ordering::Acquire) {
+                                    return None;
+                                }
+                                assert!(Instant::now() < deadline, "client did not finish");
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("recording listener failed: {error}"),
+                        }
+                    }
+                });
+                let result = endpoint_without_owner(
+                    &discovery,
+                    default_root,
+                    (addr.ip().to_string(), addr.port()),
+                )
+                .and_then(|(host, port)| {
+                    post_jsonrpc_request_blocking_http(
+                        &format!("http://{host}:{port}/mcp/"),
+                        Some("routing-regression-secret"),
+                        &payload,
+                        2,
+                    )
+                });
+                finished.store(true, Ordering::Release);
+                (result, recorder.join().unwrap())
+            });
+            if should_send {
+                assert_eq!(result.unwrap().unwrap().status, 200);
+                let request = recorded.expect("positive control must capture an actual request");
+                assert!(request.contains("POST /mcp/ HTTP/1.1"));
+                assert!(request.contains("Authorization: Bearer routing-regression-secret"));
+                assert!(request.contains("tools/list"));
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("nothing was sent to"), "{error}");
+                assert!(
+                    recorded.is_none(),
+                    "stray request leaked to default endpoint: {recorded:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_mailbox_root_is_recognised_under_another_spelling() {
+        let default = mcp_agent_mail_core::config::default_storage_root_path();
+        assert!(is_default_mailbox_root(&default));
+        let scratch = tempfile::tempdir().unwrap();
+        assert!(!is_default_mailbox_root(scratch.path()));
+    }
+
     #[test]
     fn check_inbox_rpc_config_does_not_alias_explicit_url_path() {
         let env: HashMap<String, String> = HashMap::from_iter([
@@ -52984,16 +54046,8 @@ http_headers = { Authorization = "Bearer secret" }
         let dir = tempfile::tempdir().expect("tempdir");
         let _cwd = CwdGuard::chdir(dir.path());
 
-        // Skip this test if 'am' is not in PATH, as handle_bench relies on invoking the CLI binary.
-        if std::process::Command::new("am")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            println!("Skipping handle_bench test because 'am' binary is not in PATH");
-            return;
-        }
-
+        // The handler invokes current_exe, not an installed am from PATH.
+        // In this unit test its help subprocess is this test executable.
         let capture = ftui_runtime::StdioCapture::install().expect("install capture");
 
         let result = handle_bench(
@@ -53028,6 +54082,136 @@ http_headers = { Authorization = "Bearer secret" }
             .filter_map(Result::ok)
             .count();
         assert_eq!(report_files, 1, "expected one quick bench report file");
+
+        let baseline_path = dir.path().join("baseline.json");
+        let regression_baseline = b"{\"help\":0.0}\n";
+        std::fs::write(&baseline_path, regression_baseline).expect("write regression baseline");
+        for (save_path, existed) in [
+            (baseline_path.clone(), true),
+            (dir.path().join("new-baseline.json"), false),
+        ] {
+            let result = handle_bench(
+                true,
+                None,
+                true,
+                Some(baseline_path.clone()),
+                Some(save_path.clone()),
+                Some("help".to_string()),
+                false,
+                None,
+                None,
+            );
+            let output = capture.drain_to_string();
+            assert!(
+                matches!(&result, Err(CliError::ExitCode(3))),
+                "regressing benchmark must fail: {result:?}"
+            );
+            let parsed: serde_json::Value =
+                serde_json::from_str(extract_json_block(&output).expect("regression report JSON"))
+                    .expect("valid regression report");
+            assert_eq!(parsed["regression_count"], 1);
+            assert_eq!(parsed["baseline_saved"], false);
+            assert!(
+                parsed["failures"]
+                    .as_array()
+                    .expect("failure list")
+                    .is_empty()
+            );
+            assert_eq!(
+                std::fs::read(&baseline_path).expect("preserved regression baseline"),
+                regression_baseline
+            );
+            assert_eq!(save_path.exists(), existed);
+        }
+
+        let passing_baseline = b"{\"help\":1000000000.0}\n";
+        std::fs::write(&baseline_path, passing_baseline).expect("write passing baseline");
+        let result = handle_bench(
+            true,
+            None,
+            true,
+            Some(baseline_path.clone()),
+            Some(baseline_path.clone()),
+            Some("help".to_string()),
+            false,
+            None,
+            None,
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "passing benchmark must save: {result:?}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(extract_json_block(&output).expect("passing report JSON"))
+                .expect("valid passing report");
+        assert_eq!(parsed["regression_count"], 0);
+        assert_eq!(parsed["baseline_saved"], true);
+        assert_ne!(
+            std::fs::read(&baseline_path).expect("updated passing baseline"),
+            passing_baseline
+        );
+        assert_eq!(
+            std::fs::read_dir(&report_dir)
+                .expect("read every benchmark report")
+                .filter_map(Result::ok)
+                .count(),
+            4,
+            "passing and regressing runs must each retain a report"
+        );
+
+        let separate_output = dir.path().join("preserved-output.json");
+        let output_sentinel = b"preserve the existing output baseline verbatim\n";
+        std::fs::write(&separate_output, output_sentinel).expect("plant output baseline");
+        for (missing_baseline, save_path) in [
+            ("{}\n", baseline_path.clone()),
+            ("{\"lint\":1000000000}\n", separate_output.clone()),
+        ] {
+            std::fs::write(&baseline_path, missing_baseline).expect("write uncovered baseline");
+            let result = handle_bench(
+                true,
+                None,
+                true,
+                Some(baseline_path.clone()),
+                Some(save_path),
+                Some("help".to_string()),
+                false,
+                None,
+                None,
+            );
+            assert!(
+                matches!(&result, Err(CliError::InvalidArgument(message))
+                    if message.contains("baseline has no entry for enabled benchmark 'help'")),
+                "an uncovered comparison must fail before running: {result:?}"
+            );
+            assert!(capture.drain_to_string().is_empty());
+            assert_eq!(
+                std::fs::read_to_string(&baseline_path).expect("preserved input baseline"),
+                missing_baseline
+            );
+            assert_eq!(
+                std::fs::read(&separate_output).expect("preserved output baseline"),
+                output_sentinel
+            );
+            assert_eq!(
+                std::fs::read_dir(&report_dir)
+                    .expect("report inventory after rejected comparison")
+                    .count(),
+                4,
+                "an uncovered comparison must not execute or produce a measurement report"
+            );
+        }
+    }
+
+    #[test]
+    fn benchmark_reports_with_identical_timestamps_preserve_every_run() {
+        let dir = canonical_test_tempdir("bench-reports-");
+        let first =
+            write_bench_report(dir.path(), "same-timestamp", r#"{"run":1}"#).expect("first report");
+        let second = write_bench_report(dir.path(), "same-timestamp", r#"{"run":2}"#)
+            .expect("second report");
+
+        assert_ne!(first, second, "one report must not overwrite another");
+        assert_eq!(std::fs::read_to_string(first).unwrap(), r#"{"run":1}"#);
+        assert_eq!(std::fs::read_to_string(second).unwrap(), r#"{"run":2}"#);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
     #[test]
@@ -56518,6 +57702,243 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn migrate_format_detection_holds_authority_across_canonical_read() {
+        const TEST_NAME: &str =
+            "tests::migrate_format_detection_holds_authority_across_canonical_read";
+        const MODE_ENV: &str = "AM_TEST_MIGRATION_FORMAT_AUTHORITY_MODE";
+        const PATH_ENV: &str = "AM_TEST_MIGRATION_FORMAT_AUTHORITY_PATH";
+        const BUSY_ENV: &str = "AM_TEST_MIGRATION_FORMAT_AUTHORITY_BUSY";
+        const CHILD_WITNESS: &str = "migration-format-contender-checked";
+        const READ_WITNESS: &str = "migration-format-read-guarded";
+
+        if std::env::var(MODE_ENV).as_deref() == Ok("contender") {
+            let path = PathBuf::from(std::env::var_os(PATH_ENV).expect("contender path"));
+            let admission = acquire_cli_mailbox_activity_lock_for_sqlite_path(
+                &path,
+                mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+            );
+            if std::env::var(BUSY_ENV).as_deref() == Ok("1") {
+                let error = admission.expect_err(
+                    "a competing runtime must not enter during canonical format detection",
+                );
+                assert!(is_resource_busy_cli_error(&error), "{error}");
+            } else {
+                assert!(
+                    admission
+                        .expect("completed format detection releases admission")
+                        .is_some()
+                );
+            }
+            println!("{CHILD_WITNESS}");
+            return;
+        }
+
+        fn assert_child_admission(path: &Path, busy: bool) {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(MODE_ENV, "contender")
+            .env(PATH_ENV, path)
+            .env(BUSY_ENV, if busy { "1" } else { "0" })
+            .output()
+            .expect("run real child admission contender");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            assert!(stdout.contains(CHILD_WITNESS), "{stdout}\n{stderr}");
+        }
+
+        if std::env::var(MODE_ENV).as_deref() == Ok("read") {
+            let path = PathBuf::from(std::env::var_os(PATH_ENV).expect("reader path"));
+            let phases = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let observed = std::rc::Rc::clone(&phases);
+            MIGRATION_FORMAT_READ_OBSERVER.with(|cell| {
+                *cell.borrow_mut() = Some(Box::new(move |path, phase| {
+                    // Exercise both the OS lock and the same-process registry
+                    // at the actual handler's check/open and open/read seams.
+                    assert_child_admission(path, true);
+                    let error = acquire_cli_mailbox_activity_lock_for_sqlite_path(
+                        path,
+                        mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+                    )
+                    .expect_err("same-process admission must remain exclusive");
+                    assert!(is_resource_busy_cli_error(&error), "{error}");
+                    observed.borrow_mut().push(phase);
+                }));
+            });
+            let result = handle_migrate_cmd(true, false, false, None);
+            MIGRATION_FORMAT_READ_OBSERVER.with(|cell| *cell.borrow_mut() = None);
+            result.expect("read the real sidecarless canonical timestamp format");
+            assert_eq!(*phases.borrow(), ["before_open", "read_open"]);
+            assert_child_admission(&path, false);
+            println!("{READ_WITNESS}");
+            return;
+        }
+
+        // Only the exact child receives configuration changes; parallel tests
+        // keep their own database and archive environment throughout.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("migration-authority.sqlite3");
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("private storage root");
+        let canonical =
+            mcp_agent_mail_db::CanonicalDbConn::open_file(path.to_string_lossy().as_ref())
+                .expect("seed canonical source");
+        canonical
+            .execute_raw("PRAGMA journal_mode = DELETE;")
+            .expect("sidecarless fixture");
+        canonical
+            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("seed mailbox schema");
+        canonical
+            .execute_raw(
+                "INSERT INTO projects (slug, human_key, created_at) \
+                 VALUES ('migration-authority', '/tmp/migration-authority', '2026-01-15T10:30:00Z');",
+            )
+            .expect("seed legacy timestamp");
+        drop(canonical);
+        let source_before = std::fs::read(&path).expect("original source bytes");
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(MODE_ENV, "read")
+                .env(PATH_ENV, &path)
+                .env("DATABASE_URL", format!("sqlite:///{}", path.display()))
+                .env("STORAGE_ROOT", &storage_root)
+                .output()
+                .expect("run isolated migration reader");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains(READ_WITNESS), "{stdout}\n{stderr}");
+        assert_eq!(
+            std::fs::read(&path).expect("source after check"),
+            source_before
+        );
+        for suffix in [
+            "-fsqlite-ns-gate",
+            "-fsqlite-ns-use",
+            "-wal",
+            "-shm",
+            "-journal",
+        ] {
+            assert!(
+                !sqlite_sidecar_path(&path, suffix).exists(),
+                "read-only format detection must not create engine sidecar {suffix}"
+            );
+        }
+    }
+
+    #[test]
+    fn migrate_format_detection_refuses_engine_change_after_admission() {
+        const CHILD_ENV: &str = "AM_TEST_MIGRATION_FORMAT_ENGINE_CHANGE";
+        const TEST_NAME: &str =
+            "tests::migrate_format_detection_refuses_engine_change_after_admission";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("current test executable"),
+            )
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("run isolated namespace-change control");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            assert!(
+                stdout.contains("migration-engine-changes-refused"),
+                "{stdout}\n{stderr}"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("private storage root");
+        for franken_source in [false, true] {
+            let path = dir.path().join(format!("engine-{franken_source}.sqlite3"));
+            let path_text = path.to_string_lossy().into_owned();
+            let seed = mcp_agent_mail_db::CanonicalDbConn::open_file(&path_text)
+                .expect("seed canonical source");
+            seed.execute_raw("PRAGMA journal_mode = DELETE;")
+                .expect("sidecarless fixture");
+            seed.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("seed mailbox schema");
+            drop(seed);
+            if franken_source {
+                let runtime = mcp_agent_mail_db::DbConn::open_file(&path_text)
+                    .expect("admit private fixture to FrankenSQLite");
+                runtime
+                    .execute_raw("PRAGMA journal_mode = DELETE;")
+                    .expect("settle private fixture");
+                drop(runtime);
+            }
+            assert_eq!(
+                mcp_agent_mail_db::pool::is_franken_admitted_family(&path, "test")
+                    .expect("fixture namespace"),
+                franken_source
+            );
+            let source_before = std::fs::read(&path).expect("source before namespace transition");
+            let quarantine = dir.path().join(format!("namespace-{franken_source}"));
+            std::fs::create_dir(&quarantine).expect("private namespace quarantine");
+            MIGRATION_FORMAT_READ_OBSERVER.with(|cell| {
+                *cell.borrow_mut() = Some(Box::new(move |path, phase| {
+                    assert_eq!(
+                        phase, "before_open",
+                        "changed namespace must refuse before reading"
+                    );
+                    if franken_source {
+                        for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+                            std::fs::rename(
+                                sqlite_sidecar_path(path, suffix),
+                                quarantine.join(suffix),
+                            )
+                            .expect("retain changed namespace witnesses");
+                        }
+                    } else {
+                        std::fs::write(
+                            sqlite_sidecar_path(path, "-fsqlite-ns-gate"),
+                            b"foreign namespace appeared",
+                        )
+                        .expect("place foreign namespace witness");
+                    }
+                }));
+            });
+            let database_url = format!("sqlite:///{}", path.display());
+            let storage_text = storage_root.to_string_lossy().into_owned();
+            let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[
+                    ("DATABASE_URL", database_url.as_str()),
+                    ("STORAGE_ROOT", storage_text.as_str()),
+                ],
+                || handle_migrate_cmd(true, false, false, None),
+            );
+            MIGRATION_FORMAT_READ_OBSERVER.with(|cell| *cell.borrow_mut() = None);
+            let error =
+                result.expect_err("a changed engine authority must not switch read engines");
+            let detail = error.to_string();
+            assert!(detail.contains("cannot open DB"), "{detail}");
+            assert!(
+                detail.contains("namespace") || detail.contains("Franken-admitted"),
+                "{detail}"
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("unchanged source"),
+                source_before
+            );
+            if !franken_source {
+                assert_eq!(
+                    std::fs::read(sqlite_sidecar_path(&path, "-fsqlite-ns-gate"))
+                        .expect("foreign namespace preserved"),
+                    b"foreign namespace appeared"
+                );
+            }
+        }
+        println!("migration-engine-changes-refused");
+    }
+
+    #[test]
     fn migrate_check_and_convert_sidecarless_legacy_text_database() {
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
@@ -56546,6 +57967,7 @@ http_headers = { Authorization = "Bearer secret" }
             )
             .expect("insert legacy text timestamp row");
         drop(canonical);
+        let source_before_check = std::fs::read(&db_path).expect("original legacy source bytes");
 
         assert!(
             !mcp_agent_mail_db::pool::is_franken_admitted_family(&db_path, "test")
@@ -56563,6 +57985,11 @@ http_headers = { Authorization = "Bearer secret" }
             || {
                 handle_migrate_cmd(true, false, false, None)
                     .expect("migrate --check must succeed on sidecarless legacy text DB");
+                assert_eq!(
+                    std::fs::read(&db_path).expect("legacy source after check"),
+                    source_before_check,
+                    "format detection must leave the legacy source byte-identical"
+                );
 
                 for suffix in [
                     "-fsqlite-ns-gate",
@@ -56570,7 +57997,6 @@ http_headers = { Authorization = "Bearer secret" }
                     "-wal",
                     "-shm",
                     "-journal",
-                    ".activity.lock",
                 ] {
                     let sidecar = sqlite_sidecar_path(&db_path, suffix);
                     assert!(
@@ -56579,6 +58005,18 @@ http_headers = { Authorization = "Bearer secret" }
                         sidecar.display()
                     );
                 }
+                // Safe admission needs a stable lock inode even for a pure
+                // format read. It stays on disk, unlocked, for the next owner;
+                // unlinking it would let contenders lock different inodes.
+                assert!(
+                    std::fs::symlink_metadata(sqlite_sidecar_path(&db_path, ".activity.lock"))
+                        .expect("stable migration activity lock")
+                        .file_type()
+                        .is_file()
+                );
+                let released = acquire_cli_mailbox_mutation_locks(&database_url, None)
+                    .expect("migrate --check releases both mailbox activity locks");
+                drop(released);
 
                 handle_migrate_cmd(false, false, false, Some(backup_dir.clone()))
                     .expect("migrate must convert sidecarless legacy text DB");
@@ -58134,7 +59572,7 @@ http_headers = { Authorization = "Bearer secret" }
 
             for i in 0..base_zip.len() {
                 let mut entry = base_zip.by_index(i).unwrap();
-                let name = entry.name().to_string();
+                let name = entry.name().unwrap().into_owned();
                 let mut bytes = Vec::new();
                 entry.read_to_end(&mut bytes).unwrap();
 
@@ -58816,7 +60254,7 @@ http_headers = { Authorization = "Bearer secret" }
         }
         let mut zip = zip::ZipArchive::new(std::fs::File::open(&archive).unwrap()).unwrap();
         for index in 0..zip.len() {
-            let name = zip.by_index(index).unwrap().name().to_string();
+            let name = zip.by_index(index).unwrap().name().unwrap().into_owned();
             assert!(!name.contains(".snapshot-namespace."));
             assert!(!name.contains("mailbox-archive-"));
         }
@@ -59039,7 +60477,7 @@ http_headers = { Authorization = "Bearer secret" }
         let mut zip = zip::ZipArchive::new(file).unwrap();
         let mut names = Vec::new();
         for i in 0..zip.len() {
-            names.push(zip.by_index(i).unwrap().name().to_string());
+            names.push(zip.by_index(i).unwrap().name().unwrap().into_owned());
         }
 
         assert!(
@@ -64582,6 +66020,243 @@ startup_timeout_sec = 42
         assert_eq!(stats.structural_errors, 0);
         assert_eq!(stats.integrity_class, "clean");
         assert!(stats.file_bytes > 0);
+    }
+
+    fn seed_doctor_vacuum_message_fixture(db_path: &Path) {
+        use mcp_agent_mail_db::sqlmodel_core::Value;
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_str().unwrap())
+            .expect("create offline mailbox");
+        conn.execute_raw(
+            "PRAGMA user_version = 33; PRAGMA application_id = 1095585100; \
+             CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT, body_md TEXT, attachments TEXT, extension BLOB); \
+             CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, kind TEXT, read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id, kind)); \
+             CREATE INDEX idx_messages_desc ON messages(subject, id DESC); \
+             CREATE TABLE custom_extension (key TEXT PRIMARY KEY, value TEXT); \
+             INSERT INTO custom_extension VALUES ('preserve', 'not rebuilt from archive'); \
+             BEGIN",
+        )
+        .expect("create fixture schema");
+        // Cross several keyset batches, with sparse IDs and multiple recipient
+        // kinds for one agent (the legacy three-column primary key).
+        for index in 0..70_i64 {
+            let id = 10 + index * 2;
+            conn.execute_sync(
+                "INSERT INTO messages VALUES (?, ?, ?, ?, ?)",
+                &[
+                    Value::BigInt(id),
+                    Value::Text(format!("message {index} — café")),
+                    Value::Text(format!("body {index}\nsecond line\n")),
+                    Value::Text("[{\"path\":\"attachment.bin\"}]".to_string()),
+                    Value::Bytes(vec![0, 1, 127, 255]),
+                ],
+            )
+            .expect("insert message");
+            for kind in ["to", "cc"] {
+                conn.execute_sync(
+                    "INSERT INTO message_recipients VALUES (?, 7, ?, ?, ?)",
+                    &[
+                        Value::BigInt(id),
+                        Value::Text(kind.to_string()),
+                        Value::BigInt(1_700_000_000_000_000 + index),
+                        Value::Null,
+                    ],
+                )
+                .expect("insert delivery receipt");
+            }
+        }
+        conn.execute_raw(
+            "INSERT INTO messages (id, subject) VALUES (1000001, 'deleted high-water sentinel'); \
+             DELETE FROM messages WHERE id = 1000001; COMMIT",
+        )
+        .expect("retain autoincrement high-water mark above surviving rows");
+        mcp_agent_mail_db::close_db_conn(conn, "doctor vacuum fixture");
+    }
+
+    #[test]
+    fn doctor_vacuum_content_witness_detects_same_count_body_and_ack_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mail.sqlite3");
+        seed_doctor_vacuum_message_fixture(&path);
+        let before = doctor_vacuum_content_witness(&path).expect("source witness");
+        assert_eq!(before.tables["messages"].rows, 70);
+        assert_eq!(before.tables["message_recipients"].rows, 140);
+        assert_eq!(before.user_version, 33);
+        assert_eq!(before.application_id, 1_095_585_100);
+        assert_eq!(before.tables["sqlite_sequence"].rows, 1);
+        {
+            let conn = mcp_agent_mail_db::DbConn::open_file(path.to_str().unwrap()).unwrap();
+            conn.execute_raw(
+                "UPDATE messages SET body_md = 'changed body' WHERE id = 148; \
+                 UPDATE message_recipients SET ack_ts = 1700000000009999 WHERE message_id = 10 AND kind = 'cc'",
+            )
+            .expect("change content without changing counts");
+            mcp_agent_mail_db::close_db_conn(conn, "doctor vacuum changed-content fixture");
+        }
+        let after = doctor_vacuum_content_witness(&path).expect("changed witness");
+        assert_eq!(
+            before.tables["messages"].rows,
+            after.tables["messages"].rows
+        );
+        assert_eq!(
+            before.tables["message_recipients"].rows,
+            after.tables["message_recipients"].rows
+        );
+        assert_ne!(
+            before.tables["messages"].sha256,
+            after.tables["messages"].sha256
+        );
+        assert_ne!(
+            before.tables["message_recipients"].sha256,
+            after.tables["message_recipients"].sha256
+        );
+    }
+
+    #[test]
+    fn doctor_vacuum_backup_verifies_content_and_preserves_source_on_refusal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mail.sqlite3");
+        seed_doctor_vacuum_message_fixture(&path);
+        let mut witness = doctor_vacuum_content_witness(&path).expect("source witness");
+        let backup = create_doctor_vacuum_backup(&path, &witness).expect("verified backup");
+        assert_eq!(doctor_vacuum_content_witness(&backup).unwrap(), witness);
+        let before = std::fs::read(&path).expect("source bytes");
+        witness.tables.get_mut("messages").unwrap().sha256 =
+            "deliberately wrong digest".to_string();
+        let error = create_doctor_vacuum_backup(&path, &witness)
+            .expect_err("mismatched backup must refuse mutation");
+        assert!(error.to_string().contains("backup changed message"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            backup.exists(),
+            "an earlier verified backup remains available"
+        );
+    }
+
+    #[test]
+    fn doctor_vacuum_locks_refuse_live_owner_override_and_block_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mail.sqlite3");
+        seed_doctor_vacuum_message_fixture(&path);
+        let database_url = format!("sqlite://{}", path.display());
+        let live = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_sqlite_path(
+            &path,
+            mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+        )
+        .expect("live owner lock");
+        assert!(acquire_doctor_vacuum_locks(&database_url, dir.path(), false, false).is_err());
+        assert!(matches!(
+            acquire_doctor_vacuum_locks(&database_url, dir.path(), true, false),
+            Err(CliError::Usage(message)) if message.contains("offline-only")
+        ));
+        assert!(matches!(
+            acquire_doctor_vacuum_locks(&database_url, dir.path(), false, true),
+            Err(CliError::Usage(message)) if message.contains("offline-only")
+        ));
+        drop(live);
+        let offline = acquire_doctor_vacuum_locks(&database_url, dir.path(), false, false)
+            .expect("offline ownership");
+        assert!(
+            mcp_agent_mail_server::acquire_mailbox_activity_lock_for_sqlite_path(
+                &path,
+                mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+            )
+            .is_err(),
+            "a server cannot reopen the mailbox during compaction"
+        );
+        assert!(
+            mcp_agent_mail_server::acquire_mailbox_activity_lock_for_storage_root(
+                dir.path(),
+                mcp_agent_mail_server::MailboxActivityLockMode::Exclusive,
+            )
+            .is_err(),
+            "the storage-root lifetime lock also remains held"
+        );
+        drop(offline);
+    }
+
+    #[test]
+    fn doctor_vacuum_preview_is_read_only_and_apply_preserves_mailbox_and_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mail.sqlite3");
+        seed_doctor_vacuum_message_fixture(&path);
+        let database_url = format!("sqlite://{}", path.display());
+        let storage_root = dir.path().to_str().unwrap();
+        let before = std::fs::read(&path).expect("source bytes");
+        let contents = doctor_vacuum_content_witness(&path).expect("source witness");
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &database_url),
+                ("STORAGE_ROOT", storage_root),
+            ],
+            || {
+                handle_doctor_vacuum(false, false, true, false, false).expect("default preview");
+                handle_doctor_vacuum(true, true, true, false, false).expect("explicit dry run");
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                let live = mcp_agent_mail_server::acquire_mailbox_activity_lock_for_sqlite_path(
+                    &path,
+                    mcp_agent_mail_server::MailboxActivityLockMode::Shared,
+                )
+                .expect("live mailbox owner");
+                assert!(
+                    handle_doctor_vacuum(false, true, true, false, false).is_err(),
+                    "apply must refuse an actual live owner before backup or rewrite"
+                );
+                assert!(
+                    handle_doctor_vacuum(false, true, true, true, false).is_err(),
+                    "--allow-live-owner must not bypass offline admission"
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                drop(live);
+                assert!(
+                    std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("doctor-vacuum-backup-")),
+                    "previews and live-owner refusals must not create backup artifacts"
+                );
+                handle_doctor_vacuum(false, true, true, false, false).expect("offline compaction");
+            },
+        );
+        assert_eq!(doctor_vacuum_content_witness(&path).unwrap(), contents);
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("doctor-vacuum-backup-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        let backup_path = backups[0].join("mailbox.sqlite3");
+        assert_eq!(
+            doctor_vacuum_content_witness(&backup_path).unwrap(),
+            contents
+        );
+        let backup = mcp_agent_mail_db::CanonicalDbConn::open_file(backup_path.to_str().unwrap())
+            .expect("backup readable by canonical SQLite");
+        let rows = backup
+            .query_sync(
+                "SELECT value FROM custom_extension WHERE key = 'preserve'",
+                &[],
+            )
+            .expect("custom schema survived");
+        assert_eq!(
+            rows[0].get_named::<String>("value").unwrap(),
+            "not rebuilt from archive"
+        );
+        let sequence = backup
+            .query_sync(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'messages'",
+                &[],
+            )
+            .expect("read retained AUTOINCREMENT history");
+        assert_eq!(sequence[0].get_named::<i64>("seq").unwrap(), 1_000_001);
+        assert_eq!(doctor_vacuum_stats(&path).unwrap().integrity_class, "clean");
     }
 
     #[test]
@@ -72969,6 +74644,22 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn clap_parses_read_only_mail_count_and_requires_project() {
+        let cli = Cli::try_parse_from(["am", "mail", "count", "--project", "/tmp/proj", "--json"])
+            .expect("mail count arguments");
+        let Commands::Mail { action } = cli.command.expect("mail command") else {
+            panic!("expected mail command");
+        };
+        assert!(mail_command_is_read_only(&action));
+        assert!(matches!(
+            action,
+            MailCommand::Count { project_key, format: None, json: true }
+                if project_key == "/tmp/proj"
+        ));
+        assert!(Cli::try_parse_from(["am", "mail", "count"]).is_err());
+    }
+
+    #[test]
     fn clap_parses_mail_send_hyphen_prefixed_sender_token() {
         for token in ["-F_native-token", "--native-token", "ordinary_native-token"] {
             let cli = Cli::try_parse_from([
@@ -75506,7 +77197,7 @@ startup_timeout_sec = 42
                 err.to_string().contains("no beads directory"),
                 "expected 'no beads directory' in: {err}"
             ),
-            // beads_rust discovery deliberately walks UP from the start dir,
+            // br discovery deliberately walks UP from the start dir,
             // so on hosts where a tempdir ancestor is a real beads workspace
             // (e.g. a stray /data/tmp/.beads) resolution legitimately
             // escapes the tempdir (br-51028). The invariant that must hold
@@ -75527,6 +77218,11 @@ startup_timeout_sec = 42
         let underscore_beads = dir.path().join("_beads");
         std::fs::create_dir_all(&dot_beads).expect("create .beads");
         std::fs::create_dir_all(&underscore_beads).expect("create _beads");
+        let poisoned_database = b"not a SQLite database; discovery must not open or recover it";
+        for beads_dir in [&dot_beads, &underscore_beads] {
+            std::fs::write(beads_dir.join("beads.db"), poisoned_database)
+                .expect("write poisoned discovery database");
+        }
 
         assert_eq!(
             resolve_beads_dir(Some(&dot_beads)).expect("resolve explicit .beads"),
@@ -75537,6 +77233,20 @@ startup_timeout_sec = 42
             std::fs::canonicalize(&underscore_beads).expect("canonical _beads"),
             "an explicit _beads path must not lose to a sibling .beads"
         );
+        for beads_dir in [&dot_beads, &underscore_beads] {
+            assert_eq!(
+                std::fs::read(beads_dir.join("beads.db")).expect("read discovery database"),
+                poisoned_database,
+                "directory discovery must preserve even an unreadable database"
+            );
+            assert_eq!(
+                std::fs::read_dir(beads_dir)
+                    .expect("read discovery directory")
+                    .count(),
+                1,
+                "directory discovery must not create locks, sidecars or recovery artifacts"
+            );
+        }
     }
 
     #[test]
@@ -75739,6 +77449,44 @@ startup_timeout_sec = 42
         let error = br_json_command(&path, &["status".to_string()])
             .expect_err("Beads cannot consume a non-UTF-8 BEADS_DIR pin");
         assert!(error.contains("non-UTF-8 beads directory"));
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_path = std::fs::canonicalize(root.path()).expect("canonical fixture root");
+        let rendered_beads = root_path.join("project-\u{fffd}/.beads");
+        std::fs::create_dir_all(&rendered_beads).expect("create valid UTF-8 workspace");
+        assert_eq!(
+            resolve_beads_dir(Some(&rendered_beads))
+                .expect("an explicit valid UTF-8 replacement-character path is verifiable"),
+            std::fs::canonicalize(&rendered_beads).expect("canonical explicit workspace")
+        );
+    }
+
+    // APFS accepts only valid UTF-8 filenames. Keep the portable checks above,
+    // and reproduce the physical raw-byte collision on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn br_discovery_rejects_lossy_non_utf8_workspace_names() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let root_path = std::fs::canonicalize(root.path()).expect("canonical fixture root");
+        let raw_project = root_path.join(std::ffi::OsString::from_vec(b"project-\xFF".to_vec()));
+        let rendered_beads = root_path.join("project-\u{fffd}/.beads");
+        std::fs::create_dir_all(raw_project.join(".beads")).expect("create non-UTF-8 workspace");
+        std::fs::create_dir_all(&rendered_beads).expect("create distinct rendered-path workspace");
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("BEADS_DIR", "")],
+            || {
+                let error = discover_beads_dir_via_cli(&raw_project, None)
+                    .expect_err("lossy discovery must not select the distinct UTF-8 workspace");
+                assert!(error.to_string().contains("replacement character"));
+                assert_eq!(
+                    resolve_beads_dir(Some(&rendered_beads))
+                        .expect("an explicit valid UTF-8 replacement-character path is verifiable"),
+                    std::fs::canonicalize(&rendered_beads).expect("canonical explicit workspace")
+                );
+            },
+        );
     }
 
     #[test]
@@ -77875,6 +79623,46 @@ startup_timeout_sec = 42
         });
 
         conn
+    }
+
+    #[test]
+    fn integration_mail_count_scopes_projects_and_rejects_unknown_projects() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().expect("mail count fixture");
+        let project_path = "/tmp/mail-count-project";
+        let conn = seed_mail_status_db(&dir.path().join("count.sqlite3"), project_path);
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                sqlmodel_core::Value::BigInt(2),
+                sqlmodel_core::Value::Text("empty-project".into()),
+                sqlmodel_core::Value::Text("/tmp/empty-project".into()),
+                sqlmodel_core::Value::BigInt(1),
+            ],
+        )
+        .expect("empty project");
+        let capture = ftui_runtime::StdioCapture::install().expect("capture count output");
+        let slug = resolve_project_identity(project_path).slug;
+        for (key, expected) in [(project_path, 3), (slug.as_str(), 3), ("empty-project", 0)] {
+            handle_mail_count_sync(&conn, key, output::CliOutputFormat::Json)
+                .expect("count existing project");
+            let value: serde_json::Value =
+                serde_json::from_str(capture.drain_to_string().trim()).expect("count JSON");
+            assert_eq!(value["count"], expected);
+        }
+        let result = handle_mail_count_sync(
+            &conn,
+            "/tmp/missing-count-project' OR 1=1 --",
+            output::CliOutputFormat::Json,
+        );
+        assert!(result.is_err(), "unknown projects must not look empty");
+        assert!(capture.drain_to_string().is_empty());
+        let projects = conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM projects", &[])
+            .expect("project inventory");
+        assert_eq!(projects[0].get_named::<i64>("cnt").unwrap(), 2);
     }
 
     #[test]
@@ -86695,7 +88483,7 @@ fn handle_verify(args: VerifyArgs) -> CliResult<()> {
         return Ok(());
     }
 
-    let server_url = local_server_url(&config);
+    let server_url = local_server_url(&config)?;
     let bearer = local_server_bearer_token(&config);
     handle_am_run_with(
         &config,
@@ -86718,7 +88506,7 @@ fn handle_verify(args: VerifyArgs) -> CliResult<()> {
 
 fn handle_am_run(args: AmRunArgs) -> CliResult<()> {
     let config = Config::from_env();
-    let server_url = local_server_url(&config);
+    let server_url = local_server_url(&config)?;
     // The same token `am mail` sends, including the managed-service fallback.
     let bearer = local_server_bearer_token(&config);
     handle_am_run_with(&config, Some(server_url.as_str()), bearer.as_deref(), args)
@@ -90340,7 +92128,10 @@ fn verify_saved_archive(
             .map_err(|error| CliError::Other(format!("archive verification failed: {error}")))?;
         // CRC covers member payloads, not central-directory names or sizes.
         // Compare the exact inventory before accepting a verified archive.
-        if member.name() != expected_name {
+        let member_name = member
+            .name()
+            .map_err(|error| CliError::Other(format!("archive verification failed: {error}")))?;
+        if member_name != expected_name {
             return Err(CliError::Other(format!(
                 "archive verification found a member name mismatch at index {index}"
             )));
@@ -90351,8 +92142,7 @@ fn verify_saved_archive(
                 "archive verification found a member size mismatch at index {index}"
             )));
         }
-        let recovery = member
-            .name()
+        let recovery = member_name
             .strip_prefix("storage_repo/")
             .is_some_and(|relative| {
                 archive_recovery_relative_path_is_excluded(Path::new(relative))
@@ -91996,7 +93786,9 @@ fn archive_restore_state<G>(
     let mut has_storage = false;
     for i in 0..archive.len() {
         if let Ok(file) = archive.by_index(i)
-            && file.name().starts_with(&prefix_string)
+            && file
+                .name()
+                .is_ok_and(|name| name.starts_with(&prefix_string))
         {
             has_storage = true;
             break;
@@ -95515,6 +97307,60 @@ fn collect_prunable_reservation_archives(storage_root: &Path, retention_days: u6
     out
 }
 
+/// GH#362: the reservation archive reconciler republishes the release
+/// artifact of every released row that is still in the database. A prune
+/// therefore lasts only when the server's own retention deletes those rows at
+/// the same horizon or sooner. Returns an operator warning unless this
+/// process's configuration shows that.
+fn reservation_prune_republish_warning(config: &Config, retention_days: u64) -> Option<String> {
+    let db_prunes_rows = config.file_reservations_cleanup_enabled
+        && config.file_reservations_retention_days > 0
+        && config.file_reservations_retention_days <= retention_days;
+    (!db_prunes_rows).then(|| {
+        format!(
+            "released reservation rows stay in the database unless the server runs with \
+             FILE_RESERVATIONS_CLEANUP_ENABLED=true and FILE_RESERVATIONS_RETENTION_DAYS of \
+             {retention_days} or less; while a pruned artifact's row remains, the reservation \
+             archive reconciler republishes that artifact"
+        )
+    })
+}
+
+#[cfg(test)]
+mod reservation_prune_republish_warning_tests {
+    use super::{Config, reservation_prune_republish_warning};
+
+    fn config(cleanup_enabled: bool, db_retention_days: u64) -> Config {
+        Config {
+            file_reservations_cleanup_enabled: cleanup_enabled,
+            file_reservations_retention_days: db_retention_days,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn warns_whenever_the_database_keeps_pruned_rows() {
+        // Default configuration: database retention never runs.
+        let warning = reservation_prune_republish_warning(&config(false, 30), 30)
+            .expect("cleanup disabled keeps every released row");
+        assert!(
+            warning.contains("FILE_RESERVATIONS_CLEANUP_ENABLED=true"),
+            "{warning}"
+        );
+        assert!(warning.contains("of 30 or less"), "{warning}");
+        // Database retention longer than the prune horizon.
+        assert!(reservation_prune_republish_warning(&config(true, 30), 3).is_some());
+        // Database retention disabled by a zero horizon.
+        assert!(reservation_prune_republish_warning(&config(true, 0), 3).is_some());
+    }
+
+    #[test]
+    fn stays_quiet_when_database_retention_removes_the_rows_first() {
+        assert!(reservation_prune_republish_warning(&config(true, 30), 30).is_none());
+        assert!(reservation_prune_republish_warning(&config(true, 3), 30).is_none());
+    }
+}
+
 #[cfg(test)]
 mod reservation_archive_prune_tests {
     use super::reservation_archive_json_is_prunable;
@@ -95605,6 +97451,9 @@ fn handle_doctor_archive_normalize(
                  the retention horizon defaults to FILE_RESERVATIONS_RETENTION_DAYS"
                     .to_string(),
             ));
+        }
+        if let Some(warning) = reservation_prune_republish_warning(&config, retention_days) {
+            output::warn(&warning);
         }
         let candidates = collect_prunable_reservation_archives(&storage_root, retention_days);
         if !candidates.is_empty() {
@@ -98354,6 +100203,17 @@ pub(crate) async fn try_call_server_tool(
     )
 }
 
+/// Keep resource correlation IDs bounded even when project paths or thread
+/// identifiers make the URI longer than the protocol's string-ID limit.
+pub(crate) fn resource_read_request_id(uri: &str) -> String {
+    use sha2::Digest as _;
+
+    format!(
+        "cli-resource-read-{}",
+        hex::encode(sha2::Sha256::digest(uri.as_bytes()))
+    )
+}
+
 /// Read an MCP resource over the daemon's JSON-RPC lane (`resources/read`).
 ///
 /// Shares the request deadline and the Success / Rejected / Unavailable
@@ -98367,7 +100227,7 @@ pub(crate) async fn try_read_server_resource(
 ) -> ServerToolCall {
     let req = serde_json::json!({
         "jsonrpc": "2.0",
-        "id": format!("cli-resources-read-{uri}"),
+        "id": resource_read_request_id(uri),
         "method": "resources/read",
         "params": {
             "uri": uri,
@@ -98636,7 +100496,7 @@ fn handle_products(action: ProductsCommand) -> CliResult<()> {
 
 async fn handle_products_async(action: ProductsCommand) -> CliResult<()> {
     let config = Config::from_env();
-    let server_url = local_server_url(&config);
+    let server_url = local_server_url(&config)?;
     let bearer_token = local_server_bearer_token(&config);
     let bearer = bearer_token.as_deref();
 
@@ -104100,26 +105960,36 @@ fn sqlite_message_stats(path: &Path) -> (i64, i64) {
 }
 
 #[cfg(test)]
-fn try_generate_age_recipient(dir: &Path) -> Option<String> {
+fn generate_age_recipient(dir: &Path) -> String {
     let identity_path = dir.join("age_identity.txt");
     let output = std::process::Command::new("age-keygen")
         .arg("-o")
         .arg(&identity_path)
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        .expect("encrypted-export test requires real age-keygen in PATH");
+    assert!(
+        output.status.success(),
+        "age-keygen fixture creation failed: {}",
+        output.status
     );
-    combined
-        .lines()
-        .find(|line| line.contains("public key:"))
-        .and_then(|line| line.split_whitespace().last())
-        .map(str::to_string)
+    let output = std::process::Command::new("age-keygen")
+        .arg("-y")
+        .arg(&identity_path)
+        .output()
+        .expect("run age-keygen to derive the fixture's public recipient");
+    assert!(
+        output.status.success(),
+        "age-keygen public recipient derivation failed: {}",
+        output.status
+    );
+    let recipient = String::from_utf8(output.stdout).expect("age-keygen recipient must be UTF-8");
+    let recipient = recipient.trim();
+    assert!(
+        recipient.starts_with("age1"),
+        "age-keygen did not produce an age recipient"
+    );
+    eprintln!("encrypted-export prerequisites: real age-keygen fixture and recipient created");
+    recipient.to_owned()
 }
 
 #[test]
@@ -104259,20 +106129,27 @@ fn run_share_export_reports_encrypted_archive_as_final_output() {
         .lock()
         .unwrap_or_else(|err| err.into_inner());
 
-    if std::process::Command::new("age")
+    let age_version = std::process::Command::new("age")
         .arg("--version")
         .output()
-        .is_err()
-    {
-        eprintln!("Skipping: age CLI not available");
-        return;
-    }
+        .expect("encrypted-export test requires real age in PATH");
+    assert!(
+        age_version.status.success(),
+        "age --version failed: {}",
+        age_version.status
+    );
+    let version = if age_version.stdout.is_empty() {
+        &age_version.stderr
+    } else {
+        &age_version.stdout
+    };
+    eprintln!(
+        "encrypted-export prerequisites: age {}",
+        String::from_utf8_lossy(version).trim()
+    );
 
     let temp = tempfile::tempdir().expect("tempdir");
-    let Some(recipient) = try_generate_age_recipient(temp.path()) else {
-        eprintln!("Skipping: age-keygen not available");
-        return;
-    };
+    let recipient = generate_age_recipient(temp.path());
 
     let source_db = temp.path().join("share-export-source.sqlite3");
     let storage_root = temp.path().join("storage");

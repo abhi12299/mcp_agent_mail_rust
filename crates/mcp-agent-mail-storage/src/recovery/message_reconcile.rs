@@ -70,7 +70,7 @@ impl RepairControl<'_> {
 
     #[track_caller]
     fn begin_at(self, path: &Path) -> crate::Result<crate::ArchiveMutationGuard> {
-        crate::ArchiveMutationGuard::try_begin_repair(path, || self.cancelled())
+        crate::ArchiveMutationGuard::begin_message_repair(path, || self.cancelled())
     }
 }
 
@@ -110,10 +110,10 @@ pub fn reconcile_message_bundle(
 ///
 /// Uses the same validation, no-clobber publication and exact Git verification
 /// as [`reconcile_message_bundle`]. Immutable history is checked before the
-/// non-blocking global publication-fence admission; project mutex/flock waits
-/// share a 250 ms acquisition budget.
-/// The worker stop flag and Cx are checked before admission, while waiting for
-/// project locks, during canonical identity scans, between file publications,
+/// bounded, cancellation-aware global publication-fence admission; project mutex/flock
+/// contention also defers immediately instead of waiting with that fence held.
+/// The worker stop flag and Cx are checked before and after lock admission,
+/// during canonical identity scans, between file publications,
 /// and before committing. Completed
 /// files survive cancellation and are revalidated on retry, never redelivered.
 ///
@@ -730,15 +730,14 @@ fn publish_missing_file(path: &Path, bytes: &[u8]) -> crate::Result<()> {
         Err(error) => {
             // Preserve the candidate too: a raced-in destination is never
             // replaced, and the error does not erase either piece of evidence.
-            let kind = error.error.kind();
             let kept = error.file.keep().map_err(|error| error.error)?;
             drop(kept.0);
-            Err(std::io::Error::new(
-                kind,
+            Err(crate::recovery::contextual_io_error(
                 format!(
                     "archive publication refused; candidate retained at {}",
                     kept.1.display(),
                 ),
+                error.error,
             )
             .into())
         }
@@ -1161,7 +1160,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("occupied.md");
         std::fs::write(&path, b"sentinel").unwrap();
-        assert!(publish_missing_file(&path, b"candidate").is_err());
+        let error = publish_missing_file(&path, b"candidate").unwrap_err();
+        let crate::StorageError::Io(error) = error else {
+            panic!("publication collision must retain its I/O cause");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        let cause = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<std::io::Error>())
+            .expect("native publication failure remains available through context");
+        assert_eq!(cause.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(cause.raw_os_error().is_some());
         assert_eq!(std::fs::read(&path).unwrap(), b"sentinel");
         let candidates: Vec<PathBuf> = std::fs::read_dir(dir.path())
             .unwrap()

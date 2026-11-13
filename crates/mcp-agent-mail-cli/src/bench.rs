@@ -144,6 +144,13 @@ pub enum BenchValidationError {
     EmptySetupCommand,
     #[error("benchmark samples must not be empty")]
     EmptySamples,
+    #[error(
+        "benchmark invocations failed: warmup={warmup_failures}, measurement={measurement_failures}"
+    )]
+    FailedInvocations {
+        warmup_failures: u32,
+        measurement_failures: u32,
+    },
 }
 
 /// Timing phase for one benchmark process invocation.
@@ -186,7 +193,7 @@ impl TimingResult {
 }
 
 /// Timing harness failures.
-#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq)]
 pub enum BenchTimingError {
     #[error("benchmark command must not be empty")]
     EmptyCommand,
@@ -198,6 +205,7 @@ pub enum BenchTimingError {
     NoSuccessfulMeasurementRuns {
         attempted_runs: u32,
         failure_count: u32,
+        timing: Box<TimingResult>,
     },
 }
 
@@ -707,7 +715,9 @@ fn run_once(
             false,
         );
     }
-    let mut process = Command::new(&command[0]);
+    // The CLI prepends current_exe(); direct API callers explicitly select a
+    // benchmark executable. Arguments remain separate argv, without a shell.
+    let mut process = Command::new(&command[0]); // ubs:ignore -- Intentional process runner; the production caller fixes this to current_exe(), not measured data or a shell-parsed string.
     process.args(&command[1..]);
     process.stdout(Stdio::null());
     process.stderr(Stdio::null());
@@ -790,14 +800,7 @@ pub fn run_timed(
         });
     }
 
-    if samples_seconds.is_empty() {
-        return Err(BenchTimingError::NoSuccessfulMeasurementRuns {
-            attempted_runs: runs,
-            failure_count: measurement_failures,
-        });
-    }
-
-    Ok(TimingResult {
+    let timing = TimingResult {
         samples_seconds,
         warmup_runs: warmup,
         measurement_runs: runs,
@@ -805,7 +808,16 @@ pub fn run_timed(
         measurement_failures,
         failures,
         total_elapsed_us: elapsed_us(started.elapsed()),
-    })
+    };
+    if timing.samples_seconds.is_empty() {
+        return Err(BenchTimingError::NoSuccessfulMeasurementRuns {
+            attempted_runs: runs,
+            failure_count: measurement_failures,
+            timing: Box::new(timing),
+        });
+    }
+
+    Ok(timing)
 }
 
 /// Built-in benchmark catalog, aligned to the existing benchmark script.
@@ -1004,7 +1016,14 @@ pub struct BenchResult {
 
 fn round_to(value: f64, decimals: i32) -> f64 {
     let factor = 10_f64.powi(decimals);
-    (value * factor).round() / factor
+    let scaled = value * factor;
+    if scaled.is_finite() {
+        scaled.round() / factor
+    } else {
+        // A finite value this large already has no fractional digits at the
+        // requested precision. Scaling must not turn its reference into inf.
+        value
+    }
 }
 
 fn percentile(sorted_values: &[f64], p: f64) -> f64 {
@@ -1017,6 +1036,29 @@ fn percentile(sorted_values: &[f64], p: f64) -> f64 {
 }
 
 impl BenchResult {
+    /// Aggregate only a complete timing run; partial successes are diagnostic
+    /// samples and must not become a successful result or a saved baseline.
+    pub fn from_timing(
+        name: impl Into<String>,
+        command: impl Into<String>,
+        timing: &TimingResult,
+        fixture_signature: impl Into<String>,
+    ) -> Result<Self, BenchValidationError> {
+        if timing.has_failures() {
+            return Err(BenchValidationError::FailedInvocations {
+                warmup_failures: timing.warmup_failures,
+                measurement_failures: timing.measurement_failures,
+            });
+        }
+        Self::from_samples(
+            name,
+            command,
+            &timing.samples_seconds,
+            fixture_signature,
+            None,
+        )
+    }
+
     /// Construct a benchmark result from duration samples measured in seconds.
     pub fn from_samples(
         name: impl Into<String>,
@@ -1029,13 +1071,14 @@ impl BenchResult {
             return Err(BenchValidationError::EmptySamples);
         }
 
-        let mut samples_ms: Vec<f64> = samples_seconds
+        let timeseries_ms: Vec<f64> = samples_seconds
             .iter()
             .map(|s| round_to(s * 1000.0, 4))
             .collect();
+        let mut samples_ms = timeseries_ms.clone();
         samples_ms.sort_by(|a, b| a.total_cmp(b));
 
-        let mean_ms = round_to(samples_ms.iter().sum::<f64>() / samples_ms.len() as f64, 2);
+        let mean_ms = samples_ms.iter().sum::<f64>() / samples_ms.len() as f64;
         let variance_ms2 = samples_ms
             .iter()
             .map(|sample| {
@@ -1047,11 +1090,11 @@ impl BenchResult {
         let stddev_ms = round_to(variance_ms2.sqrt(), 2);
 
         let p95_ms = percentile(&samples_ms, 95.0);
-        let delta_p95_ms = baseline_p95_ms.map(|base| round_to(p95_ms - base, 2));
+        let delta_p95_ms = baseline_p95_ms.map(|base| p95_ms - base);
 
         Ok(Self {
             name: name.into(),
-            mean_ms,
+            mean_ms: round_to(mean_ms, 2),
             stddev_ms,
             variance_ms2: round_to(variance_ms2, 4),
             min_ms: round_to(*samples_ms.first().unwrap_or(&0.0), 2),
@@ -1059,12 +1102,12 @@ impl BenchResult {
             median_ms: round_to(percentile(&samples_ms, 50.0), 2),
             p95_ms,
             p99_ms: percentile(&samples_ms, 99.0),
-            timeseries_ms: samples_ms,
+            timeseries_ms,
             command: command.into(),
             fixture_signature: fixture_signature.into(),
             baseline: BaselineComparison {
                 baseline_p95_ms,
-                delta_p95_ms,
+                delta_p95_ms: delta_p95_ms.map(|delta| round_to(delta, 2)),
                 regression: delta_p95_ms.is_some_and(|delta| delta > 0.0),
             },
         })
@@ -1117,7 +1160,9 @@ pub enum BenchBaselineError {
     },
     #[error("baseline root must be a JSON object at '{path}'")]
     InvalidRoot { path: String },
-    #[error("baseline entry for '{benchmark}' must be a number or object with numeric p95_ms")]
+    #[error(
+        "baseline entry for '{benchmark}' must be a finite, non-negative number or an object with such a p95_ms"
+    )]
     InvalidEntry { benchmark: String },
 }
 
@@ -1147,9 +1192,11 @@ pub fn save_baseline(
         })?;
     }
 
+    // Baselines feed later decisions: retain the measured percentile rather
+    // than rounding it as presentation data.
     let baseline: BaselineData = results
         .iter()
-        .map(|(name, result)| (name.clone(), round_to(result.p95_ms, 2)))
+        .map(|(name, result)| (name.clone(), result.p95_ms))
         .collect();
 
     let encoded = serde_json::to_string_pretty(&baseline).map_err(|source| {
@@ -1193,10 +1240,11 @@ pub fn load_baseline(path: &Path) -> Result<BaselineData, BenchBaselineError> {
         let p95_ms = value
             .as_f64()
             .or_else(|| value.get("p95_ms").and_then(serde_json::Value::as_f64))
+            .filter(|p95_ms| p95_ms.is_finite() && *p95_ms >= 0.0)
             .ok_or_else(|| BenchBaselineError::InvalidEntry {
                 benchmark: benchmark.clone(),
             })?;
-        baseline.insert(benchmark.clone(), round_to(p95_ms, 2));
+        baseline.insert(benchmark.clone(), p95_ms);
     }
 
     Ok(baseline)
@@ -1215,7 +1263,9 @@ pub fn compare_baseline(
 
     for (name, result) in results {
         let baseline_p95_ms = baseline.get(name).copied();
-        let delta_p95_ms = baseline_p95_ms.map(|base| round_to(result.p95_ms - base, 2));
+        // Use the unrounded delta for classification and percentages. Rounding
+        // to two decimals first can move it across either side of the threshold.
+        let delta_p95_ms = baseline_p95_ms.map(|base| result.p95_ms - base);
         let delta_pct = baseline_p95_ms.and_then(|base| {
             if base <= f64::EPSILON {
                 return None;
@@ -1232,7 +1282,7 @@ pub fn compare_baseline(
             name: name.clone(),
             current_p95_ms: result.p95_ms,
             baseline_p95_ms,
-            delta_p95_ms,
+            delta_p95_ms: delta_p95_ms.map(|delta| round_to(delta, 2)),
             delta_pct,
             regression,
         });
@@ -1467,7 +1517,7 @@ mod tests {
         let result = BenchResult::from_samples(
             "help",
             "--help",
-            &[0.001, 0.002, 0.004, 0.010],
+            &[0.010, 0.001, 0.004, 0.002],
             "sig",
             Some(7.0),
         )
@@ -1479,6 +1529,7 @@ mod tests {
         assert!((result.p95_ms - 10.0).abs() < 0.001);
         assert!(result.baseline.regression);
         assert_eq!(result.baseline.delta_p95_ms, Some(3.0));
+        assert_eq!(result.timeseries_ms, vec![10.0, 1.0, 4.0, 2.0]);
     }
 
     #[test]
@@ -1513,6 +1564,19 @@ mod tests {
         assert_eq!(result.p99_ms, 12.0);
         assert_eq!(result.stddev_ms, 0.0);
         assert_eq!(result.variance_ms2, 0.0);
+
+        for sample_seconds in [0.063_205, 0.033_095, 0.055_635, 0.055_235] {
+            let fractional = BenchResult::from_samples(
+                "fractional-single",
+                "single",
+                &[sample_seconds],
+                "sig-single",
+                None,
+            )
+            .expect("fractional result");
+            assert_eq!(fractional.stddev_ms, 0.0, "sample {sample_seconds}");
+            assert_eq!(fractional.variance_ms2, 0.0, "sample {sample_seconds}");
+        }
     }
 
     #[test]
@@ -1531,12 +1595,34 @@ mod tests {
         assert_eq!(result.variance_ms2, 0.0);
         assert_eq!(result.p95_ms, 7.0);
         assert_eq!(result.p99_ms, 7.0);
+
+        let fractional = BenchResult::from_samples(
+            "fractional-identical",
+            "identical",
+            &[0.063_205; 4],
+            "sig-identical",
+            None,
+        )
+        .expect("fractional result");
+        assert_eq!(fractional.stddev_ms, 0.0);
+        assert_eq!(fractional.variance_ms2, 0.0);
     }
 
     #[test]
     fn bench_result_from_samples_requires_samples() {
         let result = BenchResult::from_samples("help", "--help", &[], "sig", None);
         assert_eq!(result, Err(BenchValidationError::EmptySamples));
+    }
+
+    #[test]
+    fn bench_result_compares_baseline_before_rounding() {
+        for (seconds, regression) in [(0.010_001, true), (0.010, false), (0.009_999, false)] {
+            let result =
+                BenchResult::from_samples("precision", "help", &[seconds], "sig", Some(10.0))
+                    .expect("valid timing");
+            assert_eq!(result.baseline.delta_p95_ms, Some(0.0));
+            assert_eq!(result.baseline.regression, regression, "{seconds}");
+        }
     }
 
     #[test]
@@ -1574,31 +1660,109 @@ mod tests {
     }
 
     #[test]
+    fn save_baseline_preserves_measured_p95_precision() {
+        let results = BTreeMap::from([
+            (
+                "above".to_string(),
+                BenchResult::from_samples("above", "help", &[0.010_006], "sig", None)
+                    .expect("valid timing"),
+            ),
+            (
+                "below".to_string(),
+                BenchResult::from_samples("below", "help", &[0.010_004], "sig", None)
+                    .expect("valid timing"),
+            ),
+            (
+                "small".to_string(),
+                BenchResult::from_samples("small", "help", &[0.000_004], "sig", None)
+                    .expect("valid timing"),
+            ),
+        ]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("baseline.json");
+        save_baseline(&results, &path).expect("save measured baseline");
+        let saved: BaselineData =
+            serde_json::from_slice(&fs::read(&path).expect("read saved baseline"))
+                .expect("numeric baseline JSON");
+        let loaded = load_baseline(&path).expect("reload saved baseline");
+        for (name, result) in &results {
+            assert_eq!(saved[name], result.p95_ms, "saved {name}");
+            assert_eq!(loaded[name], result.p95_ms, "loaded {name}");
+        }
+    }
+
+    #[test]
+    fn load_baseline_preserves_threshold_classification() {
+        let results = BTreeMap::from([
+            (
+                "above".to_string(),
+                BenchResult::from_samples("above", "help", &[0.011_007], "sig", None)
+                    .expect("valid timing"),
+            ),
+            (
+                "below".to_string(),
+                BenchResult::from_samples("below", "help", &[0.011_004], "sig", None)
+                    .expect("valid timing"),
+            ),
+        ]);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("baseline.json");
+        for input in [
+            r#"{"above":10.006,"below":10.004}"#,
+            r#"{"above":{"p95_ms":10.006},"below":{"p95_ms":10.004}}"#,
+        ] {
+            fs::write(&path, input).expect("write measured baseline");
+            let baseline = load_baseline(&path).expect("load measured baseline");
+            let comparisons = compare_baseline(&results, &baseline, 0.10);
+            let verdicts: Vec<_> = comparisons
+                .iter()
+                .map(|comparison| (comparison.name.as_str(), comparison.regression))
+                .collect();
+            // 11.007 / 10.006 is over 1.10; 11.004 / 10.004 is below it.
+            // Rounding either baseline to two decimals reverses its verdict.
+            assert_eq!(verdicts, [("above", true), ("below", false)], "{input}");
+        }
+    }
+
+    #[test]
     fn load_baseline_supports_legacy_nested_format() {
         let temp = tempfile::tempdir().expect("tempdir");
         let baseline_path = temp.path().join("legacy.json");
         fs::write(
             &baseline_path,
-            r#"{"help":{"p95_ms":12.34},"lint":{"p95_ms":99.0}}"#,
+            r#"{"help":{"p95_ms":12.34},"lint":{"p95_ms":99.0},"large":1e308,"large_nested":{"p95_ms":1.79e308},"zero":0.0,"signed_zero":{"p95_ms":-0.0}}"#,
         )
         .expect("write baseline");
 
         let loaded = load_baseline(&baseline_path).expect("load baseline");
         assert_eq!(loaded.get("help").copied(), Some(12.34));
         assert_eq!(loaded.get("lint").copied(), Some(99.0));
+        assert_eq!(loaded.get("large").copied(), Some(1e308));
+        assert_eq!(loaded.get("large_nested").copied(), Some(1.79e308));
+        assert_eq!(loaded.get("zero").copied(), Some(0.0));
+        assert_eq!(loaded.get("signed_zero").copied(), Some(0.0));
+        let json = serde_json::to_value(&loaded).expect("serialize finite baseline");
+        assert_eq!(json["large"].as_f64(), Some(1e308));
+        assert_eq!(json["large_nested"].as_f64(), Some(1.79e308));
     }
 
     #[test]
     fn load_baseline_rejects_invalid_entry_shape() {
         let temp = tempfile::tempdir().expect("tempdir");
         let baseline_path = temp.path().join("invalid.json");
-        fs::write(&baseline_path, r#"{"help":{"unexpected":1}}"#).expect("write baseline");
-
-        let err = load_baseline(&baseline_path).expect_err("invalid baseline shape");
-        assert!(matches!(
-            err,
-            BenchBaselineError::InvalidEntry { benchmark } if benchmark == "help"
-        ));
+        for (input, invalid_benchmark) in [
+            (r#"{"help":{"unexpected":1}}"#, "help"),
+            (r#"{"help":-1.0}"#, "help"),
+            (r#"{"help":{"p95_ms":-0.004}}"#, "help"),
+            (r#"{"help":12.34,"unselected":-1.0}"#, "unselected"),
+        ] {
+            fs::write(&baseline_path, input).expect("write baseline");
+            let err = load_baseline(&baseline_path).expect_err("invalid baseline entry");
+            assert!(matches!(
+                err,
+                BenchBaselineError::InvalidEntry { benchmark } if benchmark == invalid_benchmark
+            ));
+        }
     }
 
     #[test]
@@ -1637,6 +1801,16 @@ mod tests {
         assert_eq!(lint.delta_p95_ms, Some(-10.0));
         assert_eq!(lint.delta_pct, Some(-50.0));
         assert!(!lint.regression);
+
+        baseline.insert("help".to_string(), f64::MAX);
+        let help = compare_baseline(&results, &baseline, 0.10)
+            .into_iter()
+            .find(|entry| entry.name == "help")
+            .expect("large reference comparison");
+        assert_eq!(help.baseline_p95_ms, Some(f64::MAX));
+        assert_eq!(help.delta_p95_ms, Some(-f64::MAX));
+        assert_eq!(help.delta_pct, Some(-100.0));
+        assert!(!help.regression);
     }
 
     #[test]
@@ -1673,6 +1847,42 @@ mod tests {
         assert_eq!(over.delta_p95_ms, Some(1.1));
         assert_eq!(over.delta_pct, Some(11.0));
         assert!(over.regression, "11% delta must exceed 10% threshold");
+    }
+
+    #[test]
+    fn compare_baseline_does_not_round_away_excess_latency() {
+        let mut results = BTreeMap::from([(
+            "precision".to_string(),
+            BenchResult::from_samples("precision", "help", &[0.011_001], "sig", None)
+                .expect("valid timing"),
+        )]);
+        let baseline = BaselineData::from([("precision".to_string(), 10.0)]);
+        let comparison = compare_baseline(&results, &baseline, 0.10).remove(0);
+        // 11.001 ms exceeds 10 ms by 10.01%, even though its displayed
+        // millisecond delta rounds to the same 1.00 as the exact 10% boundary.
+        assert!(comparison.regression, "{comparison:?}");
+        assert_eq!(comparison.delta_p95_ms, Some(1.0));
+        assert_eq!(comparison.delta_pct, Some(10.01));
+        apply_baseline_comparison(&mut results, &baseline, 0.10);
+        assert!(results["precision"].baseline.regression);
+    }
+
+    #[test]
+    fn compare_baseline_does_not_round_under_budget_into_regression() {
+        let mut results = BTreeMap::from([(
+            "precision".to_string(),
+            BenchResult::from_samples("precision", "help", &[0.011_087], "sig", None)
+                .expect("valid timing"),
+        )]);
+        let baseline = BaselineData::from([("precision".to_string(), 10.08)]);
+        let comparison = compare_baseline(&results, &baseline, 0.10).remove(0);
+        // 1.007 / 10.08 is below 10%. Rounding that delta to 1.01 before
+        // comparison falsely rejects this slower but within-budget result.
+        assert!(!comparison.regression, "{comparison:?}");
+        assert_eq!(comparison.delta_p95_ms, Some(1.01));
+        assert_eq!(comparison.delta_pct, Some(9.99));
+        apply_baseline_comparison(&mut results, &baseline, 0.10);
+        assert!(!results["precision"].baseline.regression);
     }
 
     #[test]
@@ -1730,6 +1940,61 @@ mod tests {
         assert_eq!(result.measurement_failures, 0);
         assert!(!result.has_failures());
         assert!(result.total_elapsed_us > 0);
+        let aggregate = BenchResult::from_timing("help", "test --help", &result, "fixture")
+            .expect("complete timing run");
+        assert_eq!(aggregate.timeseries_ms.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_timing_runs_preserve_failures_and_cannot_become_baselines() {
+        // Exercise real process exit statuses in both phases. A successful
+        // measurement must not hide an earlier failed invocation.
+        for failed_invocation in [1_u32, 3] {
+            let dir = tempfile::tempdir().expect("counter directory");
+            let counter = dir.path().join("invocations");
+            let command = vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                r#"count=0
+if [ -f "$1" ]; then read -r count < "$1"; fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$1"
+if [ "$count" -eq "$2" ]; then exit 23; fi"#
+                    .to_string(),
+                "bench-invocation".to_string(),
+                counter.to_string_lossy().into_owned(),
+                failed_invocation.to_string(),
+            ];
+            let timing = run_timed(&command, 1, 3, &BTreeMap::new(), None)
+                .expect("partial timing remains available for diagnostics");
+            let warmup_failure = u32::from(failed_invocation == 1);
+            let measurement_failure = 1 - warmup_failure;
+            assert_eq!(fs::read_to_string(counter).expect("counter"), "4\n");
+            assert_eq!(
+                timing.samples_seconds.len(),
+                3 - measurement_failure as usize
+            );
+            assert_eq!(timing.warmup_failures, warmup_failure);
+            assert_eq!(timing.measurement_failures, measurement_failure);
+            assert_eq!(timing.failures.len(), 1);
+            assert_eq!(timing.failures[0].exit_code, Some(23));
+            assert_eq!(
+                timing.failures[0].phase,
+                if warmup_failure == 1 {
+                    TimingPhase::Warmup
+                } else {
+                    TimingPhase::Measurement
+                }
+            );
+            assert_eq!(
+                BenchResult::from_timing("partial", "sh", &timing, "fixture"),
+                Err(BenchValidationError::FailedInvocations {
+                    warmup_failures: warmup_failure,
+                    measurement_failures: measurement_failure,
+                })
+            );
+        }
     }
 
     #[test]
@@ -1755,12 +2020,91 @@ mod tests {
         let err = run_timed(&command, 2, 3, &BTreeMap::new(), None)
             .expect_err("expected no successful measurement runs");
 
+        let BenchTimingError::NoSuccessfulMeasurementRuns {
+            attempted_runs,
+            failure_count,
+            timing,
+        } = err
+        else {
+            panic!("expected no successful measurement runs");
+        };
+        assert_eq!(attempted_runs, 3);
+        assert_eq!(failure_count, 3);
+        assert_eq!(timing.samples_seconds, Vec::<f64>::new());
+        assert_eq!(timing.warmup_runs, 2);
+        assert_eq!(timing.measurement_runs, 3);
+        assert_eq!(timing.warmup_failures, 2);
+        assert_eq!(timing.measurement_failures, 3);
+        assert_eq!(timing.failures.len(), 5);
+        assert!(timing.failures.iter().all(|failure| {
+            failure.exit_code.is_none()
+                && failure
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| !error.is_empty())
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_failed_timing_runs_retain_every_process_invocation() {
+        let dir = tempfile::tempdir().expect("counter directory");
+        let counter = dir.path().join("invocations");
+        let command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            r#"count=0
+if [ -f "$1" ]; then read -r count < "$1"; fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$1"
+exit 23"#
+                .to_string(),
+            "bench-invocation".to_string(),
+            counter.to_string_lossy().into_owned(),
+        ];
+        let err = run_timed(&command, 2, 3, &BTreeMap::new(), None)
+            .expect_err("all process invocations fail");
+        assert_eq!(fs::read_to_string(counter).expect("counter"), "5\n");
+        let BenchTimingError::NoSuccessfulMeasurementRuns {
+            attempted_runs,
+            failure_count,
+            timing,
+        } = err
+        else {
+            panic!("expected no successful measurement runs");
+        };
+        assert_eq!(attempted_runs, 3);
+        assert_eq!(failure_count, 3);
+        assert_eq!(timing.samples_seconds, Vec::<f64>::new());
+        assert_eq!(timing.warmup_failures, 2);
+        assert_eq!(timing.measurement_failures, 3);
         assert_eq!(
-            err,
-            BenchTimingError::NoSuccessfulMeasurementRuns {
-                attempted_runs: 3,
-                failure_count: 3,
-            }
+            timing
+                .failures
+                .iter()
+                .map(|failure| (failure.phase, failure.iteration, failure.exit_code))
+                .collect::<Vec<_>>(),
+            [
+                (TimingPhase::Warmup, 1, Some(23)),
+                (TimingPhase::Warmup, 2, Some(23)),
+                (TimingPhase::Measurement, 1, Some(23)),
+                (TimingPhase::Measurement, 2, Some(23)),
+                (TimingPhase::Measurement, 3, Some(23)),
+            ]
+        );
+        assert!(
+            timing
+                .failures
+                .iter()
+                .all(|failure| failure.error.is_none())
+        );
+        assert!(timing.total_elapsed_us > 0);
+        assert_eq!(
+            BenchResult::from_timing("all-failed", "sh", &timing, "fixture"),
+            Err(BenchValidationError::FailedInvocations {
+                warmup_failures: 2,
+                measurement_failures: 3,
+            })
         );
     }
 

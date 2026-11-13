@@ -10,7 +10,7 @@
 //! rest by moving incident evidence into `doctor/reclaimable/rotation-<ts>[-<n>]/`.
 //! On Unix, dated periodic `.bak` generations are instead deleted by default
 //! only after a newer fully verified snapshot authorizes reclamation. Previously
-//! staged periodic generations are reclaimed by the same safety boundary.
+//! staged periodic generations share that keep window and safety boundary.
 //! An explicit false `AM_BACKUP_ROTATION_DELETE` preserves move-only retention;
 //! the automatic producer then stops at its publication budget. Kinds are classified by filename
 //! suffix pattern so we never touch the live DB (`storage.sqlite3`), the
@@ -23,9 +23,11 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use tracing::{debug, info, warn};
+
+use crate::integrity_guard::BackupParentAdmission;
 
 #[cfg(unix)]
 use mcp_agent_mail_db::recovery_retention::{
@@ -41,9 +43,45 @@ const PERIODIC_BYTES_FLOOR: u64 = 512 * 1024 * 1024;
 const MAX_RECLAIM_FILES_PER_PASS: usize = 128;
 #[cfg(unix)]
 const MAX_RECLAIM_DIRECTORIES_PER_PASS: usize = 128;
+/// Wall-clock limit on the rotation pass a cold start waits for.
+///
+/// That pass runs before the listener binds, and every reclaimed entry costs a
+/// scan of `/proc`. Past this budget the pass stops reclaiming and the
+/// background loop takes the rest.
+pub const COLD_START_ROTATION_BUDGET: Duration = Duration::from_secs(1);
+/// Background reclamation also yields between verified operations. An
+/// individual synchronous verification may finish after this soft deadline.
+pub const BACKGROUND_ROTATION_BUDGET: Duration = Duration::from_secs(1);
 const MAX_INVENTORY_ENTRIES: usize = 16_384;
 #[cfg(any(not(unix), test))]
 const MAX_QUARANTINE_LEAF_ATTEMPTS: u32 = 128;
+
+#[derive(Clone, Copy)]
+struct RotationWorkBudget {
+    deadline: Option<Instant>,
+    finish_first_unit: bool,
+}
+
+impl RotationWorkBudget {
+    const fn strict(deadline: Option<Instant>) -> Self {
+        Self {
+            deadline,
+            finish_first_unit: false,
+        }
+    }
+
+    fn background(budget: Duration) -> Self {
+        Self {
+            deadline: Instant::now().checked_add(budget),
+            finish_first_unit: cfg!(unix),
+        }
+    }
+
+    fn admit_first_unit(self, entered: Instant) -> Option<Instant> {
+        (self.finish_first_unit && self.deadline.is_some_and(|deadline| entered < deadline))
+            .then_some(entered)
+    }
+}
 
 // Lifted to the db crate (GH#210) so the MCP `health_check` retention block
 // (tools crate, which cannot depend on this crate) and `am doctor health`
@@ -54,12 +92,24 @@ pub use mcp_agent_mail_db::recovery_retention::{
     inspect_storage_backups,
 };
 
+/// Monotone budget evidence for a rotation pass. A deadline may be reached
+/// by the final admitted operation without leaving any deferred work.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RotationBudgetState {
+    #[default]
+    WithinBudget,
+    WorkDeferred,
+    DeadlineReached,
+    DeadlineWithDeferredWork,
+}
+
 /// Report returned by `rotate_storage_backups`. One entry per non-empty kind.
 ///
 /// "Staged" means moved into a `doctor/reclaimable/rotation-<ts>[-<n>]/`
-/// quarantine directory; "deleted" means hard-removed. Superseded periodic
-/// generations can be deleted by default under verified snapshot admission;
-/// other kinds require explicit `AM_BACKUP_ROTATION_DELETE` opt-in.
+/// quarantine directory; "deleted" means its pathname was durably unlinked.
+/// Superseded periodic generations can be deleted by default under verified
+/// snapshot admission; other kinds require explicit `AM_BACKUP_ROTATION_DELETE`
+/// opt-in.
 /// Staged bytes are *not* reclaimed disk. On Unix, staging also requires the
 /// source-file and parent-directory syncs and identity checks to complete.
 /// A rename followed by failed sync or validation is separately unconfirmed:
@@ -78,8 +128,14 @@ pub struct RotateReport {
     pub bytes_staged: u64,
     pub bytes_deleted: u64,
     /// Allocated bytes of successfully unlinked, single-link files. This is
-    /// not a measurement of the filesystem's free-space delta.
+    /// not a measurement of the filesystem's free-space delta. Files with
+    /// incomplete reader visibility do not contribute to this total.
     pub bytes_reclaimed: u64,
+    /// Completed unlinks whose external reader inventory was incomplete.
+    /// This includes completed unlinks with unconfirmed directory durability;
+    /// surviving descriptors and mappings can still retain the inode's blocks.
+    pub unlinks_with_unobserved_readers: usize,
+    pub bytes_unlinked_with_unobserved_readers: u64,
     pub unconfirmed_deletions: usize,
     pub bytes_unconfirmed_deletions: u64,
     pub unconfirmed_moves: usize,
@@ -87,14 +143,56 @@ pub struct RotateReport {
     /// At least one path could not be inventoried. Byte totals are then known
     /// lower bounds; inaccessible evidence is never treated as zero bytes.
     pub inventory_incomplete: bool,
-    /// Namespace, inventory, or snapshot admission was unavailable. A quota
-    /// refusal following this pass must not authorize a repair export.
+    /// Namespace, inventory, or snapshot admission was unavailable, or a
+    /// completed mutation has unconfirmed durability. A quota refusal following
+    /// this pass must not authorize a repair export.
     pub admission_refused: bool,
+    /// Budget exhaustion and deferred work remain distinct: neither means
+    /// reclamation failed or authorizes a repair export.
+    pub budget_state: RotationBudgetState,
+    /// An unchanged complete bounded search found no verified pin. This may
+    /// reach the existing one-shot repair-export gate, never deletion.
+    pub completed_pin_search_without_match: bool,
+    /// Periodic images removed from inside the newest-image window, because
+    /// the publication budget was still exhausted when the pass reached them.
+    pub window_images_deleted: usize,
     pub failures: Vec<RotationFailure>,
     pub per_kind: BTreeMap<&'static str, RotateKindSummary>,
 }
 
 impl RotateReport {
+    #[must_use]
+    pub const fn deadline_reached(&self) -> bool {
+        matches!(
+            self.budget_state,
+            RotationBudgetState::DeadlineReached | RotationBudgetState::DeadlineWithDeferredWork
+        )
+    }
+
+    #[must_use]
+    pub const fn work_deferred(&self) -> bool {
+        matches!(
+            self.budget_state,
+            RotationBudgetState::WorkDeferred | RotationBudgetState::DeadlineWithDeferredWork
+        )
+    }
+
+    fn note_deadline(&mut self) {
+        self.budget_state = if self.work_deferred() {
+            RotationBudgetState::DeadlineWithDeferredWork
+        } else {
+            RotationBudgetState::DeadlineReached
+        };
+    }
+
+    fn defer_work(&mut self) {
+        self.budget_state = if self.deadline_reached() {
+            RotationBudgetState::DeadlineWithDeferredWork
+        } else {
+            RotationBudgetState::WorkDeferred
+        };
+    }
+
     /// Confirmed completed evictions. Unconfirmed moves are reported separately
     /// and must never be silently promoted into successful staging counts.
     #[must_use]
@@ -102,8 +200,9 @@ impl RotateReport {
         self.staged.saturating_add(self.deleted)
     }
 
-    /// Known retained logical bytes, including quarantined and incompletely
-    /// staged files. Unconfirmed unlinks have their own separate counter.
+    /// Known logical bytes at retained paths, including quarantined and
+    /// incompletely staged files. Unconfirmed unlinks have their own counter;
+    /// unlinked bytes possibly held by unobserved readers are also separate.
     #[must_use]
     pub const fn bytes_retained(&self) -> u64 {
         self.bytes_kept
@@ -111,7 +210,17 @@ impl RotateReport {
             .saturating_add(self.bytes_unconfirmed_moves)
     }
 
+    fn record_failure(&mut self, failure: RotationFailure) {
+        // A completed namespace operation with uncertain durability is not
+        // evidence of reusable publication capacity. Stop this pass before
+        // another mutation can build on the unconfirmed result.
+        self.admission_refused |= failure.rename_completed || failure.deletion_completed;
+        self.failures.push(failure);
+    }
+
     fn add_kind(&mut self, kind: &'static str, summary: &RotateKindSummary) {
+        self.admission_refused |=
+            summary.unconfirmed_moves > 0 || summary.unconfirmed_deletions > 0;
         if summary == &RotateKindSummary::default() {
             return;
         }
@@ -122,6 +231,12 @@ impl RotateReport {
         self.bytes_staged = self.bytes_staged.saturating_add(summary.bytes_staged);
         self.bytes_deleted = self.bytes_deleted.saturating_add(summary.bytes_deleted);
         self.bytes_reclaimed = self.bytes_reclaimed.saturating_add(summary.bytes_reclaimed);
+        self.unlinks_with_unobserved_readers = self
+            .unlinks_with_unobserved_readers
+            .saturating_add(summary.unlinks_with_unobserved_readers);
+        self.bytes_unlinked_with_unobserved_readers = self
+            .bytes_unlinked_with_unobserved_readers
+            .saturating_add(summary.bytes_unlinked_with_unobserved_readers);
         self.unconfirmed_moves = self
             .unconfirmed_moves
             .saturating_add(summary.unconfirmed_moves);
@@ -144,6 +259,12 @@ impl RotateReport {
         total.bytes_reclaimed = total
             .bytes_reclaimed
             .saturating_add(summary.bytes_reclaimed);
+        total.unlinks_with_unobserved_readers = total
+            .unlinks_with_unobserved_readers
+            .saturating_add(summary.unlinks_with_unobserved_readers);
+        total.bytes_unlinked_with_unobserved_readers = total
+            .bytes_unlinked_with_unobserved_readers
+            .saturating_add(summary.bytes_unlinked_with_unobserved_readers);
         total.unconfirmed_moves = total
             .unconfirmed_moves
             .saturating_add(summary.unconfirmed_moves);
@@ -165,6 +286,8 @@ pub struct RotationFailure {
     pub source: PathBuf,
     pub rename_completed: bool,
     pub deletion_completed: bool,
+    /// A completed unlink had incomplete external reader visibility.
+    pub reader_inventory_incomplete: bool,
     /// Requested spelling, not a guarantee that a concurrently renamed parent
     /// can still be reached through this path. Never use it for blind rollback.
     pub requested_destination: Option<PathBuf>,
@@ -187,6 +310,12 @@ impl RotationFailure {
                     .is_some(),
             #[cfg(not(unix))]
             deletion_completed: false,
+            #[cfg(unix)]
+            reader_inventory_incomplete:
+                mcp_agent_mail_db::recovery_retention::CompletedReclaimDelete::from_io_error(error)
+                    .is_some_and(|completed| completed.bytes().reader_inventory_incomplete),
+            #[cfg(not(unix))]
+            reader_inventory_incomplete: false,
             requested_destination,
             error: error.to_string(),
         }
@@ -202,6 +331,8 @@ pub struct RotateKindSummary {
     pub bytes_staged: u64,
     pub bytes_deleted: u64,
     pub bytes_reclaimed: u64,
+    pub unlinks_with_unobserved_readers: usize,
+    pub bytes_unlinked_with_unobserved_readers: u64,
     pub unconfirmed_deletions: usize,
     pub bytes_unconfirmed_deletions: u64,
     pub unconfirmed_moves: usize,
@@ -209,11 +340,38 @@ pub struct RotateKindSummary {
 }
 
 impl RotateKindSummary {
+    fn record_reader_visibility(&mut self, incomplete: bool, bytes: u64) {
+        if incomplete {
+            self.unlinks_with_unobserved_readers =
+                self.unlinks_with_unobserved_readers.saturating_add(1);
+            self.bytes_unlinked_with_unobserved_readers = self
+                .bytes_unlinked_with_unobserved_readers
+                .saturating_add(bytes);
+        }
+    }
+
+    fn record_deletion(
+        &mut self,
+        logical_bytes: u64,
+        allocated_bytes: Option<u64>,
+        reader_inventory_incomplete: bool,
+    ) {
+        self.deleted = self.deleted.saturating_add(1);
+        self.bytes_deleted = self.bytes_deleted.saturating_add(logical_bytes);
+        if !reader_inventory_incomplete {
+            self.bytes_reclaimed = self
+                .bytes_reclaimed
+                .saturating_add(allocated_bytes.unwrap_or(0));
+        }
+        self.record_reader_visibility(reader_inventory_incomplete, logical_bytes);
+    }
+
     fn record_failure(&mut self, failure: &RotationFailure, bytes: u64) {
         if failure.deletion_completed {
             self.unconfirmed_deletions = self.unconfirmed_deletions.saturating_add(1);
             self.bytes_unconfirmed_deletions =
                 self.bytes_unconfirmed_deletions.saturating_add(bytes);
+            self.record_reader_visibility(failure.reader_inventory_incomplete, bytes);
         } else if failure.rename_completed {
             self.unconfirmed_moves = self.unconfirmed_moves.saturating_add(1);
             self.bytes_unconfirmed_moves = self.bytes_unconfirmed_moves.saturating_add(bytes);
@@ -273,6 +431,21 @@ impl std::fmt::Display for PeriodicBudgetExceeded {
 
 impl std::error::Error for PeriodicBudgetExceeded {}
 
+/// Deferral does not establish that the complete inventory cannot reclaim
+/// enough capacity, so it must never enter the repair-export allowance path.
+#[derive(Debug)]
+pub(crate) struct RotationWorkDeferred;
+
+impl std::fmt::Display for RotationWorkDeferred {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "backup retention work deferred; no repair export was reserved; a later bounded pass will resume",
+        )
+    }
+}
+
+impl std::error::Error for RotationWorkDeferred {}
+
 /// Only a complete inventory that exceeds policy may use the durable repair
 /// allowance. I/O failures and ambiguous paths never authorize extra exports.
 pub(crate) fn periodic_publication_budget_exhausted(error: &std::io::Error) -> bool {
@@ -296,6 +469,26 @@ fn is_periodic_backup(primary: &Path, name: &std::ffi::OsStr) -> bool {
         })
 }
 
+/// The database parent also contains live reservation temporary files. Their
+/// atomic publication/removal is unrelated to backup inventory (GH#383).
+/// Classify names before touching metadata, as publication admission does.
+/// Genuine backup metadata failures remain incomplete inventory, including
+/// ENOENT; historical transaction markers use their separate strict walker.
+fn inspect_resident_backup_entry(
+    database_name: &std::ffi::OsStr,
+    entry: &fs::DirEntry,
+) -> std::io::Result<Option<(BackupKind, fs::Metadata)>> {
+    let Some(kind) = classify_backup_file(database_name, &entry.file_name()) else {
+        return Ok(None);
+    };
+    // Archive-reconcile snapshots belong to the recovery reclaim planner.
+    if kind == BackupKind::ArchiveReconcile {
+        return Ok(None);
+    }
+    let metadata = fs::symlink_metadata(entry.path())?;
+    Ok(metadata.file_type().is_file().then_some((kind, metadata)))
+}
+
 /// Whether a file of one backup kind occupies that kind's resident window and
 /// can be evicted from it. Under periodic reclamation the manual-backup kind
 /// counts only its strict periodic generations. Operator exports and WAL/SHM
@@ -306,6 +499,44 @@ fn occupies_rotation_window(primary: &Path, path: &Path, periodic_reclaim: bool)
         || path
             .file_name()
             .is_some_and(|name| is_periodic_backup(primary, name))
+}
+
+/// Use the same recovery preference for keep-window selection and reclamation.
+/// Generation timestamps and numeric collision suffixes take precedence over
+/// copy-preserved mtimes and the directory that happens to contain an image.
+fn backup_order_newest_first(
+    primary: &Path,
+    left: (&Path, SystemTime),
+    right: (&Path, SystemTime),
+) -> std::cmp::Ordering {
+    let candidate = |path: &Path| {
+        let database_name = primary.file_name()?;
+        let name = path.file_name()?;
+        ["", "-wal", "-shm"].into_iter().find_map(|sidecar| {
+            let mut stem = database_name.to_os_string();
+            stem.push(sidecar);
+            mcp_agent_mail_core::disk::classify_sqlite_recovery_candidate_name(&stem, name)
+        })
+    };
+    let left_candidate = candidate(left.0);
+    let right_candidate = candidate(right.0);
+    let generation = |name: Option<mcp_agent_mail_core::disk::SqliteRecoveryCandidateName>,
+                      modified| {
+        name.and_then(mcp_agent_mail_core::disk::SqliteRecoveryCandidateName::generation_micros)
+            .unwrap_or_else(|| chrono::DateTime::<chrono::Utc>::from(modified).timestamp_micros())
+    };
+    let order = generation(right_candidate, right.1)
+        .cmp(&generation(left_candidate, left.1))
+        .then_with(|| right_candidate.is_some().cmp(&left_candidate.is_some()));
+    let collision_order = match (left_candidate, right_candidate) {
+        (Some(left_name), Some(right_name)) => {
+            left_name.cmp_newest_first(left.1, right_name, right.1)
+        }
+        _ => std::cmp::Ordering::Equal,
+    };
+    order
+        .then(collision_order)
+        .then_with(|| left.0.cmp(right.0))
 }
 
 fn is_native_rotation_directory(name: &std::ffi::OsStr) -> bool {
@@ -400,6 +631,17 @@ impl PeriodicPublicationBudget {
         periodic_limit_reached(
             self.count,
             self.bytes,
+            self.projected,
+            self.count_limit,
+            self.byte_limit,
+        )
+    }
+
+    /// Whether publication would stay refused with these images gone too.
+    const fn exhausted_without(&self, images: usize, bytes: u64) -> bool {
+        periodic_limit_reached(
+            self.count.saturating_sub(images),
+            self.bytes.saturating_sub(bytes),
             self.projected,
             self.count_limit,
             self.byte_limit,
@@ -571,8 +813,10 @@ fn inspect_historical_backups(storage_root: &Path, primary: &Path) -> Historical
 fn reclaim_empty_rotation_directories(
     storage_root: &Path,
     remaining: &mut usize,
+    deadline: Option<Instant>,
+    first_unit_admitted_at: &mut Option<Instant>,
     report: &mut RotateReport,
-    mut admit: impl FnMut() -> std::io::Result<()>,
+    mut admit: impl FnMut(Option<Instant>) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     if *remaining == 0 {
         return Ok(());
@@ -600,7 +844,14 @@ fn reclaim_empty_rotation_directories(
         if !metadata.file_type().is_dir() || fs::read_dir(&path)?.next().transpose()?.is_some() {
             continue;
         }
-        admit()?;
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            && first_unit_admitted_at.is_none()
+        {
+            report.note_deadline();
+            report.defer_work();
+            break;
+        }
+        admit(first_unit_admitted_at.take())?;
         *remaining -= 1;
         match mcp_agent_mail_db::recovery_retention::delete_empty_reclaim_directory(
             &path, &metadata,
@@ -609,9 +860,8 @@ fn reclaim_empty_rotation_directories(
             Err(error) => {
                 let failure = RotationFailure::from_error(&path, &error);
                 let completed = failure.deletion_completed;
-                report.failures.push(failure);
+                report.record_failure(failure);
                 if completed {
-                    report.admission_refused = true;
                     break;
                 }
             }
@@ -748,11 +998,26 @@ struct ReclaimBudget {
     bytes: u64,
     byte_limit: u64,
     publication: Option<PeriodicPublicationBudget>,
+    deadline: Option<Instant>,
+    deadline_reached: bool,
 }
 
 #[cfg(unix)]
 impl ReclaimBudget {
     fn admit(&mut self, bytes: u64) -> bool {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.deadline_reached = true;
+            // Pin admission is prerequisite work for a reclaim unit. If it
+            // alone consumes the slice, allow one candidate to finish or a
+            // large verified mailbox would never make progress. The caller
+            // refuses already-spent slices before acquiring the pin.
+            if self.attempted > 0 {
+                return false;
+            }
+        }
         // Admit one oversized image so a large mailbox can still make progress.
         if self.attempted >= MAX_RECLAIM_FILES_PER_PASS
             || (self.attempted > 0 && self.bytes.saturating_add(bytes) > self.byte_limit)
@@ -776,7 +1041,15 @@ fn reclaim_periodic_file(
     historical: bool,
 ) -> bool {
     let (path, metadata) = file;
-    if !budget.admit(metadata.len()) {
+    // Candidate integrity, possible lineage-fallback hashing, and the pinned
+    // replacement hash all consume work. The publication budget below still
+    // counts each deleted payload exactly once.
+    let verification_bytes = metadata
+        .len()
+        .saturating_mul(2)
+        .saturating_add(guard.verified_source_size_bytes().unwrap_or(0));
+    if !budget.admit(verification_bytes) {
+        report.defer_work();
         summary.kept = summary.kept.saturating_add(1);
         summary.bytes_kept = summary.bytes_kept.saturating_add(metadata.len());
         return false;
@@ -790,11 +1063,11 @@ fn reclaim_periodic_file(
     };
     match result {
         Ok(bytes) => {
-            summary.deleted = summary.deleted.saturating_add(1);
-            summary.bytes_deleted = summary.bytes_deleted.saturating_add(bytes.logical_bytes);
-            summary.bytes_reclaimed = summary
-                .bytes_reclaimed
-                .saturating_add(bytes.allocated_bytes.unwrap_or(0));
+            summary.record_deletion(
+                bytes.logical_bytes,
+                bytes.allocated_bytes,
+                bytes.reader_inventory_incomplete,
+            );
             if let Some(publication) = budget.publication.as_mut() {
                 publication.record_deletion(bytes.logical_bytes);
             }
@@ -802,7 +1075,7 @@ fn reclaim_periodic_file(
         Err(error) => {
             let failure = RotationFailure::from_error(path, &error);
             summary.record_failure(&failure, metadata.len());
-            report.failures.push(failure);
+            report.record_failure(failure);
         }
     }
     true
@@ -813,14 +1086,15 @@ struct PendingReclaim {
     path: PathBuf,
     metadata: fs::Metadata,
     historical: bool,
-    /// Shorten the normal resident window only while the complete footprint
-    /// still prevents publication. The exact slot and verified pin never enter
-    /// this queue, and failed deletions never satisfy this condition.
+    /// Shorten the normal periodic window only while the complete footprint
+    /// still prevents publication and removing the rest of the window would
+    /// end that. The exact slot and verified pin never enter this queue, and
+    /// failed deletions never satisfy this condition.
     within_window: bool,
 }
 
 #[cfg(unix)]
-type ReclaimCursor = (i64, PathBuf);
+type ReclaimCursor = (SystemTime, PathBuf);
 
 #[cfg(unix)]
 fn reclaim_pending(
@@ -836,42 +1110,71 @@ fn reclaim_pending(
     static CURSORS: std::sync::OnceLock<std::sync::Mutex<BTreeMap<PathBuf, ReclaimCursor>>> =
         std::sync::OnceLock::new();
     let cursors = CURSORS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
-    let key = |entry: &PendingReclaim| {
-        let generation = primary
-            .file_name()
-            .zip(entry.path.file_name())
-            .and_then(|(database, name)| {
-                mcp_agent_mail_core::disk::classify_sqlite_recovery_candidate_name(database, name)
-            })
-            .and_then(mcp_agent_mail_core::disk::SqliteRecoveryCandidateName::generation_micros)
-            .unwrap_or(i64::MIN);
-        (generation, entry.path.clone())
+    let modified =
+        |entry: &PendingReclaim| entry.metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let oldest_first = |left: &PendingReclaim, right: &PendingReclaim| {
+        backup_order_newest_first(
+            primary,
+            (&right.path, modified(right)),
+            (&left.path, modified(left)),
+        )
     };
-    pending.sort_by_key(&key);
+    pending.sort_by(oldest_first);
     let cursor = cursors
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(primary)
         .cloned();
     if let Some(cursor) = cursor {
-        let start = pending.partition_point(|entry| key(entry) <= cursor);
+        let start = pending.partition_point(|entry| {
+            !backup_order_newest_first(
+                primary,
+                (&cursor.1, cursor.0),
+                (&entry.path, modified(entry)),
+            )
+            .is_gt()
+        });
         pending.rotate_left(start);
     }
+    // Stable, so older entries keep the cursor's fair turn, and each has had its
+    // try before the first window image is considered. The window needs no fair
+    // turn: a refusal doesn't stop this loop, so its oldest image always goes
+    // first and the next still gets its try in the same pass.
+    pending.sort_by_key(|entry| entry.within_window);
+    let window_start = pending.partition_point(|entry| !entry.within_window);
+    pending[window_start..].sort_by(oldest_first);
+    let (mut window_images, mut window_bytes) = pending
+        .iter()
+        .filter(|entry| entry.within_window)
+        .fold((0_usize, 0_u64), |(images, bytes), entry| {
+            (
+                images.saturating_add(1),
+                bytes.saturating_add(entry.metadata.len()),
+            )
+        });
     let mut summary = RotateKindSummary::default();
     let mut last_attempted = None;
     let mut stopped = report.admission_refused;
     for entry in pending {
-        if stopped
-            || (entry.within_window
-                && budget
-                    .publication
-                    .as_ref()
-                    .is_none_or(|publication| !publication.exhausted()))
-        {
+        // The budget has only this pass's confirmed deletions in it, so what a
+        // refusal left behind still counts against the rest of the window.
+        let keep_window = entry.within_window
+            && budget.publication.as_ref().is_none_or(|publication| {
+                !publication.exhausted()
+                    || publication.exhausted_without(window_images, window_bytes)
+            });
+        if entry.within_window {
+            window_images = window_images.saturating_sub(1);
+            window_bytes = window_bytes.saturating_sub(entry.metadata.len());
+        }
+        if stopped || keep_window {
             summary.kept = summary.kept.saturating_add(1);
             summary.bytes_kept = summary.bytes_kept.saturating_add(entry.metadata.len());
             continue;
         }
+        let removed_before = summary
+            .deleted
+            .saturating_add(summary.unconfirmed_deletions);
         if reclaim_periodic_file(
             primary,
             (&entry.path, &entry.metadata),
@@ -881,12 +1184,20 @@ fn reclaim_pending(
             report,
             entry.historical,
         ) {
-            last_attempted = Some(key(&entry));
+            last_attempted = Some((modified(&entry), entry.path.clone()));
         } else {
             // Do not skip an oversized candidate and keep advancing the
             // cursor through smaller files behind it. It needs to be first
             // on the next pass to use the oversized-file allowance.
             stopped = true;
+        }
+        if entry.within_window
+            && summary
+                .deleted
+                .saturating_add(summary.unconfirmed_deletions)
+                > removed_before
+        {
+            report.window_images_deleted = report.window_images_deleted.saturating_add(1);
         }
         stopped |= report.admission_refused;
     }
@@ -933,6 +1244,22 @@ fn revalidate_historical_directory(primary: &Path, file: &Path) -> std::io::Resu
 }
 
 #[cfg(unix)]
+enum RotationParent<'a> {
+    Exporter(&'a BackupParentAdmission),
+    Retained(fs::File),
+}
+
+#[cfg(unix)]
+impl RotationParent<'_> {
+    const fn directory(&self) -> &fs::File {
+        match self {
+            Self::Exporter(admission) => admission.retained_parent(),
+            Self::Retained(directory) => directory,
+        }
+    }
+}
+
+#[cfg(unix)]
 fn acquire_rotation_parent(parent: &Path) -> std::io::Result<fs::File> {
     use std::os::unix::fs::MetadataExt as _;
     let before = fs::symlink_metadata(parent)?;
@@ -956,6 +1283,52 @@ fn acquire_rotation_parent(parent: &Path) -> std::io::Result<fs::File> {
         ));
     }
     Ok(directory)
+}
+
+#[cfg(unix)]
+fn acquire_snapshot_retention(
+    primary: &Path,
+    parent: &fs::File,
+    deadline: Option<Instant>,
+    first_unit_admitted_at: Option<Instant>,
+) -> std::io::Result<mcp_agent_mail_db::snapshot::SnapshotRetentionGuard> {
+    deadline.map_or_else(
+        || mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire_for_parent(primary, parent),
+        |deadline| first_unit_admitted_at.map_or_else(
+            || mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire_for_parent_until(
+                primary, parent, deadline,
+            ),
+            |admitted_at| {
+                mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire_for_parent_finishing_turn(
+                    primary, parent, admitted_at, deadline,
+                )
+            },
+        ),
+    )
+}
+
+#[cfg(unix)]
+fn record_snapshot_admission_error(report: &mut RotateReport, path: &Path, error: &std::io::Error) {
+    if let Some(reason) =
+        mcp_agent_mail_db::snapshot::SnapshotRetentionDeferred::from_io_error(error)
+    {
+        report.defer_work();
+        if reason == mcp_agent_mail_db::snapshot::SnapshotRetentionDeferred::Deadline {
+            report.note_deadline();
+        }
+        if reason == mcp_agent_mail_db::snapshot::SnapshotRetentionDeferred::InventoryChanged {
+            report.inventory_incomplete = true;
+            report.admission_refused = true;
+            report
+                .failures
+                .push(RotationFailure::from_error(path, error));
+        }
+    } else {
+        report.admission_refused = true;
+        report
+            .failures
+            .push(RotationFailure::from_error(path, error));
+    }
 }
 
 // Preserve the existing non-Unix move contract. The stronger descriptor and
@@ -1096,6 +1469,52 @@ pub fn rotate_storage_backups(
     )
 }
 
+/// A pass for a caller that cannot wait for a backlog.
+///
+/// At `budget` it defers remaining work to a later pass. A pin verification
+/// already admitted may finish, followed by one complete reclaim operation
+/// per work class; this cooperative bound allows progress on oversized images.
+/// Inventory still completes for retained-byte accounting, but a budget spent
+/// before pin admission cannot start new snapshot verification work.
+pub fn rotate_storage_backups_within(
+    storage_root: &Path,
+    database_path: &Path,
+    keep_per_kind: usize,
+    budget: Duration,
+) -> std::io::Result<RotateReport> {
+    rotate_storage_backups_impl(
+        storage_root,
+        database_path,
+        keep_per_kind,
+        stage_backup_noreplace,
+        None,
+        RotationWorkBudget::strict(Instant::now().checked_add(budget)),
+        |_| {},
+    )
+}
+
+/// Background progress includes inventory in its first cooperative work unit.
+/// A turn admitted before its original deadline may finish one pin candidate
+/// and the existing first reclaim operation per class after slow inventory.
+/// Later work still observes that same deadline. The caller charges the whole
+/// elapsed turn, including any overrun, to its continuation rest schedule.
+pub(crate) fn rotate_storage_backups_in_background(
+    storage_root: &Path,
+    database_path: &Path,
+    keep_per_kind: usize,
+    budget: Duration,
+) -> std::io::Result<RotateReport> {
+    rotate_storage_backups_impl(
+        storage_root,
+        database_path,
+        keep_per_kind,
+        stage_backup_noreplace,
+        None,
+        RotationWorkBudget::background(budget),
+        |_| {},
+    )
+}
+
 /// The automatic producer already owns the database-parent exporter lease.
 /// Reacquiring a second flock would refuse our own admission. Use this entry
 /// only inside that existing admitted producer/cleanup closure.
@@ -1103,13 +1522,17 @@ pub(crate) fn rotate_storage_backups_with_exporter_lease(
     storage_root: &Path,
     database_path: &Path,
     keep_per_kind: usize,
+    admission: &BackupParentAdmission,
+    budget: Duration,
 ) -> std::io::Result<RotateReport> {
     rotate_storage_backups_impl(
         storage_root,
         database_path,
         keep_per_kind,
         stage_backup_noreplace,
-        true,
+        Some(admission),
+        RotationWorkBudget::background(budget),
+        |_| {},
     )
 }
 
@@ -1122,19 +1545,34 @@ fn rotate_storage_backups_with<F>(
 where
     F: FnMut(&Path, &RotationQuarantine, &fs::Metadata) -> std::io::Result<PathBuf>,
 {
-    rotate_storage_backups_impl(storage_root, database_path, keep_per_kind, stage, false)
+    rotate_storage_backups_impl(
+        storage_root,
+        database_path,
+        keep_per_kind,
+        stage,
+        None,
+        RotationWorkBudget::strict(None),
+        |_| {},
+    )
 }
 
-fn rotate_storage_backups_impl<F>(
+fn rotate_storage_backups_impl<F, I>(
     storage_root: &Path,
     database_path: &Path,
     keep_per_kind: usize,
     mut stage: F,
-    caller_holds_parent_lease: bool,
+    exporter_admission: Option<&BackupParentAdmission>,
+    budget: RotationWorkBudget,
+    mut before_inventory_entry: I,
 ) -> std::io::Result<RotateReport>
 where
     F: FnMut(&Path, &RotationQuarantine, &fs::Metadata) -> std::io::Result<PathBuf>,
+    I: FnMut(&fs::DirEntry),
 {
+    let deadline = budget.deadline;
+    let first_unit_admitted_at = budget.admit_first_unit(Instant::now());
+    #[cfg(unix)]
+    let mut first_unit_admitted_at = first_unit_admitted_at;
     let keep = keep_per_kind.max(MIN_KEEP_PER_KIND);
     let delete_opted_in = rotation_delete_opted_in();
     if database_path.file_name().is_none() {
@@ -1171,14 +1609,30 @@ where
     // cannot make byte accounting or source witnesses stale between the scan
     // and admission. On refusal, still collect the observable retained bytes.
     #[cfg(not(unix))]
-    let _ = caller_holds_parent_lease;
+    let _ = deadline;
+    #[cfg(not(unix))]
+    if let Some(admission) = exporter_admission {
+        admission.revalidate_for(&database_path)?;
+    }
     #[cfg(unix)]
-    let parent_admission = if caller_holds_parent_lease {
-        Ok(None)
-    } else {
-        acquire_rotation_parent(database_parent).map(Some)
-    };
+    let parent_admission = exporter_admission.map_or_else(
+        || acquire_rotation_parent(database_parent).map(RotationParent::Retained),
+        |admission| {
+            admission
+                .revalidate_for(&database_path)
+                .map(|()| RotationParent::Exporter(admission))
+        },
+    );
     let mut report = RotateReport::default();
+    #[cfg(unix)]
+    if exporter_admission.is_some()
+        && let Err(error) = &parent_admission
+    {
+        report.admission_refused = true;
+        report
+            .failures
+            .push(RotationFailure::from_error(database_parent, error));
+    }
     #[cfg(unix)]
     let mut empty_directory_budget = MAX_RECLAIM_DIRECTORIES_PER_PASS;
     #[cfg(unix)]
@@ -1189,14 +1643,20 @@ where
         && let Err(error) = reclaim_empty_rotation_directories(
             &storage_root,
             &mut empty_directory_budget,
+            deadline,
+            &mut first_unit_admitted_at,
             &mut report,
-            || {
+            |admitted_at| {
                 if early_snapshot_guard.is_none() {
-                    early_snapshot_guard = Some(
-                        mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(
-                            snapshot_primary,
-                        )?,
-                    );
+                    let parent = parent_admission
+                        .as_ref()
+                        .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))?;
+                    early_snapshot_guard = Some(acquire_snapshot_retention(
+                        snapshot_primary,
+                        parent.directory(),
+                        deadline,
+                        admitted_at,
+                    )?);
                 }
                 early_snapshot_guard
                     .as_ref()
@@ -1205,14 +1665,14 @@ where
             },
         )
     {
-        report.admission_refused = true;
-        report.failures.push(RotationFailure::from_error(
+        record_snapshot_admission_error(
+            &mut report,
             &storage_root.join("doctor/reclaimable"),
             &error,
-        ));
+        );
     }
     let mut history = inspect_historical_backups(&storage_root, &database_path);
-    report.inventory_incomplete = history.incomplete;
+    report.inventory_incomplete |= history.incomplete;
     report.admission_refused |= history.incomplete;
     report.failures.append(&mut history.failures);
     report.add_kind("protected_quarantine", &history.protected);
@@ -1259,8 +1719,10 @@ where
                 continue;
             }
         };
-        let meta = match fs::symlink_metadata(entry.path()) {
-            Ok(metadata) => metadata,
+        before_inventory_entry(&entry);
+        let (kind, meta) = match inspect_resident_backup_entry(database_name, &entry) {
+            Ok(Some(backup)) => backup,
+            Ok(None) => continue,
             Err(error) => {
                 report.inventory_incomplete = true;
                 report.admission_refused = true;
@@ -1270,21 +1732,6 @@ where
                 continue;
             }
         };
-        if !meta.file_type().is_file() {
-            continue;
-        }
-        let Some(kind) = classify_backup_file(database_name, &entry.file_name()) else {
-            continue;
-        };
-        // Single ownership: `storage.sqlite3.archive-reconcile-*` snapshots
-        // are owned by the recovery-retention reclaim planner
-        // (`mcp-agent-mail-db/src/recovery_retention.rs`), which stages them
-        // with its own policy. If rotation also evicted them, a snapshot
-        // could disappear before the planner stages it — so rotation leaves
-        // this kind alone entirely.
-        if kind == BackupKind::ArchiveReconcile {
-            continue;
-        }
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         by_kind
             .entry(kind)
@@ -1292,10 +1739,21 @@ where
             .push((entry.path(), mtime, meta));
     }
 
+    // Inventory always completes for retained counts. Strict/cold-start calls
+    // stop before new pin work after expiry. A background unit admitted at
+    // entry includes this prerequisite inventory, otherwise a slow directory
+    // scan could defer every continuation without ever checking one candidate.
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        report.note_deadline();
+    }
+    if report.deadline_reached() && first_unit_admitted_at.is_none() {
+        report.defer_work();
+    }
     // Inventory is only a hint: every move checks its retained file witness.
     // Acquire before choosing a pin, then retain admission for the whole pass.
-    // Do not create control state for a missing/empty backup inventory.
-    if report.inventory_incomplete || report.admission_refused {
+    // Do not create control state for a missing/empty backup inventory or work
+    // deferred by the deadline. Deferral is not an admission refusal.
+    if report.inventory_incomplete || report.admission_refused || report.work_deferred() {
         // An unreadable entry may be the recovery record for a visible payload.
         // Preserve every known file and report lower bounds until the complete
         // namespace can be inspected; never infer absence from an I/O error.
@@ -1357,12 +1815,30 @@ where
         None
     };
 
+    // Native rotation staging is another location for periodic generations,
+    // not a separate deletion policy. Rank these files with their resident
+    // peers so raising KEEP_COUNT also protects already-parked images. Build
+    // the publication budget above before merging: it already includes their
+    // count and bytes. Recorded/interrupted recovery transactions stay in
+    // history.protected and never displace the normal retention window.
+    #[cfg(unix)]
+    if periodic_reclamation_enabled() && !history.eligible.is_empty() {
+        by_kind.entry(BackupKind::ManualBackup).or_default().extend(
+            std::mem::take(&mut history.eligible)
+                .into_iter()
+                .map(|(path, metadata)| {
+                    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    (path, modified, metadata)
+                }),
+        );
+    }
+
     // The guard runs retention after every automatic backup attempt, so on
     // every quick integrity cycle. Selecting the verified pin below re-hashes
     // the backup and runs a full integrity check on it, so a pass that cannot
     // evict anything stops here. Candidates exist only beyond a kind's
-    // resident window, in native rotation staging, or inside the periodic
-    // window while the publication footprint is exhausted. The exact slot and
+    // retention window or inside the periodic window while the publication
+    // footprint is exhausted. The exact slot and
     // the pin only remove candidates, so this bound never skips real work.
     #[cfg(unix)]
     let window_may_shorten = publication_budget
@@ -1398,10 +1874,19 @@ where
     }
 
     #[cfg(unix)]
+    let pin_admitted_at = first_unit_admitted_at.take();
+    #[cfg(unix)]
     let (_retained_parent, snapshot_guard) = match parent_admission.and_then(|parent| {
         early_snapshot_guard
             .map_or_else(
-                || mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(snapshot_primary),
+                || {
+                    acquire_snapshot_retention(
+                        snapshot_primary,
+                        parent.directory(),
+                        deadline,
+                        pin_admitted_at,
+                    )
+                },
                 Ok,
             )
             .map(|guard| (parent, guard))
@@ -1410,10 +1895,7 @@ where
         Err(error) => {
             // Refusal is observable even when no bytes can be reclaimed. Do
             // not discard the inventory or imply all bytes disappeared.
-            report.admission_refused = true;
-            report
-                .failures
-                .push(RotationFailure::from_error(snapshot_primary, &error));
+            record_snapshot_admission_error(&mut report, snapshot_primary, &error);
             for (kind, files) in by_kind {
                 let summary = RotateKindSummary {
                     kept: files.len(),
@@ -1436,6 +1918,10 @@ where
         snapshot_guard.metadata_occupied(),
         snapshot_guard.verified_source_path().map(Path::to_path_buf),
     );
+    #[cfg(unix)]
+    {
+        report.completed_pin_search_without_match = snapshot_guard.completed_search_without_pin();
+    }
     #[cfg(not(unix))]
     let snapshot_authority_occupied = match fs::symlink_metadata(&snapshot_metadata) {
         Ok(_) => true,
@@ -1454,6 +1940,8 @@ where
             .unwrap_or(0)
             .max(PERIODIC_BYTES_FLOOR),
         publication: publication_budget,
+        deadline,
+        deadline_reached: false,
     };
     // Incident verification has its own bounded work allowance. Repeatedly
     // refused incident evidence must not starve the periodic backup queue.
@@ -1463,6 +1951,8 @@ where
         bytes: 0,
         byte_limit: reclaim_budget.byte_limit,
         publication: None,
+        deadline,
+        deadline_reached: false,
     };
     #[cfg(unix)]
     let mut pending_reclaims = Vec::new();
@@ -1474,10 +1964,16 @@ where
     let mut quarantine_dir = None;
 
     for (kind, mut files) in by_kind {
-        if kind == BackupKind::ManualBackup
-            && snapshot_authority_occupied
-            && pinned_verified_snapshot.is_none()
+        let periodic_reclaim = kind == BackupKind::ManualBackup && periodic_reclamation_enabled();
+        if pinned_verified_snapshot.is_none()
+            && ((kind == BackupKind::ManualBackup
+                && (snapshot_authority_occupied || periodic_reclaim))
+                || (delete_opted_in && files.len() > keep))
         {
+            // Without a pin these deletions cannot possibly succeed. Retain
+            // them in one accounting pass, rather than endlessly exhausting
+            // a verification budget and masking the bounded repair allowance.
+            // Move-only incident staging without metadata remains unchanged.
             let summary = RotateKindSummary {
                 kept: files.len(),
                 bytes_kept: files
@@ -1486,9 +1982,10 @@ where
                 ..Default::default()
             };
             warn!(
+                kind = kind.label(),
                 metadata = %snapshot_metadata.display(),
                 kept = files.len(),
-                "verified-snapshot metadata is occupied but no authoritative backup generation can be resolved; refusing manual-backup rotation"
+                "no authoritative verified backup generation can be resolved; backup generations retained"
             );
             report.add_kind(kind.label(), &summary);
             report.failures.push(RotationFailure::from_error(
@@ -1502,83 +1999,41 @@ where
         // Published backup generations outrank copy-preserved mtimes. Other
         // debris uses mtime; raw paths make ties deterministic.
         files.sort_by(|left, right| {
-            let candidate = |path: &Path| {
-                let name = path.file_name()?;
-                ["", "-wal", "-shm"].into_iter().find_map(|sidecar| {
-                    let mut stem = database_name.to_os_string();
-                    stem.push(sidecar);
-                    mcp_agent_mail_core::disk::classify_sqlite_recovery_candidate_name(&stem, name)
-                })
-            };
-            let left_candidate = candidate(&left.0);
-            let right_candidate = candidate(&right.0);
-            let generation =
-                |name: Option<mcp_agent_mail_core::disk::SqliteRecoveryCandidateName>, modified| {
-                    name.and_then(
-                        mcp_agent_mail_core::disk::SqliteRecoveryCandidateName::generation_micros,
-                    )
-                    .unwrap_or_else(|| {
-                        chrono::DateTime::<chrono::Utc>::from(modified).timestamp_micros()
-                    })
-                };
-            let order = generation(right_candidate, right.1)
-                .cmp(&generation(left_candidate, left.1))
-                .then_with(|| right_candidate.is_some().cmp(&left_candidate.is_some()));
-            let collision_order = match (left_candidate, right_candidate) {
-                (Some(left_name), Some(right_name)) => {
-                    left_name.cmp_newest_first(left.1, right_name, right.1)
-                }
-                _ => std::cmp::Ordering::Equal,
-            };
-            order
-                .then(collision_order)
-                .then_with(|| left.0.cmp(&right.0))
+            backup_order_newest_first(snapshot_primary, (&left.0, left.1), (&right.0, right.1))
         });
-        let periodic_reclaim = kind == BackupKind::ManualBackup && periodic_reclamation_enabled();
-        let to_evict = files
-            .iter()
-            .filter(|(path, _, _)| {
-                occupies_rotation_window(snapshot_primary, path, periodic_reclaim)
-            })
-            .enumerate()
-            .filter_map(|(index, file @ (path, _, _))| {
-                if path == &mcp_agent_mail_db::snapshot::snapshot_bak_path(snapshot_primary) {
-                    return None;
-                }
-                let is_pinned = kind == BackupKind::ManualBackup
-                    && pinned_verified_snapshot.as_ref().is_some_and(|pinned| {
-                        fs::canonicalize(path)
-                            .is_ok_and(|canonical| canonical.as_path() == pinned.as_path())
-                    });
-                if is_pinned {
-                    return None;
-                }
-                let within_window = index < keep;
-                if within_window && !periodic_reclaim {
-                    return None;
-                }
-                Some((file, within_window))
-            })
-            .collect::<Vec<_>>();
-
-        let mut summary = RotateKindSummary {
-            kept: files.len().saturating_sub(to_evict.len()),
-            bytes_kept: files
-                .iter()
-                .filter(|file| !to_evict.iter().any(|(evicted, _)| evicted.0 == file.0))
-                .fold(0_u64, |bytes, file| bytes.saturating_add(file.2.len())),
-            ..Default::default()
-        };
+        let publication_slot = mcp_agent_mail_db::snapshot::snapshot_bak_path(snapshot_primary);
+        let mut to_evict = Vec::new();
+        let mut summary = RotateKindSummary::default();
+        let mut window_index = 0_usize;
+        // Partition and account once. Looking up every retained file in the
+        // whole eviction list made a large backlog quadratic (GH#383).
+        for file @ (path, _, metadata) in &files {
+            let occupies = occupies_rotation_window(snapshot_primary, path, periodic_reclaim);
+            let within_window = window_index < keep;
+            window_index += usize::from(occupies);
+            let is_pinned = kind == BackupKind::ManualBackup
+                && pinned_verified_snapshot.as_ref().is_some_and(|pinned| {
+                    fs::canonicalize(path)
+                        .is_ok_and(|canonical| canonical.as_path() == pinned.as_path())
+                });
+            if !occupies
+                || path == &publication_slot
+                || is_pinned
+                || (within_window && !periodic_reclaim)
+            {
+                summary.kept = summary.kept.saturating_add(1);
+                summary.bytes_kept = summary.bytes_kept.saturating_add(metadata.len());
+            } else {
+                to_evict.push((file, within_window));
+            }
+        }
         for ((path, _mtime, metadata), within_window) in to_evict {
             #[cfg(not(unix))]
             let _ = within_window;
             let size = metadata.len();
-            #[cfg(unix)]
-            if let Err(error) = snapshot_guard.revalidate() {
-                report.admission_refused = true;
-                let failure = RotationFailure::from_error(path, &error);
-                summary.record_failure(&failure, size);
-                report.failures.push(failure);
+            if report.admission_refused {
+                summary.kept = summary.kept.saturating_add(1);
+                summary.bytes_kept = summary.bytes_kept.saturating_add(size);
                 continue;
             }
             #[cfg(unix)]
@@ -1586,7 +2041,9 @@ where
                 pending_reclaims.push(PendingReclaim {
                     path: path.clone(),
                     metadata: metadata.clone(),
-                    historical: false,
+                    // Merged native history must still revalidate its whole
+                    // transaction directory immediately before deletion.
+                    historical: path.parent() != Some(database_parent),
                     within_window,
                 });
                 continue;
@@ -1599,30 +2056,54 @@ where
                 summary.bytes_kept = summary.bytes_kept.saturating_add(size);
                 continue;
             }
-            if delete_opted_in {
-                #[cfg(unix)]
-                if !incident_reclaim_budget.admit(size) {
+            #[cfg(unix)]
+            {
+                let work_bytes = if delete_opted_in {
+                    size.saturating_mul(2)
+                        .saturating_add(snapshot_guard.verified_source_size_bytes().unwrap_or(0))
+                } else {
+                    size
+                };
+                if !incident_reclaim_budget.admit(work_bytes) {
+                    report.defer_work();
                     summary.kept += 1;
                     summary.bytes_kept = summary.bytes_kept.saturating_add(size);
                     continue;
                 }
+                // Only admitted work pays for repeated authority validation.
+                // Periodic deletion has the same check inside its boundary.
+                if let Err(error) = snapshot_guard.revalidate() {
+                    report.admission_refused = true;
+                    let failure = RotationFailure::from_error(path, &error);
+                    summary.record_failure(&failure, size);
+                    report.record_failure(failure);
+                    continue;
+                }
+            }
+            if delete_opted_in {
                 #[cfg(unix)]
                 let deletion = snapshot_guard
                     .delete_superseded_incident_generation(snapshot_primary, path, metadata)
-                    .map(|bytes| (bytes.logical_bytes, bytes.allocated_bytes));
+                    .map(|bytes| {
+                        (
+                            bytes.logical_bytes,
+                            bytes.allocated_bytes,
+                            bytes.reader_inventory_incomplete,
+                        )
+                    });
                 #[cfg(not(unix))]
-                let deletion: std::io::Result<(u64, Option<u64>)> = Err(std::io::Error::new(
+                let deletion: std::io::Result<(u64, Option<u64>, bool)> = Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "verified descriptor-bound incident reclamation is unavailable",
                 ));
                 match deletion {
-                    Ok((logical_bytes, allocated_bytes)) => {
+                    Ok((logical_bytes, allocated_bytes, reader_inventory_incomplete)) => {
                         debug!(kind = kind.label(), path = %path.display(), logical_bytes, "deleted verified rotated backup (explicit opt-in)");
-                        summary.deleted += 1;
-                        summary.bytes_deleted = summary.bytes_deleted.saturating_add(logical_bytes);
-                        summary.bytes_reclaimed = summary
-                            .bytes_reclaimed
-                            .saturating_add(allocated_bytes.unwrap_or(0));
+                        summary.record_deletion(
+                            logical_bytes,
+                            allocated_bytes,
+                            reader_inventory_incomplete,
+                        );
                     }
                     Err(err) => {
                         warn!(
@@ -1633,7 +2114,7 @@ where
                         );
                         let failure = RotationFailure::from_error(path, &err);
                         summary.record_failure(&failure, size);
-                        report.failures.push(failure);
+                        report.record_failure(failure);
                     }
                 }
                 continue;
@@ -1652,7 +2133,7 @@ where
                         );
                         let failure = RotationFailure::from_error(path, &err);
                         summary.record_failure(&failure, size);
-                        report.failures.push(failure);
+                        report.record_failure(failure);
                         continue;
                     }
                 }
@@ -1661,25 +2142,25 @@ where
                 let error = std::io::Error::other("rotation quarantine directory unavailable");
                 let failure = RotationFailure::from_error(path, &error);
                 summary.record_failure(&failure, size);
-                report.failures.push(failure);
+                report.record_failure(failure);
                 continue;
             };
             match stage(path, directory, metadata) {
                 Ok(dest) => {
                     #[cfg(unix)]
                     if let Err(error) = snapshot_guard.revalidate() {
-                        report.admission_refused = true;
                         let failure = RotationFailure {
                             source: path.clone(),
                             rename_completed: true,
                             deletion_completed: false,
+                            reader_inventory_incomplete: false,
                             requested_destination: Some(dest),
                             error: format!(
                                 "backup moved but snapshot authority changed: {error}; evidence retained, do not retry"
                             ),
                         };
                         summary.record_failure(&failure, size);
-                        report.failures.push(failure);
+                        report.record_failure(failure);
                         continue;
                     }
                     debug!(kind = kind.label(), path = %path.display(), dest = %dest.display(), size, "staged rotated backup into quarantine");
@@ -1706,7 +2187,7 @@ where
                         );
                     }
                     summary.record_failure(&failure, size);
-                    report.failures.push(failure);
+                    report.record_failure(failure);
                 }
             }
         }
@@ -1714,23 +2195,12 @@ where
         report.add_kind(kind.label(), &summary);
     }
 
-    let mut historical_summary = RotateKindSummary::default();
-    for (path, metadata) in history.eligible {
-        #[cfg(unix)]
-        if periodic_reclamation_enabled() && pinned_verified_snapshot.is_some() {
-            pending_reclaims.push(PendingReclaim {
-                path,
-                metadata,
-                historical: true,
-                within_window: false,
-            });
-            continue;
-        }
-        historical_summary.kept = historical_summary.kept.saturating_add(1);
-        historical_summary.bytes_kept =
-            historical_summary.bytes_kept.saturating_add(metadata.len());
-    }
-    report.add_kind(BackupKind::ManualBackup.label(), &historical_summary);
+    // Move-only policy and unsupported platforms retain native history;
+    // eligible Unix periodic images already joined the shared window above.
+    report.add_kind(
+        BackupKind::ManualBackup.label(),
+        &history.retained_eligible(),
+    );
     #[cfg(unix)]
     reclaim_pending(
         snapshot_primary,
@@ -1740,13 +2210,21 @@ where
         &mut report,
     );
     #[cfg(unix)]
+    {
+        if reclaim_budget.deadline_reached || incident_reclaim_budget.deadline_reached {
+            report.note_deadline();
+        }
+    }
+    #[cfg(unix)]
     if !report.admission_refused
         && periodic_reclamation_enabled()
         && let Err(error) = reclaim_empty_rotation_directories(
             &storage_root,
             &mut empty_directory_budget,
+            deadline,
+            &mut first_unit_admitted_at,
             &mut report,
-            || snapshot_guard.revalidate(),
+            |_| snapshot_guard.revalidate(),
         )
     {
         report.admission_refused = true;
@@ -1768,6 +2246,8 @@ where
     if report.evicted() > 0
         || report.empty_directories_deleted > 0
         || report.unconfirmed_moves > 0
+        || report.deadline_reached()
+        || report.work_deferred()
         || !report.failures.is_empty()
     {
         info!(
@@ -1778,9 +2258,13 @@ where
             bytes_staged = report.bytes_staged,
             bytes_deleted = report.bytes_deleted,
             bytes_reclaimed = report.bytes_reclaimed,
+            unlinks_with_unobserved_readers = report.unlinks_with_unobserved_readers,
+            bytes_unlinked_with_unobserved_readers = report.bytes_unlinked_with_unobserved_readers,
             bytes_retained = report.bytes_retained(),
             inventory_incomplete = report.inventory_incomplete,
             admission_refused = report.admission_refused,
+            work_deferred = report.work_deferred(),
+            deadline_reached = report.deadline_reached(),
             failures = report.failures.len(),
             unconfirmed_deletions = report.unconfirmed_deletions,
             bytes_unconfirmed_deletions = report.bytes_unconfirmed_deletions,
@@ -1797,8 +2281,22 @@ where
 mod tests {
     use super::*;
 
+    fn create_fixture_directory(path: impl AsRef<Path>) {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        builder.create(path).unwrap();
+    }
+
     #[cfg(unix)]
     fn verified_mailbox(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
         let primary = root.join("storage.sqlite3");
         let conn =
             mcp_agent_mail_db::CanonicalDbConn::open_file(primary.to_str().unwrap()).unwrap();
@@ -1807,6 +2305,7 @@ mod tests {
         conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[])
             .unwrap();
         drop(conn);
+        fs::set_permissions(&primary, fs::Permissions::from_mode(0o600)).unwrap();
         fs::copy(
             &primary,
             mcp_agent_mail_db::snapshot::snapshot_bak_path(&primary),
@@ -1818,6 +2317,1216 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn names_on_disk(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = walkdir::WalkDir::new(root)
+            .min_depth(1)
+            .into_iter()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap()
+                    .display()
+                    .to_string()
+            })
+            .filter(|name| Path::new(name).extension().is_none_or(|ext| ext != "lock"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[cfg(unix)]
+    fn mailbox_with_backlog(root: &Path) -> PathBuf {
+        let primary = verified_mailbox(root);
+        for day in 1..=9 {
+            fs::copy(
+                &primary,
+                root.join(format!("storage.sqlite3.bak.2000010{day}_000000")),
+            )
+            .unwrap();
+        }
+        primary
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disappearing_reservation_temp_does_not_refuse_backup_inventory() {
+        let tmp = TempDir::new().unwrap();
+        let primary = mailbox_with_backlog(tmp.path());
+        let live = fs::read(&primary).unwrap();
+        let temporary = tmp.path().join(".am-active-reservation-race");
+        let published = tmp.path().join("published-reservation");
+        fs::write(&temporary, b"atomic reservation publication").unwrap();
+        let mut raced = false;
+        let report = rotate_storage_backups_impl(
+            tmp.path(),
+            &primary,
+            3,
+            stage_backup_noreplace,
+            None,
+            RotationWorkBudget::strict(None),
+            |entry| {
+                if entry.path() == temporary {
+                    // A real DirEntry has been returned, but its old name no
+                    // longer exists when the production inventory sees it.
+                    fs::rename(&temporary, &published).unwrap();
+                    raced = true;
+                }
+            },
+        )
+        .unwrap();
+        assert!(raced);
+        assert!(report.failures.is_empty(), "{report:?}");
+        assert!(!report.inventory_incomplete);
+        assert!(!report.admission_refused);
+        assert_eq!((report.deleted, report.kept), (7, 3));
+        assert_eq!(
+            fs::read(&published).unwrap(),
+            b"atomic reservation publication"
+        );
+        assert_eq!(fs::read(&primary).unwrap(), live);
+        assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disappearing_backup_candidate_keeps_inventory_incomplete() {
+        let tmp = TempDir::new().unwrap();
+        let primary = mailbox_with_backlog(tmp.path());
+        let candidate = tmp.path().join("storage.sqlite3.bak.20000101_000000");
+        let preserved = tmp.path().join("preserved-outside-inventory");
+        let live = fs::read(&primary).unwrap();
+        let mut raced = false;
+        let report = rotate_storage_backups_impl(
+            tmp.path(),
+            &primary,
+            3,
+            stage_backup_noreplace,
+            None,
+            RotationWorkBudget::strict(None),
+            |entry| {
+                if entry.path() == candidate {
+                    fs::rename(&candidate, &preserved).unwrap();
+                    raced = true;
+                }
+            },
+        )
+        .unwrap();
+        assert!(raced);
+        assert!(report.inventory_incomplete);
+        assert!(report.admission_refused);
+        assert_eq!((report.deleted, report.staged, report.kept), (0, 0, 9));
+        assert_eq!(report.bytes_reclaimed, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].source, candidate);
+        assert!(!report.failures[0].deletion_completed);
+        assert_eq!(fs::read(&preserved).unwrap(), live);
+        assert_eq!(fs::read(&primary).unwrap(), live);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_looking_historical_markers_still_protect_the_transaction() {
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let directory = tmp
+            .path()
+            .join("doctor/reclaimable/rotation-20000101T000000Z");
+        create_fixture_directory(&directory);
+        let image = directory.join("storage.sqlite3.bak.20000101_000000");
+        fs::copy(&primary, &image).unwrap();
+        let marker = directory.join(".am-active-reservation-interrupted");
+        fs::write(&marker, b"unknown transaction evidence").unwrap();
+        let report = rotate_storage_backups(tmp.path(), &primary, 1).unwrap();
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.per_kind["protected_quarantine"].kept, 2);
+        assert_eq!(fs::read(&image).unwrap(), fs::read(&primary).unwrap());
+        assert_eq!(fs::read(&marker).unwrap(), b"unknown transaction evidence");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_hundred_twelve_mixed_images_drain_across_bounded_passes() {
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let live = fs::read(&primary).unwrap();
+        let history = tmp
+            .path()
+            .join("doctor/reclaimable/rotation-20000101T000000Z");
+        let interrupted = tmp
+            .path()
+            .join("doctor/reclaimable/rotation-20000102T000000Z");
+        create_fixture_directory(&history);
+        create_fixture_directory(&interrupted);
+        let marker = interrupted.join("manifest.json");
+        fs::write(&marker, b"interrupted reclamation evidence").unwrap();
+        let mut images = Vec::new();
+        for index in 1..=211 {
+            let parent = if index == 211 {
+                &interrupted
+            } else if index % 2 == 0 {
+                &history
+            } else {
+                tmp.path()
+            };
+            let path = parent.join(format!(
+                "storage.sqlite3.bak.200001{:02}_{:02}0000",
+                index / 24 + 1,
+                index % 24
+            ));
+            fs::copy(&primary, &path).unwrap();
+            images.push(path);
+        }
+        assert_eq!(
+            periodic_backup_footprint(tmp.path(), &primary, 3)
+                .unwrap()
+                .images,
+            212
+        );
+        let first = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
+        assert!(first.failures.is_empty(), "{first:?}");
+        assert!(first.work_deferred());
+        assert!(!first.admission_refused);
+        assert_eq!(first.deleted, MAX_RECLAIM_FILES_PER_PASS);
+        assert_eq!(
+            periodic_backup_footprint(tmp.path(), &primary, 3)
+                .unwrap()
+                .images,
+            212 - first.deleted
+        );
+        let next = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
+        assert!(next.failures.is_empty(), "{next:?}");
+        assert!(!next.work_deferred());
+        assert_eq!(first.deleted + next.deleted, 208);
+        let footprint = periodic_backup_footprint(tmp.path(), &primary, 3).unwrap();
+        assert_eq!(footprint.images, 4);
+        assert!(!footprint.publication_refused());
+        assert_eq!(next.bytes_retained(), footprint.retained_bytes);
+        for (offset, path) in images.iter().enumerate() {
+            if offset >= 208 {
+                assert_eq!(fs::read(path).unwrap(), live);
+            } else {
+                assert!(!path.exists(), "{}", path.display());
+            }
+        }
+        assert_eq!(
+            fs::read(&marker).unwrap(),
+            b"interrupted reclamation evidence"
+        );
+        assert_eq!(fs::read(&primary).unwrap(), live);
+        assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
+    }
+
+    #[cfg(unix)]
+    fn mailbox_with_mixed_periodic_history(root: &Path) -> (PathBuf, Vec<(usize, PathBuf)>) {
+        let primary = verified_mailbox(root);
+        let history = root.join("doctor/reclaimable/rotation-19991231T235959Z");
+        create_fixture_directory(&history);
+        let images = (1..=12)
+            .map(|day| {
+                let parent = if [2, 4, 6, 8].contains(&day) {
+                    root
+                } else {
+                    history.as_path()
+                };
+                let path = parent.join(format!("storage.sqlite3.bak.200001{day:02}_000000"));
+                fs::copy(&primary, &path).unwrap();
+                (day, path)
+            })
+            .collect();
+        (primary, images)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exporter_cleanup_cannot_adopt_a_replaced_database_parent() {
+        let tree = |root: &Path| {
+            walkdir::WalkDir::new(root)
+                .min_depth(1)
+                .into_iter()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let path = entry.path().strip_prefix(root).unwrap().to_path_buf();
+                    let bytes = entry
+                        .file_type()
+                        .is_file()
+                        .then(|| fs::read(entry.path()).unwrap());
+                    (path, bytes)
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        for has_empty_directory in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let active = root.join("active");
+            let replacement = root.join("replacement");
+            let displaced = root.join("displaced");
+            fs::create_dir(&active).unwrap();
+            // Build the replacement at its eventual configured spelling so
+            // its metadata is genuinely valid there. Foreign-path metadata
+            // would mask the old lease bug by refusing selection on its own.
+            let primary = mailbox_with_backlog(&active);
+            fs::write(active.join("parent-sentinel"), b"replacement parent").unwrap();
+            let empty = active.join("doctor/reclaimable/rotation-19991231T235959Z");
+            if has_empty_directory {
+                fs::create_dir_all(&empty).unwrap();
+            }
+            let replacement_before = tree(&active);
+            fs::rename(&active, &replacement).unwrap();
+            fs::create_dir(&active).unwrap();
+            assert_eq!(mailbox_with_backlog(&active), primary);
+            fs::write(active.join("parent-sentinel"), b"admitted parent").unwrap();
+            if has_empty_directory {
+                fs::create_dir_all(&empty).unwrap();
+            }
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("AM_BACKUP_ROTATION_DELETE", "1")],
+                || {
+                    crate::integrity_guard::with_backup_parent_admission(&primary, |admission| {
+                        let admission = admission.unwrap();
+                        fs::rename(&active, &displaced).unwrap();
+                        fs::rename(&replacement, &active).unwrap();
+                        let refused = rotate_storage_backups_with_exporter_lease(
+                            &active,
+                            &primary,
+                            3,
+                            admission,
+                            Duration::from_secs(3600),
+                        )
+                        .unwrap();
+                        assert!(refused.admission_refused, "{refused:?}");
+                        assert_eq!(refused.deleted, 0);
+                        assert_eq!(refused.empty_directories_deleted, 0);
+                        assert_eq!(refused.kept, 10);
+                        assert_eq!(tree(&active), replacement_before);
+
+                        fs::rename(&active, &replacement).unwrap();
+                        fs::rename(&displaced, &active).unwrap();
+                        let resumed = rotate_storage_backups_with_exporter_lease(
+                            &active,
+                            &primary,
+                            3,
+                            admission,
+                            Duration::from_secs(3600),
+                        )
+                        .unwrap();
+                        assert!(!resumed.admission_refused, "{resumed:?}");
+                        assert_eq!(resumed.deleted, 7, "{resumed:?}");
+                        assert_eq!(
+                            resumed.empty_directories_deleted,
+                            usize::from(has_empty_directory)
+                        );
+                        assert_eq!(resumed.kept, 3);
+                        Ok(())
+                    })
+                    .unwrap();
+                },
+            );
+            assert_eq!(tree(&replacement), replacement_before);
+            assert_eq!(
+                fs::read(active.join("parent-sentinel")).unwrap(),
+                b"admitted parent"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn periodic_retention_keep_count_includes_native_history() {
+        // GH#373: five root images (including the publication slot), eight
+        // parked images, and keep=300 must retain all thirteen. A parked
+        // pathname alone is not evidence that the current keep window expired.
+        let tmp = TempDir::new().unwrap();
+        let (primary, images) = mailbox_with_mixed_periodic_history(tmp.path());
+        let live = fs::read(&primary).unwrap();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(&[], || {
+            for _ in 0..2 {
+                let report = rotate_storage_backups(tmp.path(), &primary, 300).unwrap();
+                assert!(report.failures.is_empty(), "{:?}", report.failures);
+                assert!(!report.admission_refused);
+                assert_eq!(report.deleted, 0);
+                assert_eq!(report.staged, 0);
+                assert_eq!(report.kept, 13);
+                assert_eq!(
+                    report.bytes_retained(),
+                    13 * u64::try_from(live.len()).unwrap()
+                );
+                assert_eq!(report.window_images_deleted, 0);
+                assert_eq!(
+                    periodic_backup_footprint(tmp.path(), &primary, 300)
+                        .unwrap()
+                        .images,
+                    13
+                );
+                for (_, path) in &images {
+                    assert_eq!(fs::read(path).unwrap(), live);
+                }
+            }
+        });
+        assert_eq!(fs::read(&primary).unwrap(), live);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn periodic_retention_reports_opaque_reader_inventory() {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::{fs::MetadataExt as _, process::CommandExt as _};
+        use std::process::{Command, Stdio};
+
+        struct OpaqueReader(std::process::Child);
+        impl Drop for OpaqueReader {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        // A privileged caller can inspect a nondumpable peer. Exercise the
+        // actual ordinary-user path, retaining this exact ELF across setuid.
+        let status = fs::read_to_string("/proc/self/status").unwrap();
+        let capabilities = status
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:"))
+            .map(|value| u64::from_str_radix(value.trim(), 16).unwrap())
+            .unwrap();
+        if fs::metadata("/proc/self").unwrap().uid() == 0 && capabilities != 0 {
+            let executable = fs::File::open("/proc/self/exe").unwrap();
+            let name = std::thread::current().name().unwrap().to_owned();
+            let output = Command::new(format!("/proc/self/fd/{}", executable.as_raw_fd()))
+                .args(["--exact", &name, "--nocapture"])
+                .uid(65_534)
+                .gid(65_534)
+                .env("TMPDIR", "/tmp")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let old = tmp.path().join("storage.sqlite3.bak.20000101_000000");
+        fs::copy(&primary, &old).unwrap();
+        let original = fs::read(&old).unwrap();
+        let program = tmp.path().join("opaque_reader.py");
+        fs::write(
+            &program,
+            "import ctypes,sys\nf=open(sys.argv[1],'rb')\ndata=f.read()\nf.seek(0)\nassert ctypes.CDLL(None,use_errno=True).prctl(4,0,0,0,0)==0\nprint('ready',flush=True)\nassert sys.stdin.buffer.read(1)==b'r'\nassert f.read()==data\nprint('bytes preserved',flush=True)",
+        )
+        .unwrap();
+        let mut reader = OpaqueReader(
+            Command::new("python3")
+                .arg(program)
+                .arg(&old)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut output = std::io::BufReader::new(reader.0.stdout.take().unwrap());
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "ready");
+        assert_eq!(
+            fs::read_dir(format!("/proc/{}/fd", reader.0.id()))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(&[], || {
+            rotate_storage_backups(tmp.path(), &primary, 1).unwrap()
+        });
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert!(!report.admission_refused);
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.bytes_deleted, u64::try_from(original.len()).unwrap());
+        assert_eq!(report.bytes_reclaimed, 0);
+        assert_eq!(report.unlinks_with_unobserved_readers, 1);
+        assert_eq!(
+            report.bytes_unlinked_with_unobserved_readers,
+            u64::try_from(original.len()).unwrap()
+        );
+        assert_eq!(
+            report.per_kind[BackupKind::ManualBackup.label()].unlinks_with_unobserved_readers,
+            1
+        );
+        assert_eq!(
+            report.per_kind[BackupKind::ManualBackup.label()]
+                .bytes_unlinked_with_unobserved_readers,
+            u64::try_from(original.len()).unwrap()
+        );
+        assert!(!old.exists());
+        reader.0.stdin.take().unwrap().write_all(b"r").unwrap();
+        line.clear();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "bytes preserved");
+        assert!(reader.0.wait().unwrap().success());
+        assert_eq!(fs::read(primary).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn periodic_retention_ranks_resident_and_native_history_together() {
+        let tmp = TempDir::new().unwrap();
+        let (primary, images) = mailbox_with_mixed_periodic_history(tmp.path());
+        let generation_bytes = fs::metadata(&primary).unwrap().len();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(&[], || {
+            let report = rotate_storage_backups(tmp.path(), &primary, 5).unwrap();
+            assert!(report.failures.is_empty(), "{:?}", report.failures);
+            assert_eq!(report.deleted, 8);
+            assert_eq!(report.kept, 5);
+            assert_eq!(report.bytes_deleted, 8 * generation_bytes);
+            assert_eq!(report.bytes_retained(), 5 * generation_bytes);
+            assert_eq!(report.window_images_deleted, 0);
+            for (day, path) in &images {
+                assert_eq!(path.exists(), *day >= 9, "{}", path.display());
+            }
+            assert_eq!(
+                periodic_backup_footprint(tmp.path(), &primary, 5)
+                    .unwrap()
+                    .images,
+                5
+            );
+            let unchanged = rotate_storage_backups(tmp.path(), &primary, 5).unwrap();
+            assert!(unchanged.failures.is_empty(), "{:?}", unchanged.failures);
+            assert_eq!(unchanged.deleted, 0);
+            assert_eq!(unchanged.kept, 5);
+
+            // An explicitly smaller window still reclaims the now-superseded
+            // parked generations through the same verified deletion boundary.
+            let reduced = rotate_storage_backups(tmp.path(), &primary, 1).unwrap();
+            assert!(reduced.failures.is_empty(), "{:?}", reduced.failures);
+            assert_eq!(reduced.deleted, 4);
+            assert_eq!(reduced.kept, 1);
+            assert!(images.iter().all(|(_, path)| !path.exists()));
+            assert_eq!(
+                periodic_backup_footprint(tmp.path(), &primary, 1)
+                    .unwrap()
+                    .images,
+                1
+            );
+        });
+        assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn periodic_retention_history_order_uses_generation_and_collision() {
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let history = tmp
+            .path()
+            .join("doctor/reclaimable/rotation-19990101T000000Z");
+        create_fixture_directory(&history);
+        let older = tmp.path().join("storage.sqlite3.bak.20000101_000000");
+        let first = tmp.path().join("storage.sqlite3.bak.20000102_000000-01");
+        let newest = history.join("storage.sqlite3.bak.20000102_000000-02");
+        for (path, seconds) in [(&older, 3), (&first, 2), (&newest, 1)] {
+            fs::copy(&primary, path).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+                )
+                .unwrap();
+        }
+        let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(&[], || {
+            rotate_storage_backups(tmp.path(), &primary, 2).unwrap()
+        });
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.deleted, 2);
+        assert_eq!(report.kept, 2);
+        assert_eq!(report.window_images_deleted, 0);
+        assert!(!older.exists());
+        assert!(!first.exists());
+        assert_eq!(fs::read(newest).unwrap(), fs::read(&primary).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn periodic_retention_shortens_the_window_by_numeric_generation_order() {
+        // Crossing the two-digit suffix boundary defeats lexical filename
+        // order. A parked newer image also defeats full-path ordering even
+        // for equally padded suffixes. Neither is authority to discard it first.
+        for (older_suffix, newer_suffix, parked_newer) in [
+            ("99", "100", false),
+            ("99", "100", true),
+            ("01", "02", true),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let primary = verified_mailbox(tmp.path());
+            let live = fs::read(&primary).unwrap();
+            let metadata_path = mcp_agent_mail_db::snapshot::snapshot_meta_path(&primary);
+            let metadata = fs::read(&metadata_path).unwrap();
+            let generation_bytes = fs::metadata(&primary).unwrap().len();
+            let newer_parent = if parked_newer {
+                let history = tmp
+                    .path()
+                    .join("doctor/reclaimable/rotation-19990101T000000Z");
+                fs::create_dir_all(&history).unwrap();
+                history
+            } else {
+                tmp.path().to_path_buf()
+            };
+            let older = tmp.path().join(format!(
+                "storage.sqlite3.bak.20000102_000000-{older_suffix}"
+            ));
+            let newer = newer_parent.join(format!(
+                "storage.sqlite3.bak.20000102_000000-{newer_suffix}"
+            ));
+            for (path, seconds) in [(&older, 2_100_000_000), (&newer, 1)] {
+                fs::copy(&primary, path).unwrap();
+                fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_times(
+                        fs::FileTimes::new()
+                            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)),
+                    )
+                    .unwrap();
+            }
+            let refused = (1..=3)
+                .map(|day| {
+                    let path = tmp
+                        .path()
+                        .join(format!("storage.sqlite3.bak.1999120{day}_000000"));
+                    fs::write(&path, b"incomplete export evidence").unwrap();
+                    path
+                })
+                .collect::<Vec<_>>();
+
+            // The exact slot plus five dated generations exhaust keep+3.
+            // Three invalid older images must survive, so one window image
+            // must go to permit publication, and the newer one must remain.
+            let before = periodic_backup_footprint(tmp.path(), &primary, 3).unwrap();
+            assert_eq!(before.images, 6);
+            assert!(before.publication_refused());
+            let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("AM_BACKUP_ROTATION_DELETE", "true")],
+                || rotate_storage_backups(tmp.path(), &primary, 3).unwrap(),
+            );
+            assert_eq!(report.deleted, 1);
+            assert_eq!(report.window_images_deleted, 1);
+            assert!(!older.exists(), "the older collision must go first");
+            assert_eq!(fs::read(newer).unwrap(), live);
+            assert!(!report.inventory_incomplete);
+            assert!(!report.admission_refused);
+            assert_eq!(report.kept, 5);
+            assert_eq!(report.failures.len(), 3);
+            assert!(
+                report
+                    .failures
+                    .iter()
+                    .all(|failure| refused.contains(&failure.source))
+            );
+            assert_eq!(report.bytes_deleted, generation_bytes);
+            assert_eq!(
+                report.bytes_deleted + report.bytes_retained(),
+                before.retained_bytes
+            );
+            for path in refused {
+                assert_eq!(fs::read(path).unwrap(), b"incomplete export evidence");
+            }
+            assert_eq!(fs::read(&primary).unwrap(), live);
+            assert_eq!(fs::read(metadata_path).unwrap(), metadata);
+            admit_periodic_publication(tmp.path(), &primary, 3).unwrap();
+            assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn periodic_retention_reenabled_after_staging_honors_the_current_keep_count() {
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let live = fs::read(&primary).unwrap();
+        let metadata_path = mcp_agent_mail_db::snapshot::snapshot_meta_path(&primary);
+        let metadata = fs::read(&metadata_path).unwrap();
+        for day in 1..=4 {
+            fs::copy(
+                &primary,
+                tmp.path()
+                    .join(format!("storage.sqlite3.bak.200001{day:02}_000000")),
+            )
+            .unwrap();
+        }
+
+        // Exercise the real move-only producer of native history. Its old
+        // keep decision must not become permanent deletion authority when
+        // the operator later raises the window and re-enables reclamation.
+        let staged = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_BACKUP_ROTATION_DELETE", "false"),
+                ("AM_BACKUP_KEEP_COUNT", "2"),
+            ],
+            || rotate_storage_backups(tmp.path(), &primary, resolved_keep_per_kind()).unwrap(),
+        );
+        assert!(staged.failures.is_empty(), "{:?}", staged.failures);
+        assert!(!staged.admission_refused);
+        assert_eq!((staged.staged, staged.deleted, staged.kept), (3, 0, 2));
+        let history = inspect_historical_backups(tmp.path(), &primary);
+        assert!(!history.incomplete);
+        assert_eq!(history.eligible.len(), 3);
+        assert!(admit_periodic_publication(tmp.path(), &primary, 2).is_err());
+
+        let retained = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_BACKUP_ROTATION_DELETE", "true"),
+                ("AM_BACKUP_KEEP_COUNT", "5"),
+            ],
+            || rotate_storage_backups(tmp.path(), &primary, resolved_keep_per_kind()).unwrap(),
+        );
+        assert!(retained.failures.is_empty(), "{:?}", retained.failures);
+        assert!(!retained.admission_refused);
+        assert_eq!(
+            (retained.staged, retained.deleted, retained.kept),
+            (0, 0, 5)
+        );
+        assert_eq!(retained.bytes_retained(), staged.bytes_retained());
+        assert_eq!(retained.window_images_deleted, 0);
+        admit_periodic_publication(tmp.path(), &primary, 5).unwrap();
+        for (path, _) in &history.eligible {
+            assert_eq!(fs::read(path).unwrap(), live);
+        }
+
+        // Reducing the current window makes exactly those older generations
+        // eligible again, without disturbing the slot or verified authority.
+        let reclaimed = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_BACKUP_ROTATION_DELETE", "true"),
+                ("AM_BACKUP_KEEP_COUNT", "2"),
+            ],
+            || rotate_storage_backups(tmp.path(), &primary, resolved_keep_per_kind()).unwrap(),
+        );
+        assert!(reclaimed.failures.is_empty(), "{:?}", reclaimed.failures);
+        assert!(!reclaimed.admission_refused);
+        assert_eq!(
+            (reclaimed.staged, reclaimed.deleted, reclaimed.kept),
+            (0, 3, 2)
+        );
+        assert_eq!(reclaimed.window_images_deleted, 0);
+        assert_eq!(
+            reclaimed.bytes_deleted + reclaimed.bytes_retained(),
+            staged.bytes_retained()
+        );
+        assert!(history.eligible.iter().all(|(path, _)| !path.exists()));
+        assert_eq!(
+            fs::read(tmp.path().join("storage.sqlite3.bak.20000104_000000")).unwrap(),
+            live
+        );
+        assert_eq!(fs::read(&primary).unwrap(), live);
+        assert_eq!(fs::read(metadata_path).unwrap(), metadata);
+        assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn periodic_retention_interrupted_history_does_not_displace_the_keep_window() {
+        let tmp = TempDir::new().unwrap();
+        let (primary, images) = mailbox_with_mixed_periodic_history(tmp.path());
+        let live = fs::read(&primary).unwrap();
+        let generation_bytes = fs::metadata(&primary).unwrap().len();
+        let marker = tmp
+            .path()
+            .join("doctor/reclaimable/rotation-19991231T235959Z/manifest.json");
+        let unfinished = b"interrupted recovery; preserve every transaction payload";
+        fs::write(&marker, unfinished).unwrap();
+
+        // The newest dated images happen to be in the interrupted directory.
+        // They consume publication capacity but cannot displace independently
+        // retained resident generations, or be deleted to satisfy the quota.
+        let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "true")],
+            || rotate_storage_backups(tmp.path(), &primary, 3).unwrap(),
+        );
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert!(!report.admission_refused);
+        assert!(!report.inventory_incomplete);
+        assert_eq!((report.staged, report.deleted, report.kept), (0, 2, 12));
+        assert_eq!(report.per_kind["protected_quarantine"].kept, 9);
+        assert_eq!(report.per_kind[BackupKind::ManualBackup.label()].kept, 3);
+        assert_eq!(report.window_images_deleted, 0);
+        assert_eq!(report.bytes_deleted, 2 * generation_bytes);
+        assert_eq!(
+            report.bytes_retained(),
+            11 * generation_bytes + u64::try_from(unfinished.len()).unwrap()
+        );
+        for (day, path) in &images {
+            if path.parent() == Some(tmp.path()) && *day < 6 {
+                assert!(!path.exists(), "{}", path.display());
+            } else {
+                assert_eq!(fs::read(path).unwrap(), live, "{}", path.display());
+            }
+        }
+        assert_eq!(fs::read(marker).unwrap(), unfinished);
+        let footprint = periodic_backup_footprint(tmp.path(), &primary, 3).unwrap();
+        assert_eq!(footprint.images, 11);
+        assert_eq!(footprint.retained_bytes, report.bytes_retained());
+        assert!(footprint.publication_refused());
+        assert_eq!(fs::read(&primary).unwrap(), live);
+        assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_inventory_background_turns_reclaim_with_the_original_budget() {
+        let tmp = TempDir::new().unwrap();
+        let primary = mailbox_with_backlog(tmp.path());
+        let live = fs::read(&primary).unwrap();
+        let before = names_on_disk(tmp.path());
+        let work_time = Duration::from_millis(50);
+        let rotate = |background| {
+            let budget = if background {
+                RotationWorkBudget::background(work_time)
+            } else {
+                RotationWorkBudget::strict(Instant::now().checked_add(work_time))
+            };
+            let deadline = budget.deadline.unwrap();
+            let mut delayed = false;
+            let report = rotate_storage_backups_impl(
+                tmp.path(),
+                &primary,
+                3,
+                stage_backup_noreplace,
+                None,
+                budget,
+                |_| {
+                    if !delayed {
+                        // Model a slow read_dir/metadata operation in the real
+                        // inventory, without changing the original deadline.
+                        std::thread::sleep(
+                            deadline.saturating_duration_since(Instant::now())
+                                + Duration::from_millis(1),
+                        );
+                        delayed = true;
+                    }
+                },
+            )
+            .unwrap();
+            assert!(delayed);
+            assert!(report.deadline_reached(), "{report:?}");
+            assert!(!report.inventory_incomplete, "{report:?}");
+            assert!(!report.admission_refused, "{report:?}");
+            assert!(report.failures.is_empty(), "{report:?}");
+            report
+        };
+
+        // This was the production background path: every bounded retry paid
+        // for a complete inventory but reached no pin or eviction whatsoever.
+        for _ in 0..2 {
+            let strict = rotate(false);
+            assert!(strict.work_deferred());
+            assert_eq!((strict.deleted, strict.kept), (0, 10));
+            assert_eq!(names_on_disk(tmp.path()), before);
+        }
+        for pass in 0..7 {
+            let report = rotate(true);
+            assert_eq!(report.deleted, 1, "pass {pass}: {report:?}");
+            assert_eq!(report.kept, 9 - pass);
+            assert_eq!(report.work_deferred(), pass < 6, "{report:?}");
+            assert_eq!(fs::read(&primary).unwrap(), live);
+            assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
+        }
+        let footprint = periodic_backup_footprint(tmp.path(), &primary, 3).unwrap();
+        assert_eq!(footprint.images, 3);
+        assert!(!footprint.publication_refused());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_directory_cleanup_consumes_the_background_first_unit() {
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        for day in [1, 2] {
+            create_fixture_directory(
+                tmp.path()
+                    .join(format!("doctor/reclaimable/rotation-2000010{day}T000000Z")),
+            );
+        }
+        let guard = mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(&primary).unwrap();
+        let deadline = Instant::now();
+        let admitted_at = deadline
+            .checked_sub(Duration::from_millis(1))
+            .expect("fixture clock must have one millisecond of history");
+        let mut first_unit = Some(admitted_at);
+        let mut remaining = MAX_RECLAIM_DIRECTORIES_PER_PASS;
+        let mut report = RotateReport::default();
+        let mut admissions = 0;
+        reclaim_empty_rotation_directories(
+            tmp.path(),
+            &mut remaining,
+            Some(deadline),
+            &mut first_unit,
+            &mut report,
+            |admitted| {
+                admissions += 1;
+                assert_eq!(admitted, Some(admitted_at));
+                guard.revalidate()
+            },
+        )
+        .unwrap();
+        assert_eq!(admissions, 1);
+        assert!(first_unit.is_none());
+        assert_eq!(report.empty_directories_deleted, 1);
+        assert!(report.deadline_reached() && report.work_deferred());
+        assert!(report.failures.is_empty(), "{report:?}");
+        assert_eq!(remaining, MAX_RECLAIM_DIRECTORIES_PER_PASS - 1);
+        assert_eq!(
+            fs::read_dir(tmp.path().join("doctor/reclaimable"))
+                .unwrap()
+                .count(),
+            1
+        );
+        guard.revalidate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zero_or_expired_background_budget_does_not_admit_a_first_unit() {
+        let tmp = TempDir::new().unwrap();
+        let primary = mailbox_with_backlog(tmp.path());
+        let before = names_on_disk(tmp.path());
+        let zero =
+            rotate_storage_backups_in_background(tmp.path(), &primary, 3, Duration::ZERO).unwrap();
+        assert!(zero.deadline_reached() && zero.work_deferred());
+        assert_eq!((zero.deleted, zero.kept), (0, 10));
+        assert!(zero.failures.is_empty(), "{zero:?}");
+        assert!(!zero.admission_refused);
+
+        let budget = RotationWorkBudget::background(Duration::from_millis(1));
+        std::thread::sleep(
+            budget
+                .deadline
+                .unwrap()
+                .saturating_duration_since(Instant::now())
+                + Duration::from_millis(1),
+        );
+        let expired = rotate_storage_backups_impl(
+            tmp.path(),
+            &primary,
+            3,
+            stage_backup_noreplace,
+            None,
+            budget,
+            |_| {},
+        )
+        .unwrap();
+        assert!(expired.deadline_reached() && expired.work_deferred());
+        assert_eq!((expired.deleted, expired.kept), (0, 10));
+        assert!(expired.failures.is_empty(), "{expired:?}");
+        assert!(!expired.admission_refused);
+        assert_eq!(names_on_disk(tmp.path()), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spent_budget_leaves_the_backlog_for_the_next_pass() {
+        let control = TempDir::new().unwrap();
+        let control_primary = mailbox_with_backlog(control.path());
+        let unbudgeted = rotate_storage_backups(control.path(), &control_primary, 3).unwrap();
+        assert!(unbudgeted.deleted > 0);
+
+        let tmp = TempDir::new().unwrap();
+        let primary = mailbox_with_backlog(tmp.path());
+        let before = names_on_disk(tmp.path());
+        let spent = rotate_storage_backups_within(tmp.path(), &primary, 3, Duration::ZERO).unwrap();
+        assert!(spent.deadline_reached());
+        assert!(spent.work_deferred());
+        assert_eq!(spent.deleted, 0);
+        assert!(spent.failures.is_empty(), "{:?}", spent.failures);
+        assert!(!spent.admission_refused);
+        assert_eq!(
+            spent.kept,
+            unbudgeted.kept + unbudgeted.deleted,
+            "a spent budget counts what it left as kept"
+        );
+        assert_eq!(names_on_disk(tmp.path()), before);
+
+        // The background pass has no budget: same evictions, same kept set.
+        let next = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
+        assert!(!next.deadline_reached());
+        assert_eq!(next.deleted, unbudgeted.deleted);
+        assert_eq!(next.kept, unbudgeted.kept);
+        assert_eq!(
+            names_on_disk(tmp.path()),
+            names_on_disk(control.path()),
+            "the kept set must not depend on which pass reclaimed the backlog"
+        );
+        assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_pin_admission_allows_one_complete_reclaim_unit_per_slice() {
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let paths: Vec<_> = (1..=3)
+            .map(|day| {
+                let path = tmp
+                    .path()
+                    .join(format!("storage.sqlite3.bak.2000010{day}_000000"));
+                fs::copy(&primary, &path).unwrap();
+                path
+            })
+            .collect();
+        for remaining in (1..=3).rev() {
+            let guard =
+                mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(&primary).unwrap();
+            let pending = paths
+                .iter()
+                .filter(|path| path.exists())
+                .map(|path| PendingReclaim {
+                    path: path.clone(),
+                    metadata: fs::metadata(path).unwrap(),
+                    historical: false,
+                    within_window: false,
+                })
+                .collect();
+            // Model the deadline having elapsed in the required pin check.
+            // The actual candidate verification and unlink remain real.
+            let mut budget = ReclaimBudget {
+                attempted: 0,
+                bytes: 0,
+                byte_limit: u64::MAX,
+                publication: None,
+                deadline: Some(Instant::now()),
+                deadline_reached: false,
+            };
+            let mut report = RotateReport::default();
+            reclaim_pending(&primary, pending, &guard, &mut budget, &mut report);
+            assert_eq!(report.deleted, 1, "{report:?}");
+            assert_eq!(report.kept, remaining - 1);
+            assert_eq!(budget.attempted, 1);
+            assert!(budget.deadline_reached);
+            assert_eq!(report.work_deferred(), remaining > 1);
+            assert_eq!(report.failures, Vec::<RotationFailure>::new());
+            guard.revalidate().unwrap();
+        }
+        assert!(paths.iter().all(|path| !path.exists()));
+        assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absent_snapshot_metadata_does_not_repeat_impossible_deletes_in_bounded_slices() {
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        fs::rename(
+            mcp_agent_mail_db::snapshot::snapshot_meta_path(&primary),
+            tmp.path().join("preserved-metadata"),
+        )
+        .unwrap();
+        for number in 0..130 {
+            fs::copy(
+                &primary,
+                tmp.path().join(format!(
+                    "storage.sqlite3.bak.20000101_00{:02}{:02}",
+                    number / 60,
+                    number % 60,
+                )),
+            )
+            .unwrap();
+        }
+        let before = names_on_disk(tmp.path());
+        let report =
+            rotate_storage_backups_within(tmp.path(), &primary, 3, Duration::from_secs(3600))
+                .unwrap();
+        assert_eq!(report.kept, 131, "{report:?}");
+        assert_eq!(report.evicted(), 0, "{report:?}");
+        assert!(
+            !report.work_deferred(),
+            "no possible delete remains unfinished"
+        );
+        assert!(!report.admission_refused, "{report:?}");
+        assert!(!report.completed_pin_search_without_match);
+        let error = admit_periodic_publication(tmp.path(), &primary, 3).unwrap_err();
+        assert!(periodic_publication_budget_exhausted(&error));
+        assert_eq!(names_on_disk(tmp.path()), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incident_deletion_without_a_pin_cannot_hide_the_periodic_repair_allowance() {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "1")],
+            || {
+                let tmp = TempDir::new().unwrap();
+                let primary = mailbox_with_backlog(tmp.path());
+                fs::rename(
+                    mcp_agent_mail_db::snapshot::snapshot_meta_path(&primary),
+                    tmp.path().join("preserved-metadata"),
+                )
+                .unwrap();
+                for number in 0..130 {
+                    fs::copy(
+                        &primary,
+                        tmp.path().join(format!("storage.sqlite3.corrupt-{number}")),
+                    )
+                    .unwrap();
+                }
+                let before = names_on_disk(tmp.path());
+                let report = rotate_storage_backups_within(
+                    tmp.path(),
+                    &primary,
+                    3,
+                    Duration::from_secs(3600),
+                )
+                .unwrap();
+                assert_eq!(report.kept, 140, "{report:?}");
+                assert_eq!(report.evicted(), 0, "{report:?}");
+                assert!(!report.work_deferred(), "{report:?}");
+                assert!(!report.admission_refused, "{report:?}");
+                let error = admit_periodic_publication(tmp.path(), &primary, 3).unwrap_err();
+                assert!(periodic_publication_budget_exhausted(&error));
+                assert_eq!(names_on_disk(tmp.path()), before);
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spent_budget_does_not_acquire_snapshot_authority() {
+        use fs2::FileExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let (primary, _) = mailbox_with_mixed_periodic_history(tmp.path());
+        let generation_bytes = fs::metadata(&primary).unwrap().len();
+        let protected = tmp
+            .path()
+            .join("doctor/reclaimable/rotation-19991230T235959Z");
+        fs::create_dir_all(&protected).unwrap();
+        fs::copy(
+            &primary,
+            protected.join("storage.sqlite3.bak.19991230_000000"),
+        )
+        .unwrap();
+        let manifest = b"interrupted recovery must retain its complete transaction";
+        fs::write(protected.join("manifest.json"), manifest).unwrap();
+        let incident = b"independent incident evidence";
+        fs::write(
+            tmp.path().join("storage.sqlite3.corrupt-evidence"),
+            incident,
+        )
+        .unwrap();
+
+        // Hold the real authority directly, without first acquiring retention's
+        // recovery election or selecting a pin. Trying admission would refuse
+        // and could create control files before reaching the per-file budget.
+        let owner = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tmp.path().join("storage.sqlite3.bak.authority.lock"))
+            .unwrap();
+        owner.try_lock_exclusive().unwrap();
+        let paths = || {
+            walkdir::WalkDir::new(tmp.path())
+                .min_depth(1)
+                .into_iter()
+                .map(|entry| entry.unwrap().into_path())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let before = paths();
+        let contents = before
+            .iter()
+            .filter(|path| path.is_file())
+            .map(|path| (path.clone(), fs::read(path).unwrap()))
+            .collect::<Vec<_>>();
+        let rotate = |budget| {
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(&[], || {
+                rotate_storage_backups_within(tmp.path(), &primary, 3, budget).unwrap()
+            })
+        };
+
+        let spent = rotate(Duration::ZERO);
+        assert!(spent.deadline_reached());
+        assert!(!spent.admission_refused, "{:?}", spent.failures);
+        assert!(!spent.inventory_incomplete);
+        assert!(spent.failures.is_empty(), "{:?}", spent.failures);
+        assert_eq!(spent.evicted(), 0);
+        assert_eq!(spent.empty_directories_deleted, 0);
+        assert_eq!(spent.kept, 16);
+        assert_eq!(spent.per_kind[BackupKind::ManualBackup.label()].kept, 13);
+        assert_eq!(spent.per_kind["protected_quarantine"].kept, 2);
+        assert_eq!(spent.per_kind[BackupKind::Corrupt.label()].kept, 1);
+        assert_eq!(
+            spent.bytes_retained(),
+            14 * generation_bytes
+                + u64::try_from(manifest.len()).unwrap()
+                + u64::try_from(incident.len()).unwrap()
+        );
+        assert_eq!(
+            paths(),
+            before,
+            "a deferred pass must not create control state"
+        );
+        for (path, bytes) in contents {
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+        }
+
+        // This is real contention, not an inventory that happens to fit the
+        // window: with time remaining the same pass must still try admission.
+        let contended = rotate(Duration::from_secs(3600));
+        assert!(!contended.deadline_reached());
+        assert!(contended.admission_refused);
+        assert!(!contended.inventory_incomplete);
+        assert_eq!(contended.failures.len(), 1);
+        assert_eq!(contended.failures[0].source, primary);
+        assert_eq!(contended.evicted(), 0);
+        assert_eq!(contended.kept, spent.kept);
+        assert_eq!(contended.bytes_retained(), spent.bytes_retained());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn budget_not_reached_changes_nothing() {
+        let control = TempDir::new().unwrap();
+        let control_primary = mailbox_with_backlog(control.path());
+        let unbudgeted = rotate_storage_backups(control.path(), &control_primary, 3).unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        let primary = mailbox_with_backlog(tmp.path());
+        let ample = Duration::from_secs(3600);
+        let report = rotate_storage_backups_within(tmp.path(), &primary, 3, ample).unwrap();
+        assert!(!report.deadline_reached());
+        assert_eq!(report.deleted, unbudgeted.deleted);
+        assert_eq!(report.kept, unbudgeted.kept);
+        assert_eq!(names_on_disk(tmp.path()), names_on_disk(control.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spent_budget_leaves_empty_rotation_directories_for_the_next_pass() {
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let empties = [1, 2, 3].map(|n| {
+            let directory = tmp
+                .path()
+                .join(format!("doctor/reclaimable/rotation-1999122{n}T235959Z"));
+            create_fixture_directory(&directory);
+            directory
+        });
+
+        let spent = rotate_storage_backups_within(tmp.path(), &primary, 3, Duration::ZERO).unwrap();
+        assert!(spent.deadline_reached());
+        assert_eq!(spent.empty_directories_deleted, 0);
+        assert!(spent.failures.is_empty(), "{:?}", spent.failures);
+        assert!(empties.iter().all(|directory| directory.is_dir()));
+
+        let next = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
+        assert!(!next.deadline_reached());
+        assert_eq!(next.empty_directories_deleted, 3);
+        assert!(empties.iter().all(|directory| !directory.exists()));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn periodic_cycles_reclaim_disk_and_historical_staging() {
         use std::os::unix::fs::MetadataExt as _;
@@ -1826,7 +3535,7 @@ mod tests {
         let staged = tmp
             .path()
             .join("doctor/reclaimable/rotation-19991231T235959Z");
-        fs::create_dir_all(&staged).unwrap();
+        create_fixture_directory(&staged);
         fs::copy(&primary, staged.join("storage.sqlite3.bak.20000101_000000")).unwrap();
         fs::write(
             staged.join("storage.sqlite3.corrupt-evidence"),
@@ -1850,11 +3559,21 @@ mod tests {
                     let report = rotate_storage_backups(tmp.path(), &primary, 3).unwrap();
                     assert!(report.failures.is_empty(), "{:?}", report.failures);
                     let inventory = inspect_storage_backups(&primary).unwrap();
-                    assert!(inventory.artifact_count <= 4); // window plus exact pin
+                    let history = inspect_historical_backups(tmp.path(), &primary);
+                    assert!(!history.incomplete);
+                    // The window spans both locations, including initial
+                    // cycles before the parked generation is superseded.
+                    assert!(inventory.artifact_count + history.periodic_count <= 4);
                     let blocks: u64 = inventory
                         .artifacts
                         .iter()
                         .map(|artifact| fs::metadata(&artifact.path).unwrap().blocks())
+                        .chain(
+                            history
+                                .eligible
+                                .iter()
+                                .map(|(_, metadata)| metadata.blocks()),
+                        )
                         .sum();
                     assert!(
                         blocks
@@ -1873,7 +3592,7 @@ mod tests {
                             .iter()
                             .map(|artifact| artifact.bytes)
                             .sum::<u64>()
-                            + 17
+                            + history.bytes
                     );
                 }
             },
@@ -1891,7 +3610,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let primary = tmp.path().join("storage.sqlite3");
         let staged = tmp.path().join("doctor/reclaimable/rotation-old");
-        fs::create_dir_all(&staged).unwrap();
+        create_fixture_directory(&staged);
         for index in 0..6 {
             fs::write(
                 staged.join(format!("storage.sqlite3.bak.20000101_00000{index}")),
@@ -1911,7 +3630,7 @@ mod tests {
         let history = tmp
             .path()
             .join("doctor/reclaimable/rotated-backups-recorded");
-        fs::create_dir_all(&history).unwrap();
+        create_fixture_directory(&history);
         fs::write(history.join("manifest.json"), b"operator restore authority").unwrap();
         let backup = history.join("storage.sqlite3.bak.20000101_000000");
         let file = fs::File::create(&backup).unwrap();
@@ -1961,7 +3680,7 @@ mod tests {
             let history = tmp
                 .path()
                 .join("doctor/reclaimable/rotated-backups-recorded");
-            fs::create_dir_all(&history).unwrap();
+            create_fixture_directory(&history);
             let manifest = history.join("manifest.json");
             let manifest_bytes = b"operator restore authority";
             fs::write(&manifest, manifest_bytes).unwrap();
@@ -2043,7 +3762,7 @@ mod tests {
         let history = tmp
             .path()
             .join("doctor/reclaimable/rotated-backups-recorded");
-        fs::create_dir_all(&history).unwrap();
+        create_fixture_directory(&history);
         fs::write(history.join("manifest.json"), b"restore authority").unwrap();
         for day in 1..=3 {
             fs::copy(
@@ -2105,7 +3824,7 @@ mod tests {
             ("proactive-staging-script", "manifest.json"),
         ] {
             let directory = tmp.path().join("doctor/reclaimable").join(name);
-            fs::create_dir_all(&directory).unwrap();
+            create_fixture_directory(&directory);
             fs::copy(
                 &primary,
                 directory.join("storage.sqlite3.bak.20000101_000000"),
@@ -2117,12 +3836,14 @@ mod tests {
         let completed = tmp
             .path()
             .join("doctor/reclaimable/rotation-19991231T235959Z");
-        fs::create_dir_all(&completed).unwrap();
+        create_fixture_directory(&completed);
         let retired = completed.join("storage.sqlite3.bak.20000101_000000");
         fs::copy(&primary, &retired).unwrap();
         let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("AM_BACKUP_ROTATION_DELETE", "true")],
-            || rotate_storage_backups(tmp.path(), &primary, 3).unwrap(),
+            // Only the publication slot is in-window. Recorded transaction
+            // payloads remain protected even when their generations expire.
+            || rotate_storage_backups(tmp.path(), &primary, 1).unwrap(),
         );
         assert_eq!(report.deleted, 1);
         assert_eq!(report.bytes_deleted, generation_bytes);
@@ -2156,7 +3877,7 @@ mod tests {
         let directory = tmp
             .path()
             .join("doctor/reclaimable/rotation-19991231T235959Z");
-        fs::create_dir_all(&directory).unwrap();
+        create_fixture_directory(&directory);
         fs::copy(
             &primary,
             directory.join("storage.sqlite3.bak.20000101_000000"),
@@ -2166,7 +3887,9 @@ mod tests {
         fs::write(&invalid, b"failed backup verification").unwrap();
         let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("AM_BACKUP_ROTATION_DELETE", "true")],
-            || rotate_storage_backups(tmp.path(), &primary, 3).unwrap(),
+            // Both historical candidates are beyond the shared keep window;
+            // failed verification still preserves the incomplete payload.
+            || rotate_storage_backups(tmp.path(), &primary, 1).unwrap(),
         );
         assert_eq!(report.deleted, 1);
         assert_eq!(report.bytes_deleted, fs::metadata(&primary).unwrap().len());
@@ -2224,6 +3947,8 @@ mod tests {
                 bytes: 0,
                 byte_limit: 0,
                 publication: None,
+                deadline: None,
+                deadline_reached: false,
             };
             let mut report = RotateReport::default();
             reclaim_pending(&primary, pending, &guard, &mut budget, &mut report);
@@ -2243,6 +3968,121 @@ mod tests {
         assert!(!valid.exists());
         drop(guard);
         assert!(mcp_agent_mail_db::snapshot::verified_snapshot_source_path(&primary).is_some());
+    }
+
+    /// An older file refused on an earlier pass sits behind the cursor, and it
+    /// still goes before the window. The window then goes only if that ends
+    /// the refusal: the limit here is 6, and two older images go first.
+    #[cfg(unix)]
+    #[test]
+    fn window_images_go_last_and_only_to_reopen_publication() {
+        for (count, window_deleted) in [(7, 0), (8, 1), (9, 0)] {
+            let tmp = TempDir::new().unwrap();
+            let primary = verified_mailbox(tmp.path());
+            let older = tmp.path().join("storage.sqlite3.bak.20000101_000000");
+            let middle = tmp.path().join("storage.sqlite3.bak.20000102_000000");
+            let newest = tmp.path().join("storage.sqlite3.bak.20000103_000000");
+            fs::write(&older, b"incomplete export evidence").unwrap();
+            fs::copy(&primary, &middle).unwrap();
+            fs::copy(&primary, &newest).unwrap();
+            let guard =
+                mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(&primary).unwrap();
+            let pass = |byte_limit, publication| {
+                let pending = [(&older, false), (&middle, false), (&newest, true)]
+                    .into_iter()
+                    .map(|(path, within_window)| PendingReclaim {
+                        path: path.clone(),
+                        metadata: fs::metadata(path).unwrap(),
+                        historical: false,
+                        within_window,
+                    })
+                    .collect();
+                let mut budget = ReclaimBudget {
+                    attempted: 0,
+                    bytes: 0,
+                    byte_limit,
+                    publication,
+                    deadline: None,
+                    deadline_reached: false,
+                };
+                let mut report = RotateReport::default();
+                reclaim_pending(&primary, pending, &guard, &mut budget, &mut report);
+                report
+            };
+            // Only the refused oldest file is attempted, and the cursor stops on it.
+            let refused = pass(0, None);
+            assert_eq!(refused.failures.len(), 1);
+            assert_eq!(refused.window_images_deleted, 0);
+            fs::copy(&primary, &older).unwrap();
+            let exhausted = PeriodicPublicationBudget {
+                count,
+                bytes: 0,
+                projected: 0,
+                count_limit: 6,
+                byte_limit: u64::MAX,
+            };
+            let report = pass(u64::MAX, Some(exhausted));
+            assert!(report.failures.is_empty(), "{:?}", report.failures);
+            assert_eq!(report.deleted, 2 + window_deleted, "count={count}");
+            assert_eq!(
+                report.window_images_deleted, window_deleted,
+                "count={count}"
+            );
+            assert_eq!(newest.exists(), window_deleted == 0, "count={count}");
+        }
+    }
+
+    /// With the cursor on the older window image, its rotation puts the newest
+    /// first, and here one deletion is all it takes to reopen publication.
+    #[cfg(unix)]
+    #[test]
+    fn older_window_image_goes_first_whatever_the_cursor() {
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let older = tmp.path().join("storage.sqlite3.bak.20000101_000000");
+        let newest = tmp.path().join("storage.sqlite3.bak.20000102_000000");
+        fs::write(&older, b"incomplete export evidence").unwrap();
+        fs::copy(&primary, &newest).unwrap();
+        let guard = mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(&primary).unwrap();
+        let pass = |within_window, byte_limit, publication| {
+            let pending = [&older, &newest]
+                .into_iter()
+                .map(|path| PendingReclaim {
+                    path: path.clone(),
+                    metadata: fs::metadata(path).unwrap(),
+                    historical: false,
+                    within_window,
+                })
+                .collect();
+            let mut budget = ReclaimBudget {
+                attempted: 0,
+                bytes: 0,
+                byte_limit,
+                publication,
+                deadline: None,
+                deadline_reached: false,
+            };
+            let mut report = RotateReport::default();
+            reclaim_pending(&primary, pending, &guard, &mut budget, &mut report);
+            report
+        };
+        // Only the refused older image is attempted, and the cursor stops on it.
+        let refused = pass(false, 0, None);
+        assert_eq!(refused.failures.len(), 1);
+        assert!(older.exists() && newest.exists());
+        fs::copy(&primary, &older).unwrap();
+        let one_over = PeriodicPublicationBudget {
+            count: 6,
+            bytes: 0,
+            projected: 0,
+            count_limit: 6,
+            byte_limit: u64::MAX,
+        };
+        let report = pass(true, u64::MAX, Some(one_over));
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.window_images_deleted, 1);
+        assert!(!older.exists(), "the older image goes first");
+        assert!(newest.exists(), "and that was enough to keep the newest");
     }
 
     #[cfg(unix)]
@@ -2273,6 +4113,8 @@ mod tests {
                 bytes: 0,
                 byte_limit: 2,
                 publication: None,
+                deadline: None,
+                deadline_reached: false,
             };
             let mut report = RotateReport::default();
             reclaim_pending(&primary, pending, &guard, &mut budget, &mut report);
@@ -2327,7 +4169,7 @@ mod tests {
         let directory = tmp
             .path()
             .join("doctor/reclaimable/rotation-20000101T000000Z");
-        fs::create_dir_all(&directory).unwrap();
+        create_fixture_directory(&directory);
         let backup = directory.join("storage.sqlite3.bak.20000101_000000");
         fs::write(&backup, b"recoverable transaction payload").unwrap();
         assert_eq!(
@@ -2600,9 +4442,9 @@ mod tests {
                 report.bytes_unconfirmed_moves,
                 b"retained backup contents".len() as u64
             );
-            assert_eq!(report.failures.len(), 2);
+            assert!(report.admission_refused);
+            assert_eq!(report.failures.len(), 1);
             assert!(report.failures[0].rename_completed);
-            assert!(!report.failures[1].rename_completed);
             assert_eq!(
                 report.failures[0].requested_destination.as_ref(),
                 Some(&moves[0].1)
@@ -2633,6 +4475,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_continues_after_a_refusal_before_any_namespace_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let primary = root.join("storage.sqlite3");
+        let contents = b"retained backup contents";
+        let paths =
+            [1, 2, 3].map(|day| root.join(format!("storage.sqlite3.bak.2026010{day}_000000")));
+        for path in &paths {
+            fs::write(path, contents).unwrap();
+        }
+        let mut attempts = 0;
+        let mut moved = None;
+        let report = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_BACKUP_ROTATION_DELETE", "0")],
+            || {
+                rotate_storage_backups_with(&root, &primary, 1, |source, directory, metadata| {
+                    attempts += 1;
+                    if attempts == 1 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "injected refusal before rename",
+                        ));
+                    }
+                    let destination = stage_backup_noreplace(source, directory, metadata)?;
+                    moved = Some(destination.clone());
+                    Ok(destination)
+                })
+                .unwrap()
+            },
+        );
+        assert_eq!(attempts, 2);
+        assert!(!report.admission_refused);
+        assert_eq!(
+            (report.staged, report.kept, report.unconfirmed_moves),
+            (1, 2, 0)
+        );
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].source, paths[1]);
+        assert!(!report.failures[0].rename_completed);
+        assert!(!report.failures[0].deletion_completed);
+        assert!(!paths[0].exists());
+        assert_eq!(fs::read(moved.unwrap()).unwrap(), contents);
+        for path in &paths[1..] {
+            assert_eq!(fs::read(path).unwrap(), contents);
+        }
+        assert_eq!(report.bytes_retained(), 3 * contents.len() as u64);
+        assert_eq!(report.bytes_reclaimed, 0);
     }
 
     #[test]
@@ -3706,6 +5599,7 @@ mod tests {
             source: PathBuf::from("source"),
             rename_completed: true,
             deletion_completed: false,
+            reader_inventory_incomplete: false,
             requested_destination: Some(PathBuf::from("quarantine/source")),
             error: "post-move validation failure".to_string(),
         };
@@ -3714,6 +5608,7 @@ mod tests {
             source: PathBuf::from("deleted-source"),
             rename_completed: false,
             deletion_completed: true,
+            reader_inventory_incomplete: true,
             requested_destination: None,
             error: "unlink completed; directory sync failed".to_string(),
         };
@@ -3727,12 +5622,166 @@ mod tests {
         assert_eq!(summary.bytes_unconfirmed_moves, 11);
         assert_eq!(summary.unconfirmed_deletions, 1);
         assert_eq!(summary.bytes_unconfirmed_deletions, 13);
+        assert_eq!(summary.unlinks_with_unobserved_readers, 1);
+        assert_eq!(summary.bytes_unlinked_with_unobserved_readers, 13);
         let mut report = RotateReport::default();
         report.add_kind(BackupKind::ManualBackup.label(), &summary);
+        assert!(report.admission_refused);
         assert_eq!(report.evicted(), 0);
         assert_eq!(report.bytes_retained(), 18);
         assert_eq!(report.bytes_reclaimed, 0);
         assert_eq!(report.bytes_unconfirmed_deletions, 13);
+        assert_eq!(report.unlinks_with_unobserved_readers, 1);
+        assert_eq!(report.bytes_unlinked_with_unobserved_readers, 13);
+        assert_eq!(report.per_kind[BackupKind::ManualBackup.label()], summary);
+    }
+
+    #[test]
+    fn completed_namespace_failure_receipts_refuse_publication_admission() {
+        // Receipt policy is distinct from the real post-rename/post-unlink
+        // sync-fault tests in recovery_retention_namespace. An ordinary
+        // refusal leaves capacity unchanged and must permit other candidates.
+        for (rename_completed, deletion_completed, reader_inventory_incomplete) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, true, true),
+        ] {
+            let failure = RotationFailure {
+                source: PathBuf::from("source"),
+                rename_completed,
+                deletion_completed,
+                reader_inventory_incomplete,
+                requested_destination: rename_completed.then(|| PathBuf::from("quarantine/source")),
+                error: "namespace operation refused or durability unconfirmed".to_owned(),
+            };
+            let completed = rename_completed || deletion_completed;
+            let mut report = RotateReport::default();
+            report.record_failure(failure.clone());
+            assert_eq!(report.admission_refused, completed);
+            assert_eq!(report.failures.as_slice(), std::slice::from_ref(&failure));
+            let mut summary = RotateKindSummary::default();
+            summary.record_failure(&failure, 17);
+            let mut aggregated = RotateReport::default();
+            aggregated.add_kind(BackupKind::ManualBackup.label(), &summary);
+            assert_eq!(aggregated.admission_refused, completed);
+            assert_eq!(aggregated.kept, usize::from(!completed));
+            assert_eq!(aggregated.unconfirmed_moves, usize::from(rename_completed));
+            assert_eq!(
+                aggregated.unconfirmed_deletions,
+                usize::from(deletion_completed)
+            );
+            assert_eq!(aggregated.bytes_reclaimed, 0);
+            assert_eq!(aggregated.evicted(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_failure_receipts_block_remaining_periodic_reclaims() {
+        let tmp = TempDir::new().unwrap();
+        let primary = verified_mailbox(tmp.path());
+        let paths = [1, 2].map(|day| {
+            tmp.path()
+                .join(format!("storage.sqlite3.bak.2000010{day}_000000"))
+        });
+        let original = fs::read(&primary).unwrap();
+        for path in &paths {
+            fs::copy(&primary, path).unwrap();
+        }
+        let guard = mcp_agent_mail_db::snapshot::SnapshotRetentionGuard::acquire(&primary).unwrap();
+        for rename_completed in [false, true] {
+            let pending = paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| PendingReclaim {
+                    path: path.clone(),
+                    metadata: fs::metadata(path).unwrap(),
+                    historical: false,
+                    within_window: index == 1,
+                })
+                .collect();
+            let mut budget = ReclaimBudget {
+                attempted: 0,
+                bytes: 0,
+                byte_limit: u64::MAX,
+                publication: Some(PeriodicPublicationBudget {
+                    count: 6,
+                    bytes: 0,
+                    projected: 0,
+                    count_limit: 6,
+                    byte_limit: u64::MAX,
+                }),
+                deadline: None,
+                deadline_reached: false,
+            };
+            // Seed the report at the receipt boundary, without pretending to
+            // reproduce a filesystem sync failure in this coordinator test.
+            let mut report = RotateReport::default();
+            report.record_failure(RotationFailure {
+                source: tmp.path().join("earlier-candidate"),
+                rename_completed,
+                deletion_completed: !rename_completed,
+                reader_inventory_incomplete: !rename_completed,
+                requested_destination: rename_completed
+                    .then(|| tmp.path().join("parked-candidate")),
+                error: "namespace mutation completed; durability unconfirmed".to_owned(),
+            });
+            reclaim_pending(&primary, pending, &guard, &mut budget, &mut report);
+            assert!(report.admission_refused);
+            assert_eq!(budget.attempted, 0);
+            assert_eq!(
+                (report.deleted, report.kept, report.window_images_deleted),
+                (0, 2, 0)
+            );
+            assert_eq!(report.bytes_retained(), 2 * original.len() as u64);
+            assert_eq!(report.failures.len(), 1);
+            assert_eq!(budget.publication.as_ref().unwrap().count, 6);
+            for path in &paths {
+                assert_eq!(fs::read(path).unwrap(), original);
+            }
+        }
+    }
+
+    #[test]
+    fn completed_unlinks_distinguish_unobserved_readers_from_reclaimed_blocks() {
+        let mut first = RotateKindSummary::default();
+        first.record_deletion(11, Some(4096), false);
+        // Even a supplied allocation estimate cannot be counted as reclaimed
+        // when an unobserved reader may retain the inode after its unlink.
+        first.record_deletion(17, Some(8192), true);
+        let refused = RotationFailure::from_error(
+            Path::new("still-present"),
+            &std::io::Error::other("reader refusal before unlink"),
+        );
+        first.record_failure(&refused, 23);
+        let mut second = RotateKindSummary::default();
+        second.record_deletion(29, None, true);
+
+        let mut report = RotateReport::default();
+        report.add_kind(BackupKind::ManualBackup.label(), &first);
+        report.add_kind(BackupKind::ManualBackup.label(), &second);
+        assert_eq!(report.deleted, 3);
+        assert_eq!(report.bytes_deleted, 57);
+        assert_eq!(report.bytes_reclaimed, 4096);
+        assert_eq!(report.unlinks_with_unobserved_readers, 2);
+        assert_eq!(report.bytes_unlinked_with_unobserved_readers, 46);
+        assert_eq!(report.kept, 1);
+        assert_eq!(report.bytes_retained(), 23);
+        assert_eq!(report.unconfirmed_deletions, 0);
+        assert_eq!(report.bytes_unconfirmed_deletions, 0);
+        let kind = &report.per_kind[BackupKind::ManualBackup.label()];
+        assert_eq!(kind.deleted, report.deleted);
+        assert_eq!(kind.bytes_deleted, report.bytes_deleted);
+        assert_eq!(kind.bytes_reclaimed, report.bytes_reclaimed);
+        assert_eq!(
+            kind.unlinks_with_unobserved_readers,
+            report.unlinks_with_unobserved_readers
+        );
+        assert_eq!(
+            kind.bytes_unlinked_with_unobserved_readers,
+            report.bytes_unlinked_with_unobserved_readers
+        );
     }
 
     #[cfg(unix)]
@@ -3743,7 +5792,7 @@ mod tests {
         let primary = tmp.path().join("storage.sqlite3");
         fs::write(&primary, b"live mailbox sentinel").unwrap();
         let reclaimable = tmp.path().join("doctor/reclaimable");
-        fs::create_dir_all(&reclaimable).unwrap();
+        create_fixture_directory(&reclaimable);
         let unknown = reclaimable.join("operator-empty-evidence");
         let recorded = reclaimable.join("rotation-20000101T000000Z");
         let nested = reclaimable.join("rotation-20000101T000000Z-1");
@@ -3754,7 +5803,7 @@ mod tests {
             b"recovery transaction evidence",
         )
         .unwrap();
-        fs::create_dir_all(nested.join("unfinished-stage")).unwrap();
+        create_fixture_directory(nested.join("unfinished-stage"));
 
         // The first bounded sweep still leaves an incomplete inventory. A
         // cleanup that waits for a complete inventory can never make progress

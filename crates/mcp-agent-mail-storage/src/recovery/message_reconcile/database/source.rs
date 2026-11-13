@@ -88,7 +88,7 @@ pub(super) fn prepare_message_classified(
 /// can turn the bounded retry lane into repeated reads of the same bad handle.
 /// Retire only failed source reads, not valid reads that expose conflicting
 /// durable metadata. Neither path mutates mailbox rows or relaxes validation.
-fn with_source_connection<T>(
+pub(super) fn with_source_connection<T>(
     cx: &Cx,
     pool: &DbPool,
     read: impl FnOnce(&DbConn) -> Result<T, ReconcileFailure>,
@@ -377,6 +377,78 @@ mod tests {
     use super::*;
     use mcp_agent_mail_core::Config;
     use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    // The pre-GH#354 statement is an independent result/cost control. Keeping
+    // it literal prevents an accidental change to the production projection
+    // or byte bound from silently changing both sides of the comparison.
+    const LEGACY_SOURCE_SQL: &str = "\
+SELECT 0 AS row_kind, m.id, m.project_id, m.subject, m.body_md, m.thread_id, m.topic, \
+       m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
+       m.archive_metadata_json, \
+       p.slug AS project_slug, p.human_key AS project_key, a.name AS sender, \
+       NULL AS recipient_id, NULL AS recipient_project_id, \
+       NULL AS recipient_name, NULL AS recipient_kind, \
+       m.sender_id, a.project_id AS sender_project_id, \
+       NULL AS recipient_read_ts, NULL AS recipient_ack_ts \
+FROM messages m JOIN projects p ON p.id = m.project_id \
+JOIN agents a ON a.id = m.sender_id \
+WHERE m.id = ?1 AND \
+      length(CAST(m.body_md AS BLOB)) + length(CAST(m.subject AS BLOB)) + \
+      length(CAST(m.recipients_json AS BLOB)) + length(CAST(m.attachments AS BLOB)) + \
+      length(CAST(m.importance AS BLOB)) + length(CAST(p.slug AS BLOB)) + \
+      length(CAST(p.human_key AS BLOB)) + length(CAST(a.name AS BLOB)) + \
+      COALESCE(length(CAST(m.thread_id AS BLOB)), 0) + \
+      COALESCE(length(CAST(m.topic AS BLOB)), 0) + \
+      COALESCE(length(CAST(m.archive_metadata_json AS BLOB)), 0) <= ?2 \
+UNION ALL \
+SELECT 1, mr.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+       NULL, NULL, NULL, mr.agent_id, a.project_id, \
+       CASE WHEN length(CAST(a.name AS BLOB)) <= ?3 THEN a.name ELSE NULL END, \
+       CASE WHEN length(CAST(mr.kind AS BLOB)) <= 3 THEN mr.kind ELSE NULL END, \
+       NULL, NULL, \
+       CASE WHEN mr.read_ts IS NULL OR typeof(mr.read_ts) = 'integer' \
+            THEN mr.read_ts ELSE 'invalid_receipt' END, \
+       CASE WHEN mr.ack_ts IS NULL OR typeof(mr.ack_ts) = 'integer' \
+            THEN mr.ack_ts ELSE 'invalid_receipt' END \
+FROM message_recipients mr LEFT JOIN agents a ON a.id = mr.agent_id \
+WHERE mr.message_id = ?1 \
+UNION ALL \
+SELECT 2, d.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+       NULL, NULL, NULL, NULL, d.project_id, \
+       CASE WHEN length(CAST(p.slug AS BLOB)) <= ?3 THEN 'project:' || p.slug ELSE NULL END, \
+       CASE WHEN length(CAST(d.kind AS BLOB)) <= 3 THEN d.kind ELSE NULL END, \
+       NULL, NULL, NULL, NULL \
+FROM project_mailbox_deliveries d LEFT JOIN projects p ON p.id = d.project_id \
+WHERE d.message_id = ?1 \
+ORDER BY row_kind, recipient_id";
+
+    fn assert_source_rows_equal(expected: &[Row], actual: &[Row]) {
+        assert_eq!(actual.len(), expected.len());
+        for (expected, actual) in expected.iter().zip(actual) {
+            for column in 0..24 {
+                assert!(expected.get(column).is_some());
+                assert_eq!(actual.get(column), expected.get(column), "column {column}");
+            }
+            assert!(actual.get(24).is_none());
+        }
+    }
+
+    fn source_sql_with_limit(sql: &str) -> String {
+        format!("{sql} LIMIT {}", MAX_RECIPIENTS + 2)
+    }
+
+    // Includes the driver's worker threads, unlike calling-thread CPU clocks.
+    // These diagnostic counters require an isolated test invocation for useful
+    // attribution; they are not noisy wall-time assertions in the test gate.
+    fn process_cpu_ticks() -> Option<u64> {
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        let (_, fields) = stat.rsplit_once(") ")?;
+        let mut fields = fields.split_whitespace().skip(11);
+        let user = fields.next()?.parse::<u64>().ok()?;
+        let system = fields.next()?.parse::<u64>().ok()?;
+        user.checked_add(system)
+    }
 
     fn fixture(test: impl FnOnce(&Cx, &DbPool, &Config)) {
         mcp_agent_mail_core::config::with_isolated_default_storage_root_for_test(|_| {
@@ -521,6 +593,78 @@ mod tests {
                             .is_none()
                     );
                 }
+            }
+        });
+    }
+
+    #[test]
+    fn durable_tui_metadata_recovers_db_only_threaded_compose_after_reopen() {
+        fixture(|_cx, pool, config| {
+            let writer = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
+            let id = mcp_agent_mail_db::sync::dispatch_root_message(
+                &writer,
+                "BlueLake",
+                "TUI handoff",
+                "Keep this exact body.\n",
+                "high",
+                Some("conversation-root"),
+                &[
+                    ("GreenStone".to_string(), "to".to_string()),
+                    ("RedFox".to_string(), "bcc".to_string()),
+                    ("GoldLeaf".to_string(), "cc".to_string()),
+                ],
+            )
+            .unwrap();
+            writer
+                .execute_sync(
+                    "UPDATE message_recipients SET read_ts = 7, ack_ts = 11 \
+                     WHERE message_id = ? AND agent_id = 102",
+                    &[id.into()],
+                )
+                .unwrap();
+            drop(writer);
+
+            // The TUI reports success after the database commit and does not
+            // enqueue an archive bundle. Recover through a fresh file handle,
+            // without the original connection or any surviving message copy.
+            let reopened = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
+            let prepared = read_source(id, |sql, params| {
+                reopened
+                    .query_sync(sql, params)
+                    .map_err(ReconcileFailure::source_unavailable)
+            })
+            .unwrap();
+            drop(reopened);
+            assert!(prepared.archive_metadata_known);
+            assert_eq!(prepared.message["thread_id"], "conversation-root");
+            assert!(
+                !prepared
+                    .message
+                    .as_object()
+                    .unwrap()
+                    .contains_key("reply_to")
+            );
+            assert_exact_recovered_bundle(config, &prepared, None);
+
+            let verify = mcp_agent_mail_db::DbConn::open_file(pool.sqlite_path()).unwrap();
+            let deliveries = verify
+                .query_sync(
+                    "SELECT agent_id, read_ts, ack_ts FROM message_recipients \
+                     WHERE message_id = ? ORDER BY agent_id",
+                    &[id.into()],
+                )
+                .unwrap();
+            assert_eq!(deliveries.len(), 3);
+            for delivery in deliveries {
+                let recipient = delivery.get_named::<i64>("agent_id").unwrap();
+                assert_eq!(
+                    delivery.get_named::<Option<i64>>("read_ts").unwrap(),
+                    (recipient == 102).then_some(7),
+                );
+                assert_eq!(
+                    delivery.get_named::<Option<i64>>("ack_ts").unwrap(),
+                    (recipient == 102).then_some(11),
+                );
             }
         });
     }
@@ -951,6 +1095,421 @@ mod tests {
                 .filter_map(|row| row.get_named::<Option<String>>("body_md").unwrap())
                 .collect::<Vec<_>>();
             assert_eq!(bodies, vec!["Keep this body."]);
+        });
+    }
+
+    #[test]
+    fn source_lookup_preserves_cross_table_utf8_byte_boundary() {
+        fixture(|cx, pool, _| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("UPDATE messages SET body_md = 'Body λ🙂', subject = 'Résumé', thread_id = 'thread-π', topic = 'µ', archive_metadata_json = '{}' WHERE id = 901").unwrap();
+            conn.execute_raw("UPDATE projects SET human_key = '/project/é' WHERE id = 101")
+                .unwrap();
+            // The joined project and sender bytes remain part of the same
+            // total. UTF-8 characters are deliberately wider than one byte.
+            let required: usize = [
+                "Body λ🙂",
+                "Résumé",
+                "{}",
+                "[]",
+                "normal",
+                "project",
+                "/project/é",
+                "OrangeHill",
+                "thread-π",
+                "µ",
+                "{}",
+            ]
+            .into_iter()
+            .map(str::len)
+            .sum();
+            let required = i64::try_from(required).unwrap();
+            for limit in [required - 1, required, required + 1] {
+                let params = [
+                    901_i64.into(),
+                    limit.into(),
+                    MAX_RECIPIENT_NAME_BYTES.into(),
+                ];
+                let expected = conn
+                    .query_sync(&source_sql_with_limit(LEGACY_SOURCE_SQL), &params)
+                    .unwrap();
+                let actual = conn
+                    .query_sync(&source_sql_with_limit(SOURCE_SQL), &params)
+                    .unwrap();
+                assert_source_rows_equal(&expected, &actual);
+                if limit < required {
+                    assert_eq!(actual.len(), 3, "deliveries remain refusal witnesses");
+                    assert!(prepare_source_rows(901, &actual).is_err());
+                } else {
+                    assert_eq!(actual.len(), 4);
+                    let prepared = prepare_source_rows(901, &actual).unwrap();
+                    assert_eq!(prepared.body, "Body λ🙂");
+                    assert_eq!(prepared.message["project"], "/project/é");
+                }
+            }
+            // Optional fields have zero cost when absent, including the
+            // pre-migration archive metadata that still has a NULL default.
+            conn.execute_raw("UPDATE messages SET thread_id = NULL, topic = NULL, archive_metadata_json = NULL WHERE id = 901").unwrap();
+            let reduced = required - i64::try_from("thread-πµ{}".len()).unwrap();
+            let params = [
+                901_i64.into(),
+                reduced.into(),
+                MAX_RECIPIENT_NAME_BYTES.into(),
+            ];
+            let actual = conn
+                .query_sync(&source_sql_with_limit(SOURCE_SQL), &params)
+                .unwrap();
+            assert_source_rows_equal(
+                &conn
+                    .query_sync(&source_sql_with_limit(LEGACY_SOURCE_SQL), &params)
+                    .unwrap(),
+                &actual,
+            );
+            assert!(prepare_source_rows(901, &actual).is_ok());
+        });
+    }
+
+    #[test]
+    fn source_lookup_keeps_one_snapshot_across_an_independent_commit() {
+        fixture(|cx, pool, _| {
+            let reader = outcome(block_on(pool.acquire(cx))).unwrap();
+            let writer = DbConn::open_file(pool.sqlite_path()).unwrap();
+            let params = [
+                901_i64.into(),
+                MAX_DB_PAYLOAD_BYTES.into(),
+                MAX_RECIPIENT_NAME_BYTES.into(),
+            ];
+            let sql = source_sql_with_limit(SOURCE_SQL);
+            reader.execute_raw("BEGIN").unwrap();
+            let before = reader.query_sync(&sql, &params).unwrap();
+            writer.execute_raw("BEGIN IMMEDIATE").unwrap();
+            writer.execute_raw("UPDATE messages SET subject = 'Committed subject', body_md = 'Committed body' WHERE id = 901").unwrap();
+            writer.execute_raw("UPDATE message_recipients SET read_ts = 17, ack_ts = 19 WHERE message_id = 901 AND agent_id = 102").unwrap();
+            writer
+                .execute_raw("UPDATE projects SET human_key = '/committed-project' WHERE id = 101")
+                .unwrap();
+            writer
+                .execute_raw("UPDATE agents SET name = 'OrangeStone' WHERE id = 201")
+                .unwrap();
+            writer.execute_raw("COMMIT").unwrap();
+            let pinned = reader.query_sync(&sql, &params).unwrap();
+            assert_source_rows_equal(&before, &pinned);
+            reader.execute_raw("COMMIT").unwrap();
+            let current = reader.query_sync(&sql, &params).unwrap();
+            assert_source_rows_equal(
+                &reader
+                    .query_sync(&source_sql_with_limit(LEGACY_SOURCE_SQL), &params)
+                    .unwrap(),
+                &current,
+            );
+            let prepared = prepare_source_rows(901, &current).unwrap();
+            assert_eq!(prepared.body, "Committed body");
+            assert_eq!(prepared.message["subject"], "Committed subject");
+            assert_eq!(prepared.message["project"], "/committed-project");
+            assert_eq!(prepared.sender, "OrangeStone");
+            let receipt = current
+                .iter()
+                .find(|row| row.get_named::<Option<i64>>("recipient_id").unwrap() == Some(102))
+                .unwrap();
+            assert_eq!(receipt.get_named::<i64>("recipient_read_ts").unwrap(), 17);
+            assert_eq!(receipt.get_named::<i64>("recipient_ack_ts").unwrap(), 19);
+        });
+    }
+
+    fn seed_source_lookup_mailbox(conn: &DbConn) {
+        conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+        conn.execute_raw("INSERT INTO projects(id, slug, human_key, created_at) VALUES(301, 'project-3', '/project-3', 1), (401, 'project-4', '/project-4', 1), (501, 'project-5', '/project-5', 1)").unwrap();
+        let project_ids = [101, 201, 301, 401, 501];
+        let agents = (0..76)
+            .map(|index| {
+                format!(
+                    "({}, {}, 'LookupAgent{index}', 'test', 'test', '', 1, 1)",
+                    1000 + index,
+                    project_ids[index % 5],
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        conn.execute_raw(&format!("INSERT INTO agents(id, project_id, name, program, model, task_description, inception_ts, last_active_ts) VALUES {agents}")).unwrap();
+        let body = "Mailbox-scale body λ. ".repeat(48);
+        for start in (0..8240).step_by(128) {
+            let mut messages = Vec::new();
+            let mut deliveries = Vec::new();
+            let mut shared = Vec::new();
+            for index in start..(start + 128).min(8240) {
+                let id = 10_000 + index;
+                let project = index % 5;
+                let member = (index / 5) % 15;
+                let sender = 1000 + member * 5 + project;
+                messages.push(format!(
+                    "({id}, {}, {sender}, 'Message {index}', '{body}', 'thread-{}', 'lookup', 'normal', 1, {}, '{{}}', '[]', '{{}}')",
+                    project_ids[project],
+                    index % 64,
+                    1_000_000 + index,
+                ));
+                for (offset, kind) in [(1, "to"), (2, "cc"), (3, "bcc")] {
+                    let recipient = 1000 + ((member + offset) % 15) * 5 + project;
+                    deliveries.push(format!("({id}, {recipient}, '{kind}', 7, 11)"));
+                }
+                if index % 7 == 0 {
+                    shared.push(format!("({id}, {}, 'to', 1)", project_ids[project]));
+                }
+            }
+            conn.execute_raw(&format!("INSERT INTO messages(id, project_id, sender_id, subject, body_md, thread_id, topic, importance, ack_required, created_ts, recipients_json, attachments, archive_metadata_json) VALUES {}", messages.join(","))).unwrap();
+            conn.execute_raw(&format!("INSERT INTO message_recipients(message_id, agent_id, kind, read_ts, ack_ts) VALUES {}", deliveries.join(","))).unwrap();
+            conn.execute_raw(&format!("INSERT INTO project_mailbox_deliveries(message_id, project_id, kind, delivered_ts) VALUES {}", shared.join(","))).unwrap();
+        }
+        conn.execute_raw("COMMIT").unwrap();
+    }
+
+    /// Run alone with `--exact ... --nocapture --test-threads=1` to attribute
+    /// the emitted process CPU ticks. Both statements execute against the same
+    /// live native connection; elapsed time never substitutes for correctness.
+    #[test]
+    fn source_lookup_mailbox_scale_matches_legacy_in_one_query() {
+        fixture(|cx, pool, _| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            seed_source_lookup_mailbox(&conn);
+            for (table, expected) in [("projects", 5), ("agents", 82), ("messages", 8241)] {
+                let count = conn
+                    .query_sync(&format!("SELECT COUNT(*) AS n FROM {table}"), &[])
+                    .unwrap()[0]
+                    .get_named::<i64>("n")
+                    .unwrap();
+                assert_eq!(count, expected);
+            }
+            let sql = [
+                source_sql_with_limit(LEGACY_SOURCE_SQL),
+                source_sql_with_limit(SOURCE_SQL),
+            ];
+            let params = |id: i64| {
+                [
+                    id.into(),
+                    MAX_DB_PAYLOAD_BYTES.into(),
+                    MAX_RECIPIENT_NAME_BYTES.into(),
+                ]
+            };
+            let plans = sql.each_ref().map(|sql| {
+                conn.query_sync(&format!("EXPLAIN QUERY PLAN {sql}"), &params(901))
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| format!("{:?}", row.get(3)))
+                    .collect::<Vec<_>>()
+            });
+            for sql in &sql {
+                conn.query_sync(sql, &params(901)).unwrap();
+            }
+            let mut wall_us = [Vec::new(), Vec::new()];
+            let mut cpu_ticks = [Some(0_u64), Some(0_u64)];
+            let mut queries = [0, 0];
+            for sample in 0..8 {
+                let id = [901, 10_000, 14_120, 18_239][sample % 4];
+                let mut observations = [Vec::new(), Vec::new()];
+                // Alternate order so only one candidate does not always
+                // inherit the other candidate's warmed cache state.
+                for variant in [sample % 2, 1 - sample % 2] {
+                    let before_cpu = process_cpu_ticks();
+                    let started = Instant::now();
+                    observations[variant] = conn.query_sync(&sql[variant], &params(id)).unwrap();
+                    wall_us[variant].push(started.elapsed().as_micros());
+                    cpu_ticks[variant] = cpu_ticks[variant].and_then(|total| {
+                        process_cpu_ticks()?
+                            .checked_sub(before_cpu?)?
+                            .checked_add(total)
+                    });
+                    queries[variant] += 1;
+                }
+                assert_source_rows_equal(&observations[0], &observations[1]);
+                assert_eq!(
+                    observations[1]
+                        .iter()
+                        .filter(|row| row
+                            .get_named::<Option<String>>("body_md")
+                            .unwrap()
+                            .is_some())
+                        .count(),
+                    1,
+                );
+                let prepared = prepare_source_rows(id, &observations[1]).unwrap();
+                assert_eq!(prepared.message["id"], id);
+            }
+            let mut production_queries = 0;
+            let prepared = read_source(18_239, |sql, params| {
+                production_queries += 1;
+                conn.query_sync(sql, params)
+                    .map_err(ReconcileFailure::source_unavailable)
+            })
+            .unwrap();
+            assert_eq!(production_queries, 1);
+            assert_eq!(prepared.message["id"], 18_239);
+            assert_eq!(prepared.recipients.len(), 3);
+            eprintln!(
+                "GH354_MESSAGE_SOURCE {}",
+                json!({
+                    "messages": 8241, "agents": 82, "projects": 5,
+                    "variants": ["legacy", "indexed"],
+                    "query_plans": plans,
+                    "measured_queries": queries,
+                    "production_queries_per_observation": production_queries,
+                    "wall_us": wall_us,
+                    "process_cpu_ticks": cpu_ticks,
+                }),
+            );
+        });
+    }
+
+    #[test]
+    fn source_statement_selects_one_message_from_populated_delivery_tables() {
+        fixture(|cx, pool, _| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw("BEGIN IMMEDIATE").unwrap();
+            // Enough unrelated deliveries to fill the observation's limit if
+            // any UNION arm loses the message-ID binding. The foreign sender
+            // of 901 is intentional and must still be accepted.
+            for id in 1000..2200 {
+                conn.execute_raw(&format!(
+                    "INSERT INTO messages(id, project_id, sender_id, subject, body_md, created_ts) \
+                     VALUES({id}, 201, 201, 'unrelated', 'not the selected body', 1); \
+                     INSERT INTO message_recipients(message_id, agent_id, kind, read_ts, ack_ts) \
+                     VALUES({id}, 202, 'to', 19, 23); \
+                     INSERT INTO project_mailbox_deliveries(message_id, project_id, kind, delivered_ts) \
+                     VALUES({id}, 201, 'cc', 1)"
+                ))
+                .unwrap();
+            }
+            conn.execute_raw(
+                "INSERT INTO project_mailbox_deliveries(message_id, project_id, kind, delivered_ts) \
+                 VALUES(901, 101, 'cc', 1); COMMIT; PRAGMA query_only=ON",
+            )
+            .unwrap();
+            let sql = format!("{SOURCE_SQL} LIMIT {}", MAX_RECIPIENTS + 2);
+            let params = [
+                901_i64.into(),
+                MAX_DB_PAYLOAD_BYTES.into(),
+                MAX_RECIPIENT_NAME_BYTES.into(),
+            ];
+            let rows = conn.query_sync(&sql, &params).unwrap();
+            assert_eq!(rows.len(), 5);
+            assert!(
+                rows.iter()
+                    .all(|row| row.get_named::<i64>("id").unwrap() == 901)
+            );
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.get_named::<i64>("row_kind").unwrap())
+                    .collect::<Vec<_>>(),
+                vec![0, 1, 1, 1, 2]
+            );
+            assert_eq!(rows[0].get_named::<i64>("sender_id").unwrap(), 201);
+            assert_eq!(rows[0].get_named::<i64>("sender_project_id").unwrap(), 201);
+            assert_eq!(rows[1].get_named::<i64>("recipient_read_ts").unwrap(), 7);
+            assert_eq!(rows[1].get_named::<i64>("recipient_ack_ts").unwrap(), 11);
+            assert_eq!(
+                rows[4].get_named::<i64>("recipient_project_id").unwrap(),
+                101
+            );
+            let prepared = prepare_source_rows(901, &rows).unwrap();
+            assert_eq!(prepared.sender, "OrangeHill");
+            assert_eq!(prepared.project_slug, "project");
+            assert_eq!(prepared.body, "Keep this body.");
+            assert_eq!(prepared.message["subject"], "Contact handoff");
+            assert_eq!(prepared.message["to"], json!(["GreenStone"]));
+            assert_eq!(
+                prepared.message["cc"],
+                json!(["GoldLeaf", "project:project"])
+            );
+            assert_eq!(prepared.message["bcc"], json!(["RedFox"]));
+            assert_eq!(
+                prepared.recipients,
+                vec!["GoldLeaf", "GreenStone", "RedFox"]
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter_map(|row| row.get_named::<Option<String>>("body_md").unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["Keep this body."]
+            );
+            let mut absent = params;
+            absent[0] = 999_i64.into();
+            assert!(conn.query_sync(&sql, &absent).unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn source_statement_preserves_byte_bounds_after_message_selection() {
+        fixture(|cx, pool, _| {
+            let conn = outcome(block_on(pool.acquire(cx))).unwrap();
+            conn.execute_raw(
+                "UPDATE messages SET body_md = 'λ', thread_id = 'thread-λ', topic = '部署', \
+                 archive_metadata_json = '{}' WHERE id = 901; PRAGMA query_only=ON",
+            )
+            .unwrap();
+            // Count UTF-8 bytes independently of SQL. A character-count cap
+            // would wrongly admit the one-byte-over control below.
+            let source_bytes: usize = [
+                "λ",
+                "Contact handoff",
+                "{}",
+                "[]",
+                "normal",
+                "project",
+                "/project",
+                "OrangeHill",
+                "thread-λ",
+                "部署",
+                "{}",
+            ]
+            .into_iter()
+            .map(str::len)
+            .sum();
+            let sql = format!("{SOURCE_SQL} LIMIT {}", MAX_RECIPIENTS + 2);
+            let mut params = [
+                901_i64.into(),
+                i64::try_from(source_bytes).unwrap().into(),
+                MAX_RECIPIENT_NAME_BYTES.into(),
+            ];
+            let rows = conn.query_sync(&sql, &params).unwrap();
+            let exact = prepare_source_rows(901, &rows).unwrap();
+            assert_eq!(exact.body, "λ");
+            assert_eq!(exact.message["thread_id"], "thread-λ");
+            assert_eq!(exact.message["topic"], "部署");
+            assert!(exact.archive_metadata_known);
+
+            params[1] = i64::try_from(source_bytes - 1).unwrap().into();
+            let oversized = conn.query_sync(&sql, &params).unwrap();
+            assert_eq!(oversized.len(), 3, "delivery witnesses remain visible");
+            assert!(
+                oversized
+                    .iter()
+                    .all(|row| row.get_named::<i64>("row_kind").unwrap() == 1)
+            );
+            assert!(
+                prepare_source_rows(901, &oversized)
+                    .err()
+                    .unwrap()
+                    .contains("oversized")
+            );
+
+            params[1] = i64::try_from(source_bytes).unwrap().into();
+            params[2] = 9_i64.into(); // GreenStone is ten bytes.
+            let oversized_name = conn.query_sync(&sql, &params).unwrap();
+            assert_eq!(
+                oversized_name.len(),
+                4,
+                "an invalid identity is not dropped by the join"
+            );
+            assert!(
+                oversized_name[1]
+                    .get_named::<Option<String>>("recipient_name")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                prepare_source_rows(901, &oversized_name)
+                    .err()
+                    .unwrap()
+                    .contains("missing or oversized")
+            );
         });
     }
 
